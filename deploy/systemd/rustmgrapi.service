@@ -1,0 +1,26 @@
+[Unit]
+Description=Rust Manager API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rust-manager/api
+ExecStart=/usr/bin/dotnet /opt/rust-manager/api/rustmgrapi.dll
+Restart=always
+RestartSec=5
+User=rustmgr
+Group=rustmgr
+EnvironmentFile=-/opt/rust-manager/config/rustops.env
+Environment=ASPNETCORE_ENVIRONMENT=Production
+Environment=HOME=/opt/rust-manager
+Environment=DOTNET_CLI_HOME=/opt/rust-manager
+Environment=TMPDIR=/tmp
+Environment=RUSTMGR_BIND=http://0.0.0.0:2077
+Environment=RUSTMGR_PATH=/opt/rust-manager/rustmgr.sh
+Environment=RUSTMGR_RUNTIME=/opt/rust-manager/runtime
+Environment=RUSTMGR_CONFIG=/opt/rust-manager/config
+Environment=RUSTMGR_TASKS_DIR=/opt/rust-manager/tasks
+
+[Install]
+WantedBy=multi-user.target

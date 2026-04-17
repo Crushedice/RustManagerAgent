@@ -1,0 +1,60 @@
+{
+  "api": {
+    "baseUrl": "${RUSTOPS_API_BASE_URL}",
+    "apiKey": "${RUSTMGR_API_KEY}"
+  },
+  "monitor": {
+    "pollSeconds": 20,
+    "controlPollSeconds": 2,
+    "logLinesPerScan": 120,
+    "healthCooldownMinutes": 10,
+    "startupIgnoreSeconds": 180,
+    "logRulesPath": "agent-log-rules.json"
+  },
+  "memory": {
+    "statePath": "data/agent-state.json"
+  },
+  "inbox": {
+    "feedbackInboxPath": "data/feedback-inbox",
+    "decisionInboxPath": "data/decision-inbox",
+    "chatInboxPath": "data/chat-inbox"
+  },
+  "outbox": {
+    "messageOutboxPath": "data/message-outbox"
+  },
+  "policy": {
+    "autoAllowedActions": [
+      "validate-oxide",
+      "inspect-host-network"
+    ],
+    "approvalRequiredActions": [
+      "restart-server",
+      "stop-server",
+      "start-server",
+      "update-server",
+      "wipe-server",
+      "write-config",
+      "modify-plugin",
+      "create-task"
+    ]
+  },
+  "selfRepair": {
+    "enabled": true,
+    "intervalSeconds": 180,
+    "maxActionsPerCycle": 4,
+    "maxFileBytes": 32768,
+    "scopeRootPath": "/opt/rust-manager",
+    "workspacePath": "data/self-repair",
+    "allowScopeFileWrites": true,
+    "applyLogRuleUpdates": true,
+    "applyReplyStyleUpdates": true
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "${RUSTOPS_LLM_PROVIDER}",
+    "baseUrl": "${RUSTOPS_LLM_BASE_URL}",
+    "model": "${RUSTOPS_LLM_MODEL}",
+    "apiKey": "${RUSTOPS_LLM_API_KEY}",
+    "useForRecommendations": true
+  }
+}

@@ -1,0 +1,22 @@
+[Unit]
+Description=Rust Ops Steam Adapter
+After=network-online.target rustopsagent.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rust-manager/SteamBot/OpsSteamBot
+ExecStart=/usr/bin/dotnet /opt/rust-manager/SteamBot/OpsSteamBot/OpsSteamBot.dll /opt/rust-manager/SteamBot/OpsSteamBot/botsettings.json
+Restart=always
+RestartSec=8
+User=rustmgr
+Group=rustmgr
+EnvironmentFile=-/opt/rust-manager/config/rustops.env
+Environment=HOME=/opt/rust-manager
+Environment=DOTNET_CLI_HOME=/opt/rust-manager
+Environment=TMPDIR=/tmp
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

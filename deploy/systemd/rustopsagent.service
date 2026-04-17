@@ -1,0 +1,20 @@
+[Unit]
+Description=Rust Ops Agent
+After=network-online.target rustmgrapi.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rust-manager/agent/RustOpsAgent
+ExecStart=/usr/bin/dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll /opt/rust-manager/agent/RustOpsAgent/agentsettings.json
+Restart=always
+RestartSec=5
+User=rustmgr
+Group=rustmgr
+EnvironmentFile=-/opt/rust-manager/config/rustops.env
+Environment=HOME=/opt/rust-manager
+Environment=DOTNET_CLI_HOME=/opt/rust-manager
+Environment=TMPDIR=/tmp
+
+[Install]
+WantedBy=multi-user.target

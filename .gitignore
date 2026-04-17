@@ -1,0 +1,11 @@
+bin/
+obj/
+build/
+data/
+runtime/
+*.user
+*.suo
+*.log
+*.db
+*.env
+rustops.env

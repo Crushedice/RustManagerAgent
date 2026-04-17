@@ -1,0 +1,16 @@
+{
+  "ignoreContains": [
+    "Shader Soft Mask/TextMeshPro/Distance Field shader is not supported on this GPU",
+    "Shader Unsupported: 'Soft Mask/TextMeshPro/Distance Field' - All subshaders removed"
+  ],
+  "startupIgnoreContains": [
+    "shader is not supported on this gpu",
+    "all subshaders removed"
+  ],
+  "incidentContains": [
+    "Error while compiling",
+    "Failed to compile",
+    "Compilation failed",
+    "Exception while calling hook"
+  ]
+}

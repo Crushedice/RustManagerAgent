@@ -1,0 +1,47 @@
+{
+  "api": {
+    "baseUrl": "${RUSTOPS_API_BASE_URL}",
+    "apiKey": "${RUSTMGR_API_KEY}"
+  },
+  "monitor": {
+    "pollSeconds": 20,
+    "controlPollSeconds": 2,
+    "logLinesPerScan": 120,
+    "healthCooldownMinutes": 10
+  },
+  "memory": {
+    "statePath": "${RUSTOPS_AGENT_STATE_PATH}"
+  },
+  "inbox": {
+    "feedbackInboxPath": "${RUSTOPS_FEEDBACK_INBOX_PATH}",
+    "decisionInboxPath": "${RUSTOPS_DECISION_INBOX_PATH}",
+    "chatInboxPath": "${RUSTOPS_CHAT_INBOX_PATH}"
+  },
+  "outbox": {
+    "messageOutboxPath": "${RUSTOPS_MESSAGE_OUTBOX_PATH}"
+  },
+  "policy": {
+    "autoAllowedActions": [
+      "validate-oxide",
+      "inspect-host-network"
+    ],
+    "approvalRequiredActions": [
+      "restart-server",
+      "stop-server",
+      "start-server",
+      "update-server",
+      "wipe-server",
+      "write-config",
+      "modify-plugin",
+      "create-task"
+    ]
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "${RUSTOPS_LLM_PROVIDER}",
+    "baseUrl": "${RUSTOPS_LLM_BASE_URL}",
+    "model": "${RUSTOPS_LLM_MODEL}",
+    "apiKey": "${RUSTOPS_LLM_API_KEY}",
+    "useForRecommendations": true
+  }
+}
