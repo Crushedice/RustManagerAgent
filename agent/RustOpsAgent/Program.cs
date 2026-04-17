@@ -135,12 +135,17 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
         ?? config.Inbox.ChatInboxPath;
     config.Outbox.MessageOutboxPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_PATH")
         ?? config.Outbox.MessageOutboxPath;
+    config.Policy.AllowAnyServerCommand = RustOpsEnv.GetBoolean("RUSTOPS_ALLOW_ANY_SERVER_COMMAND", config.Policy.AllowAnyServerCommand);
+    var allowedCommandPrefixes = RustOpsEnv.GetCsvValues("RUSTOPS_ALLOWED_SERVER_COMMAND_PREFIXES");
+    if (allowedCommandPrefixes.Count > 0)
+        config.Policy.AllowedServerCommandPrefixes = allowedCommandPrefixes;
 
     config.Monitor.PollSeconds = RustOpsEnv.GetInt32("RUSTOPS_AGENT_POLL_SECONDS", config.Monitor.PollSeconds);
     config.Monitor.ControlPollSeconds = RustOpsEnv.GetInt32("RUSTOPS_AGENT_CONTROL_POLL_SECONDS", config.Monitor.ControlPollSeconds);
     config.Monitor.LogLinesPerScan = RustOpsEnv.GetInt32("RUSTOPS_AGENT_LOG_LINES", config.Monitor.LogLinesPerScan);
     config.Monitor.HealthCooldownMinutes = RustOpsEnv.GetInt32("RUSTOPS_AGENT_HEALTH_COOLDOWN_MINUTES", config.Monitor.HealthCooldownMinutes);
     config.Monitor.StartupIgnoreSeconds = RustOpsEnv.GetInt32("RUSTOPS_AGENT_STARTUP_IGNORE_SECONDS", config.Monitor.StartupIgnoreSeconds);
+    config.Monitor.PluginUpdateCheckMinutes = RustOpsEnv.GetInt32("RUSTOPS_AGENT_PLUGIN_UPDATE_CHECK_MINUTES", config.Monitor.PluginUpdateCheckMinutes);
     config.Monitor.LogRulesPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_LOG_RULES_PATH")
         ?? config.Monitor.LogRulesPath;
     config.SelfRepair.Enabled = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_ENABLED", config.SelfRepair.Enabled);
@@ -154,6 +159,7 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
     config.SelfRepair.AllowScopeFileWrites = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_ALLOW_SCOPE_WRITES", config.SelfRepair.AllowScopeFileWrites);
     config.SelfRepair.ApplyLogRuleUpdates = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_APPLY_LOG_RULES", config.SelfRepair.ApplyLogRuleUpdates);
     config.SelfRepair.ApplyReplyStyleUpdates = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_APPLY_REPLY_STYLE", config.SelfRepair.ApplyReplyStyleUpdates);
+    config.SelfRepair.NotifyAdmins = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_NOTIFY_ADMINS", config.SelfRepair.NotifyAdmins);
 
     config.Llm.Provider = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_PROVIDER")
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Provider);
@@ -167,6 +173,9 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ApiKey);
     config.Llm.UseForRecommendations = RustOpsEnv.GetBoolean("RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS",
         RustOpsEnv.GetBoolean("RUSTOPS_OLLAMA_USE_FOR_RECOMMENDATIONS", config.Llm.UseForRecommendations));
+    config.Llm.UseChatSystemPrompt = RustOpsEnv.GetBoolean("RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT", config.Llm.UseChatSystemPrompt);
+    config.Llm.ChatSystemPrompt = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ChatSystemPrompt);
 }
 
 static void ValidateResolvedConfig(AgentConfig config)
@@ -241,6 +250,7 @@ static class AgentLogRulesFile
 internal sealed class RustOpsAgent
 {
     private static readonly Regex CompileErrorPattern = new(@"\bCS\d{4}\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private static readonly Regex OxideInfoAttributePattern = new(@"\[\s*Info\s*\(\s*""(?<title>[^""]+)""\s*,\s*""(?<author>[^""]*)""\s*,\s*""(?<version>[^""]+)""\s*\)\s*\]", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly string[] KnownChatToolNames =
     {
         "list_servers",
@@ -256,6 +266,11 @@ internal sealed class RustOpsAgent
         "restart_server",
         "get_server_players",
         "get_server_events",
+        "execute_server_command",
+        "get_server_command_memory",
+        "teach_server_command",
+        "list_server_plugins",
+        "check_plugin_updates",
         "diagnose_agent_runtime",
         "list_scope_files",
         "read_scope_file",
@@ -266,6 +281,23 @@ internal sealed class RustOpsAgent
         "update_log_rules",
         "update_reply_style"
     };
+    private const string DefaultChatToolSystemPrompt = """
+You are a local Rust server operations agent talking to an admin.
+Use the provided tools to inspect state and perform bounded operations.
+Prefer using tools over guessing.
+For start, stop, restart, and validate-oxide you must target a known server.
+If the server is unclear, ask a concise clarification question instead of guessing.
+Use recent memory, incidents, and action history to explain what is happening.
+Reply naturally, with concrete operational language.
+Start with the direct answer, then key evidence or next action.
+Do not invent facts.
+You may use self-diagnostics and workspace tools to improve your own behavior.
+Any file writes must stay inside the configured self-repair scope root.
+If an admin asks to execute a server console command, use execute_server_command.
+If an admin asks what a command does, use get_server_command_memory.
+If an admin teaches command behavior, use teach_server_command.
+If an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.
+""";
     private readonly AgentConfig _config;
     private readonly RustMgrApiClient _api;
     private readonly RustMgrExecutor _executor;
@@ -413,7 +445,7 @@ internal sealed class RustOpsAgent
         var run = ApplySelfRepairPlan(plan, utcNow);
         _memory.RecordSelfRepairRun(run);
 
-        if (run.AppliedActions > 0)
+        if (run.AppliedActions > 0 && _config.SelfRepair.NotifyAdmins)
         {
             WriteOutboxMessage(new AdapterMessage
             {
@@ -760,6 +792,8 @@ internal sealed class RustOpsAgent
                 await QueueOrExecuteActionAsync(serverMemory, server, incident, utcNow);
             }
 
+            await TryCheckPluginUpdatesAsync(server.Name, serverMemory, utcNow);
+
             serverMemory.LastStatus = server.State;
             serverMemory.LastObservedAtUtc = utcNow;
             serverMemory.LastKnownPid = server.Pid;
@@ -1013,7 +1047,23 @@ internal sealed class RustOpsAgent
         var conversation = adminPreference.Conversation ??= new AdminConversationState();
         RememberChatTurn(conversation, "user", message, utcNow);
 
+        var preferenceAck = TryCaptureAdminPreferenceFromChat(adminPreference, message, utcNow);
+        if (!string.IsNullOrWhiteSpace(preferenceAck))
+        {
+            RememberChatTurn(conversation, "assistant", preferenceAck, utcNow);
+            adminPreference.LastUpdatedAtUtc = utcNow;
+            return preferenceAck;
+        }
+
         var servers = await GetServerSnapshotsAsync();
+        var directCommandReply = await TryHandleDirectCommandMessageAsync(adminId, message, servers, utcNow);
+        if (!string.IsNullOrWhiteSpace(directCommandReply))
+        {
+            RememberChatTurn(conversation, "assistant", directCommandReply, utcNow);
+            adminPreference.LastUpdatedAtUtc = utcNow;
+            return directCommandReply;
+        }
+
         if (_config.Llm.Enabled)
         {
             var toolReply = await TryHandleChatWithLlmToolsAsync(adminId, message, servers, conversation, adminPreference, utcNow);
@@ -1073,6 +1123,103 @@ internal sealed class RustOpsAgent
         return reply;
     }
 
+    private async Task<string?> TryHandleDirectCommandMessageAsync(string adminId, string message, List<ServerSnapshot> servers, DateTime utcNow)
+    {
+        var text = message.Trim();
+        var runMatch = Regex.Match(text, @"^(run|execute)\s+command\s+(?<command>.+?)\s+on\s+(?<server>[A-Za-z0-9_\-]+)$", RegexOptions.IgnoreCase);
+        if (runMatch.Success)
+        {
+            var requestedServer = runMatch.Groups["server"].Value.Trim();
+            var serverName = ResolveServerName(requestedServer, servers);
+            if (string.IsNullOrWhiteSpace(serverName))
+                return BuildServerNotFoundReply(servers);
+
+            var command = runMatch.Groups["command"].Value.Trim();
+            if (!_config.Policy.IsServerCommandAllowed(command))
+            {
+                return $"Command '{NormalizeCommandKey(command)}' is blocked by policy. Update allowlist or enable allowAnyServerCommand.";
+            }
+
+            JsonDocument json;
+            try
+            {
+                json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(serverName)}/command", new
+                {
+                    command
+                });
+            }
+            catch (Exception ex)
+            {
+                return $"{serverName}: command execution failed: {ex.Message}";
+            }
+            using (json)
+            {
+            var ok = json.RootElement.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+            var stdout = json.RootElement.TryGetProperty("stdOut", out var stdOutNode) && stdOutNode.ValueKind == JsonValueKind.String
+                ? stdOutNode.GetString() ?? string.Empty
+                : string.Empty;
+            var stderr = json.RootElement.TryGetProperty("stdErr", out var stdErrNode) && stdErrNode.ValueKind == JsonValueKind.String
+                ? stdErrNode.GetString() ?? string.Empty
+                : string.Empty;
+            var summary = BuildCommandOutputSummary(stdout, stderr);
+            RecordCommandKnowledge(serverName, command, summary, ok, adminId, utcNow);
+
+            return $"{serverName}: command '{command}' {(ok ? "executed" : "failed")} | {TrimSingleLine(summary, 260)}";
+            }
+        }
+
+        var askMatch = Regex.Match(text, @"^what\s+does\s+command\s+(?<command>.+?)(\s+on\s+(?<server>[A-Za-z0-9_\-]+))?$", RegexOptions.IgnoreCase);
+        if (!askMatch.Success)
+            return null;
+
+        var commandFilter = NormalizeCommandKey(askMatch.Groups["command"].Value.Trim());
+        var requestedServerName = askMatch.Groups["server"].Success
+            ? ResolveServerName(askMatch.Groups["server"].Value.Trim(), servers)
+            : servers.FirstOrDefault()?.Name;
+        if (string.IsNullOrWhiteSpace(requestedServerName))
+            return "Specify a server to check command memory.";
+
+        var serverMemory = _memory.GetOrCreateServer(requestedServerName);
+        serverMemory.KnownConsoleCommands ??= new List<KnownConsoleCommand>();
+        var known = serverMemory.KnownConsoleCommands
+            .FirstOrDefault(entry => string.Equals(entry.Command, commandFilter, StringComparison.OrdinalIgnoreCase));
+        if (known is null)
+            return $"{requestedServerName}: no learned command memory for '{commandFilter}' yet.";
+
+        return $"{requestedServerName}: {known.Command} | purpose={known.Purpose ?? "unknown"} | usefulWhen={known.UsefulWhen ?? "unknown"} | lastOutput={known.LastOutputSummary ?? "n/a"} | observations={known.Observations}";
+    }
+
+    private static string? TryCaptureAdminPreferenceFromChat(AdminPreference adminPreference, string message, DateTime utcNow)
+    {
+        var lowered = message.Trim().ToLowerInvariant();
+        var captured = string.Empty;
+
+        if (lowered.StartsWith("preference:", StringComparison.Ordinal) ||
+            lowered.StartsWith("remember preference", StringComparison.Ordinal))
+        {
+            captured = message.Split(':', 2).Skip(1).FirstOrDefault()?.Trim() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(captured))
+                captured = message["remember preference".Length..].Trim();
+        }
+        else if (lowered.Contains("don't mention selfrepair", StringComparison.Ordinal) ||
+                 lowered.Contains("dont mention selfrepair", StringComparison.Ordinal) ||
+                 lowered.Contains("do not mention selfrepair", StringComparison.Ordinal) ||
+                 lowered.Contains("don't mention self-repair", StringComparison.Ordinal) ||
+                 lowered.Contains("dont mention self-repair", StringComparison.Ordinal) ||
+                 lowered.Contains("do not mention self-repair", StringComparison.Ordinal))
+        {
+            captured = "Do not mention routine self-repair actions unless explicitly asked.";
+        }
+
+        if (string.IsNullOrWhiteSpace(captured))
+            return null;
+
+        adminPreference.Preferences.Add(TrimSingleLine(captured, 240));
+        adminPreference.Preferences = adminPreference.Preferences.TakeLast(80).ToList();
+        adminPreference.LastUpdatedAtUtc = utcNow;
+        return $"Preference saved: {TrimSingleLine(captured, 160)}";
+    }
+
     private async Task<List<ServerSnapshot>> GetServerSnapshotsAsync()
     {
         using var summary = await _api.GetJsonAsync("/servers/summary");
@@ -1129,6 +1276,12 @@ internal sealed class RustOpsAgent
         var relevantServerMemory = !string.IsNullOrWhiteSpace(relevantServerName)
             ? _memory.GetOrCreateServer(relevantServerName)
             : null;
+        if (relevantServerMemory is not null)
+        {
+            relevantServerMemory.KnownConsoleCommands ??= new List<KnownConsoleCommand>();
+            relevantServerMemory.CommandInteractions ??= new List<ConsoleCommandInteraction>();
+            relevantServerMemory.KnownPlugins ??= new List<KnownPluginRecord>();
+        }
 
         return new ChatPlanningContext
         {
@@ -1157,6 +1310,12 @@ internal sealed class RustOpsAgent
                 .Take(6)
                 .Select(incident => $"{incident.CreatedAtUtc:O} {TrimSingleLine(incident.Title, 120)}")
                 .ToList(),
+            CommandKnowledge = relevantServerMemory?.KnownConsoleCommands
+                .OrderByDescending(command => command.LastObservedAtUtc)
+                .Take(8)
+                .Select(command => $"{command.Command}: {TrimSingleLine(command.Purpose ?? command.LastOutputSummary ?? "observed", 140)}")
+                .ToList()
+                ?? new List<string>(),
             ReplyStyleGuidance = _replyStyleGuidance
         };
     }
@@ -1217,7 +1376,7 @@ internal sealed class RustOpsAgent
         var planningContext = BuildChatPlanningContext(message, servers, conversation, adminPreference);
         var messages = BuildToolConversationMessages(conversation, message);
         var toolDefinitions = BuildChatToolDefinitions();
-        var toolPrompt = BuildChatToolSystemPrompt(planningContext, conversation, _replyStyleGuidance);
+        var toolPrompt = BuildChatToolSystemPrompt(planningContext, conversation, _replyStyleGuidance, _config.Llm);
         var lastServerName = string.Empty;
         var pendingClarificationIntent = string.Empty;
         var lifecycleMutations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1261,9 +1420,10 @@ internal sealed class RustOpsAgent
                 }
             }
 
-            var finalReply = await _llm.RequestChatCompletionAsync(
-                toolPrompt + "\nUse the tool results already present in the conversation. Reply directly to the admin. Do not call more tools.",
-                messages);
+            var finalPrompt = string.IsNullOrWhiteSpace(toolPrompt)
+                ? "Use the tool results already present in the conversation. Reply directly to the admin. Do not call more tools."
+                : toolPrompt + "\nUse the tool results already present in the conversation. Reply directly to the admin. Do not call more tools.";
+            var finalReply = await _llm.RequestChatCompletionAsync(finalPrompt, messages);
 
             if (string.IsNullOrWhiteSpace(finalReply))
                 return null;
@@ -1294,21 +1454,17 @@ internal sealed class RustOpsAgent
         return messages;
     }
 
-    private static string BuildChatToolSystemPrompt(ChatPlanningContext planningContext, AdminConversationState conversation, string replyStyleGuidance)
+    private static string BuildChatToolSystemPrompt(ChatPlanningContext planningContext, AdminConversationState conversation, string replyStyleGuidance, LlmSettings llmSettings)
     {
+        if (!llmSettings.UseChatSystemPrompt)
+            return string.Empty;
+
+        var preamble = string.IsNullOrWhiteSpace(llmSettings.ChatSystemPrompt)
+            ? DefaultChatToolSystemPrompt
+            : llmSettings.ChatSystemPrompt.Trim();
         var lastServer = string.IsNullOrWhiteSpace(conversation.LastServerName) ? "none" : conversation.LastServerName;
         return $$"""
-        You are a local Rust server operations agent talking to an admin.
-        Use the provided tools to inspect state and perform bounded operations.
-        Prefer using tools over guessing.
-        For start, stop, restart, and validate-oxide you must target a known server.
-        If the server is unclear, ask a concise clarification question instead of guessing.
-        Use recent memory, incidents, and action history to explain what is happening.
-        Reply naturally, with concrete operational language.
-        Start with the direct answer, then key evidence or next action.
-        Do not invent facts.
-        You may use self-diagnostics and workspace tools to improve your own behavior.
-        Any file writes must stay inside the configured self-repair scope root.
+        {{preamble}}
 
         Reply style guidance:
         {{(string.IsNullOrWhiteSpace(replyStyleGuidance) ? "Use concise, natural admin language." : replyStyleGuidance)}}
@@ -1339,6 +1495,9 @@ internal sealed class RustOpsAgent
 
         Recent incidents:
         {{FormatPromptList(planningContext.RecentIncidents)}}
+
+        Known server command behavior:
+        {{FormatPromptList(planningContext.CommandKnowledge)}}
         """;
     }
 
@@ -1396,6 +1555,26 @@ internal sealed class RustOpsAgent
             "get_server_events",
             "Get recent command/event traces for one named server.",
             BuildServerEventToolParameters()),
+        BuildToolDefinition(
+            "execute_server_command",
+            "Execute one server console command and capture stdout/stderr plus command-trace evidence.",
+            BuildServerCommandToolParameters()),
+        BuildToolDefinition(
+            "get_server_command_memory",
+            "Get learned server command behavior and recent command interaction summaries.",
+            BuildServerCommandMemoryToolParameters()),
+        BuildToolDefinition(
+            "teach_server_command",
+            "Store admin-provided guidance for what a server command does and when to use it.",
+            BuildTeachCommandToolParameters()),
+        BuildToolDefinition(
+            "list_server_plugins",
+            "List Oxide plugins for one server, including [Info] title/author/version when available.",
+            BuildServerToolParameters()),
+        BuildToolDefinition(
+            "check_plugin_updates",
+            "Check uMod for newer plugin versions for one server and return update candidates.",
+            BuildPluginUpdateToolParameters()),
         BuildToolDefinition(
             "diagnose_agent_runtime",
             "Inspect agent runtime errors, failed actions, and capability gaps.",
@@ -1498,6 +1677,101 @@ internal sealed class RustOpsAgent
             }
         },
         required = new[] { "serverName", "limit" }
+    };
+
+    private static object BuildServerCommandToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            serverName = new
+            {
+                type = "string",
+                description = "Exact server name."
+            },
+            command = new
+            {
+                type = "string",
+                description = "Console command text, for example oxide.plugins."
+            }
+        },
+        required = new[] { "serverName", "command" }
+    };
+
+    private static object BuildServerCommandMemoryToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            serverName = new
+            {
+                type = "string",
+                description = "Exact server name."
+            },
+            command = new
+            {
+                type = "string",
+                description = "Optional command name to filter by."
+            },
+            limit = new
+            {
+                type = "integer",
+                description = "Maximum records to return."
+            }
+        },
+        required = new[] { "serverName", "command", "limit" }
+    };
+
+    private static object BuildTeachCommandToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            serverName = new
+            {
+                type = "string",
+                description = "Exact server name."
+            },
+            command = new
+            {
+                type = "string",
+                description = "Command name or full command text."
+            },
+            purpose = new
+            {
+                type = "string",
+                description = "What this command is used for."
+            },
+            usefulWhen = new
+            {
+                type = "string",
+                description = "Operational situation where this command helps."
+            }
+        },
+        required = new[] { "serverName", "command", "purpose", "usefulWhen" }
+    };
+
+    private static object BuildPluginUpdateToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            serverName = new
+            {
+                type = "string",
+                description = "Exact server name."
+            },
+            notifyAdmins = new
+            {
+                type = "boolean",
+                description = "If true, send an adapter outbox message when updates are found."
+            }
+        },
+        required = new[] { "serverName", "notifyAdmins" }
     };
 
     private static object BuildWorkspaceListToolParameters() => new
@@ -1678,6 +1952,11 @@ internal sealed class RustOpsAgent
             "restart_server" => await ExecuteLifecycleToolAsync(adminId, arguments, servers, utcNow, lifecycleMutations, "restart-server"),
             "get_server_players" => await ExecuteServerPlayersToolAsync(arguments, servers),
             "get_server_events" => await ExecuteServerEventsToolAsync(arguments, servers),
+            "execute_server_command" => await ExecuteServerCommandToolAsync(arguments, servers, adminId, utcNow),
+            "get_server_command_memory" => ExecuteServerCommandMemoryTool(arguments, servers),
+            "teach_server_command" => ExecuteTeachServerCommandTool(arguments, servers, adminId, utcNow),
+            "list_server_plugins" => await ExecuteListServerPluginsToolAsync(arguments, servers),
+            "check_plugin_updates" => await ExecuteCheckPluginUpdatesToolAsync(arguments, servers, utcNow),
             "diagnose_agent_runtime" => ExecuteDiagnoseAgentRuntimeTool(),
             "list_scope_files" => ExecuteListScopeFilesTool(arguments),
             "read_scope_file" => ExecuteReadScopeFileTool(arguments),
@@ -1736,6 +2015,231 @@ internal sealed class RustOpsAgent
         var limit = ReadToolIntArgument(arguments, "limit", 40, 5, 200);
         using var json = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(resolution.Server!.Name)}/events?lines={limit}");
         return ChatToolExecutionResult.Success(json.RootElement.GetRawText(), resolution.Server.Name);
+    }
+
+    private async Task<ChatToolExecutionResult> ExecuteServerCommandToolAsync(JsonElement arguments, List<ServerSnapshot> servers, string adminId, DateTime utcNow)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "server-command");
+        if (!resolution.Matched)
+            return resolution.Result;
+        var server = resolution.Server!;
+
+        var command = ReadToolArgument(arguments, "command");
+        if (string.IsNullOrWhiteSpace(command))
+            return ChatToolExecutionResult.Error("command is required.", server.Name, "execute_server_command");
+        if (command.Contains('\n') || command.Contains('\r'))
+            return ChatToolExecutionResult.Error("command must be a single line.", server.Name, "execute_server_command");
+
+        command = command.Trim();
+        if (command.Length > 300)
+            return ChatToolExecutionResult.Error("command length exceeds 300 characters.", server.Name, "execute_server_command");
+        if (!_config.Policy.IsServerCommandAllowed(command))
+        {
+            return ChatToolExecutionResult.Error(
+                $"command '{NormalizeCommandKey(command)}' is blocked by policy. Adjust allowed prefixes or enable allowAnyServerCommand.",
+                server.Name,
+                "execute_server_command");
+        }
+
+        JsonDocument json;
+        try
+        {
+            json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/command", new
+            {
+                command
+            });
+        }
+        catch (Exception ex)
+        {
+            return ChatToolExecutionResult.Error(ex.Message, server.Name, "execute_server_command");
+        }
+        using (json)
+        {
+            var ok = json.RootElement.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+            var exitCode = json.RootElement.TryGetProperty("exitCode", out var exitCodeNode) && exitCodeNode.ValueKind == JsonValueKind.Number
+                ? exitCodeNode.GetInt32()
+                : 0;
+            var stdout = json.RootElement.TryGetProperty("stdOut", out var stdOutNode) && stdOutNode.ValueKind == JsonValueKind.String
+                ? stdOutNode.GetString() ?? string.Empty
+                : string.Empty;
+            var stderr = json.RootElement.TryGetProperty("stdErr", out var stdErrNode) && stdErrNode.ValueKind == JsonValueKind.String
+                ? stdErrNode.GetString() ?? string.Empty
+                : string.Empty;
+
+            var summary = BuildCommandOutputSummary(stdout, stderr);
+            RecordCommandKnowledge(server.Name, command, summary, ok, adminId, utcNow);
+
+            using var eventsJson = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/events?lines=20");
+            var recentEvents = ExtractTraceEventMessages(eventsJson.RootElement, 6);
+
+            return ChatToolExecutionResult.Success(SerializeToolPayload(new
+            {
+                ok,
+                serverName = server.Name,
+                command,
+                exitCode,
+                summary,
+                stdout = TrimSingleLine(stdout, 2000),
+                stderr = TrimSingleLine(stderr, 1200),
+                recentEvents
+            }), server.Name);
+        }
+    }
+
+    private ChatToolExecutionResult ExecuteServerCommandMemoryTool(JsonElement arguments, List<ServerSnapshot> servers)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "server-command-memory");
+        if (!resolution.Matched)
+            return resolution.Result;
+
+        var commandFilter = NormalizeCommandKey(ReadToolArgument(arguments, "command"));
+        var limit = ReadToolIntArgument(arguments, "limit", 8, 1, 30);
+        var serverMemory = _memory.GetOrCreateServer(resolution.Server!.Name);
+        serverMemory.KnownConsoleCommands ??= new List<KnownConsoleCommand>();
+        serverMemory.CommandInteractions ??= new List<ConsoleCommandInteraction>();
+
+        var known = serverMemory.KnownConsoleCommands
+            .Where(entry => string.IsNullOrWhiteSpace(commandFilter) ||
+                            string.Equals(entry.Command, commandFilter, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(entry => entry.LastObservedAtUtc)
+            .Take(limit)
+            .ToList();
+
+        var recent = serverMemory.CommandInteractions
+            .Where(entry => string.IsNullOrWhiteSpace(commandFilter) ||
+                            string.Equals(entry.CommandKey, commandFilter, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(entry => entry.AtUtc)
+            .Take(limit)
+            .ToList();
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            serverName = resolution.Server.Name,
+            knownCommands = known,
+            recentInteractions = recent
+        }), resolution.Server.Name);
+    }
+
+    private ChatToolExecutionResult ExecuteTeachServerCommandTool(JsonElement arguments, List<ServerSnapshot> servers, string adminId, DateTime utcNow)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "teach-server-command");
+        if (!resolution.Matched)
+            return resolution.Result;
+
+        var command = ReadToolArgument(arguments, "command");
+        var purpose = ReadToolArgument(arguments, "purpose");
+        var usefulWhen = ReadToolArgument(arguments, "usefulWhen");
+        if (string.IsNullOrWhiteSpace(command))
+            return ChatToolExecutionResult.Error("command is required.", resolution.Server!.Name, "teach_server_command");
+
+        RecordCommandKnowledge(
+            resolution.Server!.Name,
+            command,
+            string.IsNullOrWhiteSpace(purpose) ? "admin guidance recorded" : purpose,
+            success: true,
+            adminId,
+            utcNow,
+            purpose,
+            usefulWhen);
+
+        var adminPreference = _memory.GetOrCreateAdmin(adminId);
+        var note = $"command {NormalizeCommandKey(command)}: {purpose} | useful when {usefulWhen}".Trim();
+        if (!string.IsNullOrWhiteSpace(note))
+        {
+            adminPreference.Preferences.Add(note);
+            adminPreference.Preferences = adminPreference.Preferences.TakeLast(80).ToList();
+            adminPreference.LastUpdatedAtUtc = utcNow;
+        }
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            serverName = resolution.Server.Name,
+            command = NormalizeCommandKey(command),
+            purpose = purpose,
+            usefulWhen = usefulWhen
+        }), resolution.Server.Name);
+    }
+
+    private async Task<ChatToolExecutionResult> ExecuteListServerPluginsToolAsync(JsonElement arguments, List<ServerSnapshot> servers)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "list-server-plugins");
+        if (!resolution.Matched)
+            return resolution.Result;
+
+        List<ServerPluginInfo> plugins;
+        try
+        {
+            plugins = await ReadServerPluginsAsync(resolution.Server!.Name);
+        }
+        catch (Exception ex)
+        {
+            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name, "list_server_plugins");
+        }
+        var serverMemory = _memory.GetOrCreateServer(resolution.Server.Name);
+        serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
+        serverMemory.KnownPlugins = plugins
+            .Select(plugin => new KnownPluginRecord
+            {
+                Name = plugin.Name,
+                Author = plugin.Author,
+                Version = plugin.Version,
+                FilePath = plugin.Path,
+                LastSeenAtUtc = DateTime.UtcNow
+            })
+            .TakeLast(200)
+            .ToList();
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            serverName = resolution.Server.Name,
+            pluginCount = plugins.Count,
+            plugins
+        }), resolution.Server.Name);
+    }
+
+    private async Task<ChatToolExecutionResult> ExecuteCheckPluginUpdatesToolAsync(JsonElement arguments, List<ServerSnapshot> servers, DateTime utcNow)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "check-plugin-updates");
+        if (!resolution.Matched)
+            return resolution.Result;
+
+        var notifyAdmins = ReadToolBooleanArgument(arguments, "notifyAdmins", true);
+        List<PluginUpdateCandidate> updates;
+        try
+        {
+            updates = await GetPluginUpdatesAsync(resolution.Server!.Name);
+        }
+        catch (Exception ex)
+        {
+            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name, "check_plugin_updates");
+        }
+        var serverMemory = _memory.GetOrCreateServer(resolution.Server.Name);
+        serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
+        serverMemory.LastPluginUpdateCheckAtUtc = utcNow;
+        serverMemory.LastPluginUpdateSignature = BuildPluginUpdateSignature(updates);
+
+        if (updates.Count > 0 && notifyAdmins)
+        {
+            WriteOutboxMessage(new AdapterMessage
+            {
+                CreatedAtUtc = utcNow,
+                Kind = "plugin-update",
+                ServerName = resolution.Server.Name,
+                Audience = "admins",
+                Message = BuildPluginUpdateAdminMessage(resolution.Server.Name, updates)
+            });
+        }
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            serverName = resolution.Server.Name,
+            updateCount = updates.Count,
+            updates
+        }), resolution.Server.Name);
     }
 
     private ChatToolExecutionResult ExecuteDiagnoseAgentRuntimeTool()
@@ -2259,6 +2763,35 @@ internal sealed class RustOpsAgent
         return fallback;
     }
 
+    private static bool ReadToolBooleanArgument(JsonElement arguments, string name, bool fallback)
+    {
+        if (arguments.ValueKind != JsonValueKind.Object)
+            return fallback;
+
+        foreach (var property in arguments.EnumerateObject())
+        {
+            if (!string.Equals(property.Name, name, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (property.Value.ValueKind == JsonValueKind.True)
+                return true;
+            if (property.Value.ValueKind == JsonValueKind.False)
+                return false;
+            if (property.Value.ValueKind == JsonValueKind.String)
+            {
+                var value = property.Value.GetString();
+                if (string.IsNullOrWhiteSpace(value))
+                    return fallback;
+                return value.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                       value.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                       value.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+                       value.Equals("on", StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        return fallback;
+    }
+
     private static List<string> ReadToolStringArray(JsonElement arguments, string name)
     {
         if (arguments.ValueKind != JsonValueKind.Object)
@@ -2299,6 +2832,11 @@ internal sealed class RustOpsAgent
             "restart-server" => "restart_server",
             "get-server-players" => "get_server_players",
             "get-server-events" => "get_server_events",
+            "execute-server-command" => "execute_server_command",
+            "get-server-command-memory" => "get_server_command_memory",
+            "teach-server-command" => "teach_server_command",
+            "list-server-plugins" => "list_server_plugins",
+            "check-plugin-updates" => "check_plugin_updates",
             "diagnose-agent-runtime" => "diagnose_agent_runtime",
             "list-scope-files" => "list_scope_files",
             "read-scope-file" => "read_scope_file",
@@ -2681,7 +3219,12 @@ internal sealed class RustOpsAgent
             "- health modded",
             "- players vanilla",
             "- recent events onegrid",
+            "- run command oxide.plugins on modded",
+            "- what does command oxide.plugins do on modded",
+            "- teach command oxide.plugins on modded: lists loaded plugins",
             "- validate oxide sandbox",
+            "- list plugins modded",
+            "- check plugin updates modded",
             "- inspect host network throughput",
             "- restart onegrid",
             "- show pending actions",
@@ -3391,6 +3934,301 @@ internal sealed class RustOpsAgent
         _memory.PendingActions = _memory.PendingActions.TakeLast(200).ToList();
     }
 
+    private static string BuildCommandOutputSummary(string stdout, string stderr)
+    {
+        var stdoutLines = (stdout ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Take(3)
+            .ToList();
+        var stderrLines = (stderr ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Take(2)
+            .ToList();
+
+        var parts = new List<string>();
+        if (stdoutLines.Count > 0)
+            parts.Add($"stdout: {string.Join(" | ", stdoutLines.Select(line => TrimSingleLine(line, 180)))}");
+        if (stderrLines.Count > 0)
+            parts.Add($"stderr: {string.Join(" | ", stderrLines.Select(line => TrimSingleLine(line, 180)))}");
+        if (parts.Count == 0)
+            return "command executed with no output";
+        return string.Join(" || ", parts);
+    }
+
+    private static List<string> ExtractTraceEventMessages(JsonElement root, int takeLast)
+    {
+        if (!root.TryGetProperty("events", out var events) || events.ValueKind != JsonValueKind.Array)
+            return new List<string>();
+
+        return events.EnumerateArray()
+            .Select(entry => entry.TryGetProperty("message", out var node) && node.ValueKind == JsonValueKind.String ? node.GetString() : null)
+            .Where(message => !string.IsNullOrWhiteSpace(message))
+            .Select(message => message!.Trim())
+            .TakeLast(takeLast)
+            .ToList();
+    }
+
+    private void RecordCommandKnowledge(
+        string serverName,
+        string commandText,
+        string summary,
+        bool success,
+        string adminId,
+        DateTime utcNow,
+        string? purpose = null,
+        string? usefulWhen = null)
+    {
+        var commandKey = NormalizeCommandKey(commandText);
+        if (string.IsNullOrWhiteSpace(commandKey))
+            return;
+
+        var memory = _memory.GetOrCreateServer(serverName);
+        memory.KnownConsoleCommands ??= new List<KnownConsoleCommand>();
+        memory.CommandInteractions ??= new List<ConsoleCommandInteraction>();
+        var known = memory.KnownConsoleCommands
+            .FirstOrDefault(entry => string.Equals(entry.Command, commandKey, StringComparison.OrdinalIgnoreCase));
+
+        if (known is null)
+        {
+            known = new KnownConsoleCommand
+            {
+                Command = commandKey
+            };
+            memory.KnownConsoleCommands.Add(known);
+        }
+
+        known.Observations++;
+        known.LastObservedAtUtc = utcNow;
+        if (!string.IsNullOrWhiteSpace(purpose))
+            known.Purpose = TrimSingleLine(purpose, 220);
+        if (!string.IsNullOrWhiteSpace(usefulWhen))
+            known.UsefulWhen = TrimSingleLine(usefulWhen, 220);
+        if (!string.IsNullOrWhiteSpace(summary))
+            known.LastOutputSummary = TrimSingleLine(summary, 220);
+
+        memory.KnownConsoleCommands = memory.KnownConsoleCommands
+            .OrderByDescending(entry => entry.LastObservedAtUtc)
+            .Take(120)
+            .ToList();
+
+        memory.CommandInteractions.Add(new ConsoleCommandInteraction
+        {
+            AtUtc = utcNow,
+            CommandKey = commandKey,
+            RawCommand = commandText.Trim(),
+            Success = success,
+            Summary = TrimSingleLine(summary, 260),
+            AdminId = adminId
+        });
+        memory.CommandInteractions = memory.CommandInteractions
+            .OrderByDescending(entry => entry.AtUtc)
+            .Take(200)
+            .ToList();
+    }
+
+    private static string NormalizeCommandKey(string? commandText)
+    {
+        if (string.IsNullOrWhiteSpace(commandText))
+            return string.Empty;
+
+        var command = commandText.Trim();
+        var firstToken = command.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? command;
+        return firstToken.Trim().ToLowerInvariant();
+    }
+
+    private async Task TryCheckPluginUpdatesAsync(string serverName, ServerMemory serverMemory, DateTime utcNow)
+    {
+        var intervalMinutes = Math.Max(10, _config.Monitor.PluginUpdateCheckMinutes);
+        serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
+        if (serverMemory.LastPluginUpdateCheckAtUtc.HasValue &&
+            utcNow - serverMemory.LastPluginUpdateCheckAtUtc.Value < TimeSpan.FromMinutes(intervalMinutes))
+        {
+            return;
+        }
+
+        serverMemory.LastPluginUpdateCheckAtUtc = utcNow;
+        List<PluginUpdateCandidate> updates;
+        try
+        {
+            updates = await GetPluginUpdatesAsync(serverName);
+        }
+        catch (Exception ex)
+        {
+            _memory.RecordAgentError($"plugin update check failed for {serverName}: {ex.Message}");
+            SentrySdk.CaptureException(ex);
+            return;
+        }
+        var signature = BuildPluginUpdateSignature(updates);
+        if (updates.Count == 0 || string.Equals(signature, serverMemory.LastPluginUpdateSignature, StringComparison.Ordinal))
+            return;
+
+        serverMemory.LastPluginUpdateSignature = signature;
+        WriteOutboxMessage(new AdapterMessage
+        {
+            CreatedAtUtc = utcNow,
+            Kind = "plugin-update",
+            ServerName = serverName,
+            Audience = "admins",
+            Message = BuildPluginUpdateAdminMessage(serverName, updates)
+        });
+    }
+
+    private static string BuildPluginUpdateSignature(IReadOnlyCollection<PluginUpdateCandidate> updates) =>
+        updates.Count == 0
+            ? string.Empty
+            : string.Join('|', updates
+                .OrderBy(update => update.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(update => $"{update.Name}:{update.LocalVersion}->{update.RemoteVersion}"));
+
+    private static string BuildPluginUpdateAdminMessage(string serverName, IReadOnlyCollection<PluginUpdateCandidate> updates)
+    {
+        var lines = updates
+            .Take(8)
+            .Select(update => $"{update.Name} {update.LocalVersion} -> {update.RemoteVersion}")
+            .ToList();
+        return lines.Count == 0
+            ? $"Plugin update scan finished for {serverName}. No updates found."
+            : $"Plugin updates found for {serverName}:\n- {string.Join("\n- ", lines)}\nReply with your preferred action.";
+    }
+
+    private async Task<List<PluginUpdateCandidate>> GetPluginUpdatesAsync(string serverName)
+    {
+        var plugins = await ReadServerPluginsAsync(serverName);
+        if (plugins.Count == 0)
+            return new List<PluginUpdateCandidate>();
+
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+        var updates = new List<PluginUpdateCandidate>();
+        foreach (var plugin in plugins)
+        {
+            if (string.IsNullOrWhiteSpace(plugin.Name) || string.IsNullOrWhiteSpace(plugin.Version))
+                continue;
+
+            var query = Uri.EscapeDataString(plugin.Name);
+            var url = $"https://umod.org/plugins/search.json?query={query}&page=1&sort=title&sortdir=asc&filter=rust";
+            string jsonText;
+            try
+            {
+                jsonText = await client.GetStringAsync(url);
+            }
+            catch
+            {
+                continue;
+            }
+
+            JsonDocument? json = null;
+            try
+            {
+                json = JsonDocument.Parse(jsonText);
+            }
+            catch
+            {
+            }
+
+            if (json is null ||
+                !json.RootElement.TryGetProperty("data", out var dataNode) ||
+                dataNode.ValueKind != JsonValueKind.Array)
+            {
+                json?.Dispose();
+                continue;
+            }
+
+            var match = dataNode.EnumerateArray()
+                .Select(item => new
+                {
+                    Title = item.TryGetProperty("title", out var titleNode) && titleNode.ValueKind == JsonValueKind.String ? titleNode.GetString() : null,
+                    Name = item.TryGetProperty("name", out var nameNode) && nameNode.ValueKind == JsonValueKind.String ? nameNode.GetString() : null,
+                    RemoteVersion = item.TryGetProperty("latest_release_version", out var versionNode) && versionNode.ValueKind == JsonValueKind.String ? versionNode.GetString() : null,
+                    Url = item.TryGetProperty("url", out var urlNode) && urlNode.ValueKind == JsonValueKind.String ? urlNode.GetString() : null,
+                    DownloadUrl = item.TryGetProperty("download_url", out var downloadNode) && downloadNode.ValueKind == JsonValueKind.String ? downloadNode.GetString() : null
+                })
+                .FirstOrDefault(item =>
+                    string.Equals(item.Title, plugin.Name, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(item.Name, plugin.Name.Replace(" ", string.Empty), StringComparison.OrdinalIgnoreCase));
+
+            json.Dispose();
+            if (match is null || string.IsNullOrWhiteSpace(match.RemoteVersion))
+                continue;
+
+            if (CompareSemanticVersion(match.RemoteVersion!, plugin.Version) <= 0)
+                continue;
+
+            updates.Add(new PluginUpdateCandidate
+            {
+                Name = plugin.Name,
+                Author = plugin.Author,
+                LocalVersion = plugin.Version,
+                RemoteVersion = match.RemoteVersion!,
+                SourceUrl = match.Url ?? string.Empty,
+                DownloadUrl = match.DownloadUrl ?? string.Empty
+            });
+        }
+
+        return updates
+            .OrderBy(update => update.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private async Task<List<ServerPluginInfo>> ReadServerPluginsAsync(string serverName)
+    {
+        using var validationJson = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(serverName)}/oxide/validate");
+        if (!validationJson.RootElement.TryGetProperty("plugins", out var pluginsNode) || pluginsNode.ValueKind != JsonValueKind.Array)
+            return new List<ServerPluginInfo>();
+
+        var plugins = new List<ServerPluginInfo>();
+        foreach (var entry in pluginsNode.EnumerateArray())
+        {
+            if (!entry.TryGetProperty("path", out var pathNode) || pathNode.ValueKind != JsonValueKind.String)
+                continue;
+
+            var path = pathNode.GetString() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                continue;
+
+            var fileName = Path.GetFileNameWithoutExtension(path);
+            var text = File.ReadAllText(path);
+            var match = OxideInfoAttributePattern.Match(text);
+            var plugin = new ServerPluginInfo
+            {
+                Name = match.Success ? (match.Groups["title"].Value.Trim()) : fileName,
+                Author = match.Success ? (match.Groups["author"].Value.Trim()) : string.Empty,
+                Version = match.Success ? (match.Groups["version"].Value.Trim()) : string.Empty,
+                Path = path,
+                HasInfoAttribute = match.Success
+            };
+            plugins.Add(plugin);
+        }
+
+        return plugins
+            .OrderBy(plugin => plugin.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static int CompareSemanticVersion(string left, string right)
+    {
+        static int[] ParseParts(string value)
+        {
+            var normalized = value.Trim().TrimStart('v', 'V');
+            var cleaned = new string(normalized.Select(ch => char.IsDigit(ch) || ch == '.' ? ch : '.').ToArray());
+            return cleaned.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(part => int.TryParse(part, out var numeric) ? numeric : 0)
+                .ToArray();
+        }
+
+        var leftParts = ParseParts(left);
+        var rightParts = ParseParts(right);
+        var max = Math.Max(leftParts.Length, rightParts.Length);
+        for (var i = 0; i < max; i++)
+        {
+            var l = i < leftParts.Length ? leftParts[i] : 0;
+            var r = i < rightParts.Length ? rightParts[i] : 0;
+            if (l > r) return 1;
+            if (l < r) return -1;
+        }
+
+        return 0;
+    }
+
     private static string BuildIncidentTitle(ServerSnapshot server, List<string> evidence)
     {
         var first = evidence.FirstOrDefault() ?? "Issue detected";
@@ -3740,6 +4578,9 @@ Respond as strict JSON:
         Recent incidents:
         {{FormatContextList(planningContext.RecentIncidents)}}
 
+        Known command behavior:
+        {{FormatContextList(planningContext.CommandKnowledge)}}
+
         Pending clarification:
         {{pendingClarification}}
 
@@ -4046,10 +4887,11 @@ Respond as strict JSON:
 
     private static object[] BuildChatMessagesPayload(string systemPrompt, IReadOnlyList<LlmChatMessage> messages)
     {
-        var payload = new List<object>
+        var payload = new List<object>();
+        if (!string.IsNullOrWhiteSpace(systemPrompt))
         {
-            new { role = "system", content = systemPrompt }
-        };
+            payload.Add(new { role = "system", content = systemPrompt });
+        }
 
         foreach (var message in messages)
         {
@@ -4585,6 +5427,7 @@ internal sealed class MonitorSettings
     public int LogLinesPerScan { get; set; } = 120;
     public int HealthCooldownMinutes { get; set; } = 10;
     public int StartupIgnoreSeconds { get; set; } = 180;
+    public int PluginUpdateCheckMinutes { get; set; } = 180;
     public string LogRulesPath { get; set; } = "agent-log-rules.json";
 }
 
@@ -4604,12 +5447,46 @@ internal sealed class PolicySettings
 {
     public List<string> AutoAllowedActions { get; set; } = new();
     public List<string> ApprovalRequiredActions { get; set; } = new();
+    public bool AllowAnyServerCommand { get; set; }
+    public List<string> AllowedServerCommandPrefixes { get; set; } = new()
+    {
+        "oxide.",
+        "o.",
+        "status",
+        "version",
+        "plugins",
+        "global.",
+        "serverinfo"
+    };
 
     public bool IsAutoAllowed(string actionType) =>
         AutoAllowedActions.Contains(actionType, StringComparer.OrdinalIgnoreCase);
 
     public bool RequiresApproval(string actionType) =>
         ApprovalRequiredActions.Contains(actionType, StringComparer.OrdinalIgnoreCase);
+
+    public bool IsServerCommandAllowed(string commandText)
+    {
+        if (AllowAnyServerCommand)
+            return true;
+
+        var command = commandText?.Trim() ?? string.Empty;
+        var commandKey = command
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault()?
+            .Trim()
+            .ToLowerInvariant() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(commandKey))
+            return false;
+
+        return AllowedServerCommandPrefixes.Any(prefix =>
+        {
+            var normalized = (prefix ?? string.Empty).Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(normalized))
+                return false;
+            return commandKey.StartsWith(normalized, StringComparison.OrdinalIgnoreCase);
+        });
+    }
 }
 
 internal sealed class OutboxSettings
@@ -4628,6 +5505,7 @@ internal sealed class SelfRepairSettings
     public bool AllowScopeFileWrites { get; set; } = true;
     public bool ApplyLogRuleUpdates { get; set; } = true;
     public bool ApplyReplyStyleUpdates { get; set; } = true;
+    public bool NotifyAdmins { get; set; } = false;
 }
 
 internal sealed class LlmSettings
@@ -4638,6 +5516,24 @@ internal sealed class LlmSettings
     public string Model { get; set; } = "llmster";
     public string ApiKey { get; set; } = string.Empty;
     public bool UseForRecommendations { get; set; } = true;
+    public bool UseChatSystemPrompt { get; set; } = false;
+    public string ChatSystemPrompt { get; set; } = """
+You are a local Rust server operations agent talking to an admin.
+Use the provided tools to inspect state and perform bounded operations.
+Prefer using tools over guessing.
+For start, stop, restart, and validate-oxide you must target a known server.
+If the server is unclear, ask a concise clarification question instead of guessing.
+Use recent memory, incidents, and action history to explain what is happening.
+Reply naturally, with concrete operational language.
+Start with the direct answer, then key evidence or next action.
+Do not invent facts.
+You may use self-diagnostics and workspace tools to improve your own behavior.
+Any file writes must stay inside the configured self-repair scope root.
+If an admin asks to execute a server console command, use execute_server_command.
+If an admin asks what a command does, use get_server_command_memory.
+If an admin teaches command behavior, use teach_server_command.
+If an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.
+""";
 }
 
 internal sealed class ServerSnapshot
@@ -4707,6 +5603,59 @@ internal sealed class ServerMemory
     public List<string> ActionOutcomes { get; set; } = new();
     public List<LearnedActionRule> LearnedActionRules { get; set; } = new();
     public List<IncidentMemory> Incidents { get; set; } = new();
+    public List<KnownConsoleCommand> KnownConsoleCommands { get; set; } = new();
+    public List<ConsoleCommandInteraction> CommandInteractions { get; set; } = new();
+    public DateTime? LastPluginUpdateCheckAtUtc { get; set; }
+    public string? LastPluginUpdateSignature { get; set; }
+    public List<KnownPluginRecord> KnownPlugins { get; set; } = new();
+}
+
+internal sealed class KnownConsoleCommand
+{
+    public string Command { get; set; } = string.Empty;
+    public string? Purpose { get; set; }
+    public string? UsefulWhen { get; set; }
+    public string? LastOutputSummary { get; set; }
+    public int Observations { get; set; }
+    public DateTime? LastObservedAtUtc { get; set; }
+}
+
+internal sealed class ConsoleCommandInteraction
+{
+    public DateTime AtUtc { get; set; }
+    public string CommandKey { get; set; } = string.Empty;
+    public string RawCommand { get; set; } = string.Empty;
+    public bool Success { get; set; }
+    public string Summary { get; set; } = string.Empty;
+    public string? AdminId { get; set; }
+}
+
+internal sealed class KnownPluginRecord
+{
+    public string Name { get; set; } = string.Empty;
+    public string Author { get; set; } = string.Empty;
+    public string Version { get; set; } = string.Empty;
+    public string FilePath { get; set; } = string.Empty;
+    public DateTime LastSeenAtUtc { get; set; }
+}
+
+internal sealed class ServerPluginInfo
+{
+    public string Name { get; set; } = string.Empty;
+    public string Author { get; set; } = string.Empty;
+    public string Version { get; set; } = string.Empty;
+    public string Path { get; set; } = string.Empty;
+    public bool HasInfoAttribute { get; set; }
+}
+
+internal sealed class PluginUpdateCandidate
+{
+    public string Name { get; set; } = string.Empty;
+    public string Author { get; set; } = string.Empty;
+    public string LocalVersion { get; set; } = string.Empty;
+    public string RemoteVersion { get; set; } = string.Empty;
+    public string SourceUrl { get; set; } = string.Empty;
+    public string DownloadUrl { get; set; } = string.Empty;
 }
 
 internal enum LogSignalLevel
@@ -4978,6 +5927,7 @@ internal sealed class ChatPlanningContext
     public List<string> PendingActions { get; set; } = new();
     public List<string> RecentActions { get; set; } = new();
     public List<string> RecentIncidents { get; set; } = new();
+    public List<string> CommandKnowledge { get; set; } = new();
     public string ReplyStyleGuidance { get; set; } = string.Empty;
 }
 

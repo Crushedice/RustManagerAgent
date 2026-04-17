@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Json;
 using Sentry;
@@ -256,7 +257,7 @@ app.MapGet("/agent/llm/config", () =>
         restartRequired = true,
         values,
         effective = memory.RuntimeStatus,
-        note = "Changes are written to the shared env file and apply after restarting rustopsagent.service."
+        note = "Changes are written to the shared env file and agentsettings.json, then apply after restarting rustopsagent.service."
     });
 });
 
@@ -273,7 +274,7 @@ app.MapGet("/agent/ollama/config", () =>
         restartRequired = true,
         values,
         effective = memory.RuntimeStatus,
-        note = "Changes are written to the shared env file and apply after restarting rustopsagent.service."
+        note = "Changes are written to the shared env file and agentsettings.json, then apply after restarting rustopsagent.service."
     });
 });
 
@@ -282,6 +283,8 @@ app.MapPut("/agent/llm/config", (AgentLlmConfigUpdate request) =>
     if (string.IsNullOrWhiteSpace(request.Model))
         return Results.BadRequest(new ApiError("invalid_request", "Model is required."));
 
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+
     UpsertEnvFileValues(sharedEnvPath, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
         ["RUSTOPS_LLM_PROVIDER"] = string.IsNullOrWhiteSpace(request.Provider) ? "lmstudio" : request.Provider.Trim(),
@@ -289,12 +292,15 @@ app.MapPut("/agent/llm/config", (AgentLlmConfigUpdate request) =>
         ["RUSTOPS_LLM_BASE_URL"] = request.BaseUrl.Trim(),
         ["RUSTOPS_LLM_MODEL"] = request.Model.Trim(),
         ["RUSTOPS_LLM_API_KEY"] = request.ApiKey?.Trim() ?? string.Empty,
-        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false"
+        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false",
+        ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = request.UseChatSystemPrompt ? "true" : "false"
     });
+    UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, request);
 
     return Results.Ok(new
     {
         path = sharedEnvPath,
+        agentSettingsPath = agentPaths.AgentSettingsPath,
         savedAtUtc = DateTime.UtcNow,
         restartRequired = true
     });
@@ -305,6 +311,8 @@ app.MapPut("/agent/ollama/config", (AgentLlmConfigUpdate request) =>
     if (string.IsNullOrWhiteSpace(request.Model))
         return Results.BadRequest(new ApiError("invalid_request", "Model is required."));
 
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+
     UpsertEnvFileValues(sharedEnvPath, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
         ["RUSTOPS_LLM_PROVIDER"] = string.IsNullOrWhiteSpace(request.Provider) ? "lmstudio" : request.Provider.Trim(),
@@ -312,12 +320,15 @@ app.MapPut("/agent/ollama/config", (AgentLlmConfigUpdate request) =>
         ["RUSTOPS_LLM_BASE_URL"] = request.BaseUrl.Trim(),
         ["RUSTOPS_LLM_MODEL"] = request.Model.Trim(),
         ["RUSTOPS_LLM_API_KEY"] = request.ApiKey?.Trim() ?? string.Empty,
-        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false"
+        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false",
+        ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = request.UseChatSystemPrompt ? "true" : "false"
     });
+    UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, request);
 
     return Results.Ok(new
     {
         path = sharedEnvPath,
+        agentSettingsPath = agentPaths.AgentSettingsPath,
         savedAtUtc = DateTime.UtcNow,
         restartRequired = true
     });
@@ -1401,7 +1412,13 @@ static AgentLlmConfigView ReadAgentLlmConfig(string envPath, string agentSetting
         UseForRecommendations = TryParseBooleanValue(
             GetEnvValue(env, "RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS")
             ?? GetEnvValue(env, "RUSTOPS_OLLAMA_USE_FOR_RECOMMENDATIONS"),
-            llm?.UseForRecommendations ?? true)
+            llm?.UseForRecommendations ?? true),
+        UseChatSystemPrompt = TryParseBooleanValue(
+            GetEnvValue(env, "RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"),
+            llm?.UseChatSystemPrompt ?? false),
+        ChatSystemPrompt = GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
+            ?? llm?.ChatSystemPrompt
+            ?? "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates."
     };
 }
 
@@ -1513,6 +1530,40 @@ static void UpsertEnvFileValues(string path, Dictionary<string, string> updates)
 
     Directory.CreateDirectory(Path.GetDirectoryName(path)!);
     File.WriteAllLines(path, lines);
+}
+
+static void UpsertAgentSettingsLlmValues(string path, AgentLlmConfigUpdate update)
+{
+    JsonObject root;
+    if (File.Exists(path))
+    {
+        try
+        {
+            root = JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? new JsonObject();
+        }
+        catch
+        {
+            root = new JsonObject();
+        }
+    }
+    else
+    {
+        root = new JsonObject();
+    }
+
+    var llm = root["llm"] as JsonObject ?? new JsonObject();
+    llm["provider"] = string.IsNullOrWhiteSpace(update.Provider) ? "lmstudio" : update.Provider.Trim();
+    llm["enabled"] = update.Enabled;
+    llm["baseUrl"] = update.BaseUrl.Trim();
+    llm["model"] = update.Model.Trim();
+    llm["apiKey"] = update.ApiKey?.Trim() ?? string.Empty;
+    llm["useForRecommendations"] = update.UseForRecommendations;
+    llm["useChatSystemPrompt"] = update.UseChatSystemPrompt;
+    llm["chatSystemPrompt"] = update.ChatSystemPrompt ?? string.Empty;
+    root["llm"] = llm;
+
+    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+    File.WriteAllText(path, root.ToJsonString(JsonDefaults.Options));
 }
 
 static List<string> ReadStringArray(JsonElement root, string propertyName, int takeLast)
@@ -1879,7 +1930,9 @@ static List<string> GetOxideRootCandidates(ServerConfig normalized)
         {
             Path.Combine(normalized.ServerDir, "oxide"),
             Path.Combine(normalized.ServerDir, normalized.ServerIdentity, "oxide"),
-            Path.Combine(normalized.ServerDir, "server", normalized.ServerIdentity, "oxide")
+            Path.Combine(normalized.ServerDir, "server", normalized.ServerIdentity, "oxide"),
+            Path.Combine("/srv/rust", normalized.Name, "oxide"),
+            Path.Combine("/srv/rust", normalized.ServerIdentity, "oxide")
         }
         .Where(path => !string.IsNullOrWhiteSpace(path))
         .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -2187,7 +2240,7 @@ static string BuildDashboardHtml() => """
     <section id="llmGroup" class="section-group">
       <div class="grid">
         <div class="card"><h2>LLM Runtime</h2><div id="ollamaRuntime" class="kv"></div><div id="llmRuntimeDetails" class="list" style="margin-top:12px;"></div></div>
-        <div class="card"><h2>LM Studio Control <span class="legend" data-tip="This writes the agent LLM settings into the shared env file. Changes do not hot-apply; restart rustopsagent.service after saving. LM Link keeps the remote model accessible through the local LM Studio server endpoint.">?</span></h2><div id="ollamaConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="ollamaEnabled" type="checkbox"> LLM enabled</label><label class="check"><input id="ollamaUseRecommendations" type="checkbox"> Use for recommendations</label></div><div class="row" style="margin-top:12px;"><div><label for="ollamaBaseUrl" class="tiny muted">Base URL</label><input id="ollamaBaseUrl" type="text" placeholder="http://127.0.0.1:1234"></div><div><label for="ollamaModel" class="tiny muted">Model</label><input id="ollamaModel" type="text" placeholder="llmster"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmProvider" class="tiny muted">Provider</label><input id="llmProvider" type="text" placeholder="lmstudio"></div><div><label for="llmApiKey" class="tiny muted">API token (optional)</label><input id="llmApiKey" type="password" placeholder="LM Studio API token"></div></div><div class="toolbar"><div id="ollamaSaveStatus" class="muted">No changes saved yet.</div><button id="saveOllamaConfig">Save LLM Settings</button></div></div>
+        <div class="card"><h2>LM Studio Control <span class="legend" data-tip="This writes LLM settings to the shared env plus agentsettings.json. Restart rustopsagent.service after saving. Disable 'Send system prompt' to avoid sending agent premise/context each LLM chat turn.">?</span></h2><div id="ollamaConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="ollamaEnabled" type="checkbox"> LLM enabled</label><label class="check"><input id="ollamaUseRecommendations" type="checkbox"> Use for recommendations</label></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmUseChatSystemPrompt" type="checkbox"> Send system prompt</label></div><div style="margin-top:12px;"><label for="llmChatSystemPrompt" class="tiny muted">System prompt text (used only when enabled)</label><textarea id="llmChatSystemPrompt" spellcheck="false" style="margin-top:8px; min-height:180px;"></textarea></div><div class="row" style="margin-top:12px;"><div><label for="ollamaBaseUrl" class="tiny muted">Base URL</label><input id="ollamaBaseUrl" type="text" placeholder="http://127.0.0.1:1234"></div><div><label for="ollamaModel" class="tiny muted">Model</label><input id="ollamaModel" type="text" placeholder="llmster"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmProvider" class="tiny muted">Provider</label><input id="llmProvider" type="text" placeholder="lmstudio"></div><div><label for="llmApiKey" class="tiny muted">API token (optional)</label><input id="llmApiKey" type="password" placeholder="LM Studio API token"></div></div><div class="toolbar"><div id="ollamaSaveStatus" class="muted">No changes saved yet.</div><button id="saveOllamaConfig">Save LLM Settings</button></div></div>
         <div class="card"><h2>Installed Models</h2><div id="ollamaModels" class="list"></div></div>
         <div class="card"><h2>Loaded Models</h2><div id="ollamaRunning" class="list"></div></div>
         <div class="card wide"><h2>Current Model Details</h2><div class="codebox"><pre id="currentModelDetails">No model details loaded.</pre></div></div>
@@ -2276,6 +2329,7 @@ static string BuildDashboardHtml() => """
         kv('Enabled', runtime.llmEnabled ? 'yes' : 'no'),
         kv('Model', configuredModel),
         kv('Base URL', configuredBaseUrl),
+        kv('System prompt', values.useChatSystemPrompt ? 'enabled' : 'disabled'),
         kv('Last interaction', fmt(runtime.lastLlmInteractionAtUtc))
       ].join('');
 
@@ -2287,6 +2341,8 @@ static string BuildDashboardHtml() => """
       $('ollamaConfigMeta').textContent = `${llmConfig?.path || 'n/a'} | restart rustopsagent.service after save`;
       $('ollamaEnabled').checked = !!values.enabled;
       $('ollamaUseRecommendations').checked = !!values.useForRecommendations;
+      $('llmUseChatSystemPrompt').checked = !!values.useChatSystemPrompt;
+      $('llmChatSystemPrompt').value = values.chatSystemPrompt || 'You are a local Rust server operations agent talking to an admin.\\nUse the provided tools to inspect state and perform bounded operations.\\nPrefer using tools over guessing.\\nFor start, stop, restart, and validate-oxide you must target a known server.\\nIf the server is unclear, ask a concise clarification question instead of guessing.\\nUse recent memory, incidents, and action history to explain what is happening.\\nReply naturally, with concrete operational language.\\nStart with the direct answer, then key evidence or next action.\\nDo not invent facts.\\nYou may use self-diagnostics and workspace tools to improve your own behavior.\\nAny file writes must stay inside the configured self-repair scope root.\\nIf an admin asks to execute a server console command, use execute_server_command.\\nIf an admin asks what a command does, use get_server_command_memory.\\nIf an admin teaches command behavior, use teach_server_command.\\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.';
       $('ollamaBaseUrl').value = values.baseUrl || 'http://127.0.0.1:1234';
       $('ollamaModel').value = values.model || '';
       $('llmProvider').value = values.provider || 'lmstudio';
@@ -2317,7 +2373,7 @@ static string BuildDashboardHtml() => """
 
     async function saveOllamaConfig() {
       try {
-        await fetchJson('/agent/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: $('llmProvider').value.trim() || 'lmstudio', enabled: $('ollamaEnabled').checked, baseUrl: $('ollamaBaseUrl').value.trim(), model: $('ollamaModel').value.trim(), apiKey: $('llmApiKey').value.trim(), useForRecommendations: $('ollamaUseRecommendations').checked }) });
+        await fetchJson('/agent/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: $('llmProvider').value.trim() || 'lmstudio', enabled: $('ollamaEnabled').checked, baseUrl: $('ollamaBaseUrl').value.trim(), model: $('ollamaModel').value.trim(), apiKey: $('llmApiKey').value.trim(), useForRecommendations: $('ollamaUseRecommendations').checked, useChatSystemPrompt: $('llmUseChatSystemPrompt').checked, chatSystemPrompt: $('llmChatSystemPrompt').value }) });
         $('ollamaSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
         await load();
       } catch (error) { alert(`Failed to save LLM settings: ${error.message}`); }
@@ -2895,6 +2951,8 @@ public class AgentLlmConfigUpdate
     public string Model { get; set; } = string.Empty;
     public string? ApiKey { get; set; }
     public bool UseForRecommendations { get; set; } = true;
+    public bool UseChatSystemPrompt { get; set; }
+    public string? ChatSystemPrompt { get; set; }
 }
 
 public sealed class AgentLlmConfigView : AgentLlmConfigUpdate
@@ -2974,6 +3032,8 @@ public sealed class AgentSettingsLlmView
     [JsonPropertyName("model")] public string? Model { get; set; }
     [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
     [JsonPropertyName("useForRecommendations")] public bool UseForRecommendations { get; set; } = true;
+    [JsonPropertyName("useChatSystemPrompt")] public bool UseChatSystemPrompt { get; set; }
+    [JsonPropertyName("chatSystemPrompt")] public string? ChatSystemPrompt { get; set; }
 }
 
 public sealed class BotSettingsFileView
