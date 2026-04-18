@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using CoreRCON;
 using Microsoft.AspNetCore.Http.Json;
 using Sentry;
 
@@ -853,8 +854,39 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     if (request is null || string.IsNullOrWhiteSpace(request.Command))
         return Results.BadRequest(new ApiError("invalid_request", "Command is required."));
 
-    var result = await ExecRustMgrAsync("send", server, request.Command);
-    return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+    var command = request.Command.Trim();
+    if (command.Length > 256)
+        return Results.BadRequest(new ApiError("invalid_request", "Command length exceeds 256 characters."));
+    if (command.Contains('\n') || command.Contains('\r'))
+        return Results.BadRequest(new ApiError("invalid_request", "Command must be a single line."));
+
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    try
+    {
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        var reply = await rcon.SendAndReceiveAsync(command);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            transport = "rcon-web",
+            endpoint = new { host = endpoint.Host, port = endpoint.Port },
+            reply = string.IsNullOrWhiteSpace(reply) ? null : reply.Trim()
+        });
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+    }
 });
 
 app.MapPost("/servers/{server}/command/exec", async (string server, ServerCommandExecRequest request) =>
@@ -884,19 +916,29 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
     var maxBytes = Math.Clamp(request.MaxBytes <= 0 ? 128 * 1024 : request.MaxBytes, 4 * 1024, 512 * 1024);
     var maxLines = Math.Clamp(request.MaxLines <= 0 ? 120 : request.MaxLines, 1, 600);
 
-    var commandResult = await ExecRustMgrAsync("send", server, command);
-    if (!commandResult.Ok)
+    var endpoint = ResolveRconConnectionInfo(server, cfg);
+    if (!endpoint.WebRconEnabled)
+        return Results.BadRequest(new ApiError("invalid_config", $"WebRCON is disabled for '{server}'. Enable +rcon.web 1 in config/additionalArgs."));
+
+    string? directReply;
+    try
     {
-        return Results.BadRequest(new
-        {
-            ok = false,
-            server,
-            command,
-            commandResult
-        });
+        await using var rcon = new RustRcon(endpoint.Host, endpoint.Port, endpoint.Password);
+        await rcon.ConnectAsync();
+        directReply = await rcon.SendAndReceiveAsync(command);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 
     var output = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+    if (!string.IsNullOrWhiteSpace(directReply))
+    {
+        output.Messages.Insert(0, directReply.Trim());
+        output.Messages = output.Messages.Take(maxLines).ToList();
+    }
+
     return Results.Ok(new
     {
         ok = true,
@@ -904,7 +946,9 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
         command,
         waitMs,
         logPath,
-        commandResult,
+        transport = "rcon-web",
+        endpoint = new { host = endpoint.Host, port = endpoint.Port },
+        directReply = string.IsNullOrWhiteSpace(directReply) ? null : directReply.Trim(),
         output
     });
 });
@@ -1398,6 +1442,70 @@ static string GetConfigPath(string server) =>
     Path.Combine(
         Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config",
         $"{server}.json");
+
+static RconConnectionInfo ResolveRconConnectionInfo(string server, ServerConfig cfg)
+{
+    var host =
+        ReadRawServerConfigValue(server, "rcon.ip") ??
+        ReadArgValue(cfg.AdditionalArgs, "rcon.ip") ??
+        ReadRawServerConfigValue(server, "server.ip") ??
+        ReadArgValue(cfg.AdditionalArgs, "server.ip") ??
+        "127.0.0.1";
+
+    var webValue =
+        ReadRawServerConfigValue(server, "rcon.web") ??
+        ReadArgValue(cfg.AdditionalArgs, "rcon.web");
+    var webEnabled = string.IsNullOrWhiteSpace(webValue) ||
+        webValue == "1" ||
+        webValue.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+        webValue.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
+        webValue.Equals("on", StringComparison.OrdinalIgnoreCase);
+
+    var trimmedHost = host.Trim().Trim('"');
+    var port = (ushort)Math.Clamp(cfg.RconPort, 1, 65535);
+    var password = cfg.RconPassword?.Trim() ?? string.Empty;
+    if (string.IsNullOrWhiteSpace(password))
+        throw new InvalidOperationException($"rcon.password is empty for '{server}'.");
+
+    return new RconConnectionInfo(trimmedHost, port, password, webEnabled);
+}
+
+static string? ReadRawServerConfigValue(string server, string key)
+{
+    var path = GetConfigPath(server);
+    if (!File.Exists(path))
+        return null;
+
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(path));
+        if (!doc.RootElement.TryGetProperty(key, out var node))
+            return null;
+
+        return node.ValueKind switch
+        {
+            JsonValueKind.String => node.GetString(),
+            JsonValueKind.Number => node.GetRawText(),
+            JsonValueKind.True => "true",
+            JsonValueKind.False => "false",
+            _ => node.ToString()
+        };
+    }
+    catch
+    {
+        return null;
+    }
+}
+
+static string? ReadArgValue(string additionalArgs, string key)
+{
+    if (string.IsNullOrWhiteSpace(additionalArgs))
+        return null;
+
+    var pattern = $@"(?:^|\s)\+{Regex.Escape(key)}\s+(?:""(?<v>[^""]+)""|(?<v>\S+))";
+    var match = Regex.Match(additionalArgs, pattern, RegexOptions.IgnoreCase);
+    return match.Success ? match.Groups["v"].Value : null;
+}
 
 static ServerConfig? LoadServerConfig(string server)
 {
@@ -3658,6 +3766,101 @@ public sealed class ServerConfig
     [JsonPropertyName("boombox.serverurllist")]       public string BoomboxServerUrlList        { get; set; } = string.Empty;
     [JsonPropertyName("additionalArgs")]              public string AdditionalArgs              { get; set; } = string.Empty;
     [JsonPropertyName("serverDir")]                   public string ServerDir                   { get; set; } = string.Empty;
+}
+
+public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
+
+/// <summary>
+/// Lightweight RCON wrapper for Rust server console interaction.
+/// Supports fire-and-forget commands and awaited reply matching.
+/// </summary>
+public sealed class RustRcon : IAsyncDisposable
+{
+    private RCON? _rcon;
+    private readonly string _host;
+    private readonly ushort _port;
+    private readonly string _password;
+
+    public bool IsConnected { get; private set; }
+
+    public RustRcon(string host, ushort port, string password)
+    {
+        _host = host;
+        _port = port;
+        _password = password;
+    }
+
+    public async Task ConnectAsync(CancellationToken ct = default)
+    {
+        var address = await ResolveAddressAsync(_host, ct);
+        _rcon = new RCON(address, _port, _password);
+        await _rcon.ConnectAsync();
+        IsConnected = true;
+        _rcon.OnDisconnected += () => IsConnected = false;
+    }
+
+    /// <summary>Fire-and-forget. Does not wait for a response.</summary>
+    public async Task SendAsync(string command)
+    {
+        EnsureConnected();
+        await _rcon!.SendCommandAsync(command);
+    }
+
+    /// <summary>
+    /// Sends a command and returns the direct response string.
+    /// Note: RCON responses are best-effort — not all commands echo a reply.
+    /// </summary>
+    public async Task<string> SendAndReceiveAsync(string command, CancellationToken ct = default)
+    {
+        EnsureConnected();
+        return await _rcon!.SendCommandAsync(command);
+    }
+
+    /// <summary>
+    /// Sends a command and waits until a console log line matching
+    /// <paramref name="filter"/> appears, or the timeout elapses.
+    /// </summary>
+    public async Task<string?> SendAndWaitForLogAsync(
+        string command,
+        Func<string, bool> filter,
+        TimeSpan? timeout = null,
+        CancellationToken ct = default)
+    {
+        EnsureConnected();
+        var reply = await _rcon!.SendCommandAsync(command);
+        if (string.IsNullOrWhiteSpace(reply))
+            return null;
+        return filter(reply) ? reply : null;
+    }
+
+    private void EnsureConnected()
+    {
+        if (_rcon is null || !IsConnected)
+            throw new InvalidOperationException("RCON is not connected. Call ConnectAsync() first.");
+    }
+
+    private static async Task<IPAddress> ResolveAddressAsync(string host, CancellationToken ct)
+    {
+        if (IPAddress.TryParse(host, out var address))
+            return address;
+
+        var resolved = await Dns.GetHostAddressesAsync(host, ct);
+        return resolved.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            ?? resolved.FirstOrDefault()
+            ?? throw new InvalidOperationException($"Could not resolve host '{host}'.");
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_rcon is not null)
+        {
+            IsConnected = false;
+            _rcon.Dispose();
+            _rcon = null;
+        }
+
+        return ValueTask.CompletedTask;
+    }
 }
 
 

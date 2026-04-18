@@ -491,6 +491,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     private readonly string _selfRepairWorkspacePath;
     private readonly string _selfRepairScopeRootPath;
     private readonly string _replyStylePath;
+    private readonly string _learningInboxPath;
+    private readonly string _learningArchivePath;
     private DateTime? _lastReplyStyleWriteTimeUtc;
     private string _replyStyleGuidance = string.Empty;
     private DateTime? _lastSelfRepairCycleUtc;
@@ -510,6 +512,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         _selfRepairScopeRootPath = Path.GetFullPath(config.SelfRepair.ScopeRootPath);
         _selfRepairWorkspacePath = Path.GetFullPath(config.SelfRepair.WorkspacePath);
         _replyStylePath = Path.Combine(_selfRepairWorkspacePath, "reply-style.txt");
+        _learningInboxPath = Path.Combine(_selfRepairWorkspacePath, "learning", "inbox");
+        _learningArchivePath = Path.Combine(_selfRepairWorkspacePath, "learning", "archive");
         _memory = memory;
         EnsureSelfRepairWorkspace();
         RefreshReplyStyleIfChanged(force: true);
@@ -581,6 +585,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     {
         Directory.CreateDirectory(_selfRepairScopeRootPath);
         Directory.CreateDirectory(_selfRepairWorkspacePath);
+        Directory.CreateDirectory(_learningInboxPath);
+        Directory.CreateDirectory(_learningArchivePath);
         if (!File.Exists(_replyStylePath))
         {
             File.WriteAllText(_replyStylePath,
@@ -628,6 +634,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         var run = await ApplySelfRepairPlanAsync(plan, utcNow);
         _memory.RecordSelfRepairRun(run);
+        if (run.AppliedActions > 0)
+            ArchiveLearningIncidents(utcNow, maxCount: 8, reason: "capability-evolution");
 
         if (run.AppliedActions > 0 && _config.SelfRepair.NotifyAdmins)
         {
@@ -661,11 +669,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             .ToList();
         var workspaceFiles = EnumerateWorkspaceFilePreviews();
         var scopeFiles = EnumerateScopeFilePreviews();
+        var learningIncidents = EnumerateLearningIncidentPreviews();
 
         return new SelfRepairContext
         {
             AtUtc = utcNow,
-            ShouldAttemptRepair = recentErrors.Count > 0 || recentFailures.Count > 0 || recentGaps.Count > 0,
+            ShouldAttemptRepair = recentErrors.Count > 0 || recentFailures.Count > 0 || recentGaps.Count > 0 || learningIncidents.Count > 0,
             ScopeRootPath = _selfRepairScopeRootPath,
             WorkspacePath = _selfRepairWorkspacePath,
             CurrentReplyStyle = _replyStyleGuidance,
@@ -674,9 +683,48 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             RecentFailures = recentFailures,
             CapabilityGaps = recentGaps,
             RecentIncidents = recentIncidents,
+            LearningIncidents = learningIncidents,
             WorkspaceFiles = workspaceFiles,
             ScopeFiles = scopeFiles
         };
+    }
+
+    private List<string> EnumerateLearningIncidentPreviews()
+    {
+        if (!Directory.Exists(_learningInboxPath))
+            return new List<string>();
+
+        return Directory.GetFiles(_learningInboxPath, "*.json", SearchOption.TopDirectoryOnly)
+            .OrderByDescending(File.GetLastWriteTimeUtc)
+            .Take(20)
+            .Select(path => ReadFilePreview(path, 360))
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .Select(text => TrimSingleLine(text, 320))
+            .ToList();
+    }
+
+    private void ArchiveLearningIncidents(DateTime utcNow, int maxCount, string reason)
+    {
+        if (!Directory.Exists(_learningInboxPath))
+            return;
+
+        foreach (var path in Directory.GetFiles(_learningInboxPath, "*.json", SearchOption.TopDirectoryOnly)
+                     .OrderBy(Path.GetFileName)
+                     .Take(Math.Max(1, maxCount)))
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var archivedName = $"{fileName}-worked-{utcNow:yyyyMMddHHmmssfff}.json";
+                var target = Path.Combine(_learningArchivePath, archivedName);
+                File.Move(path, target, true);
+                File.WriteAllText($"{target}.note.txt", $"Archived after {reason} at {utcNow:O}");
+            }
+            catch (Exception ex)
+            {
+                _memory.RecordAgentError($"learning-archive failed: {ex.Message}");
+            }
+        }
     }
 
     private List<SelfRepairWorkspaceFilePreview> EnumerateWorkspaceFilePreviews()
@@ -1317,15 +1365,26 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         var preferenceAck = TryCaptureAdminPreferenceFromChat(adminPreference, message, utcNow);
         if (!string.IsNullOrWhiteSpace(preferenceAck))
         {
+            SetConversationTrace(conversation, utcNow, "preference", "preference-update", usedTools: null, note: "Stored admin preference from chat.");
             RememberChatTurn(conversation, "assistant", preferenceAck, utcNow);
             adminPreference.LastUpdatedAtUtc = utcNow;
             return preferenceAck;
+        }
+
+        var metaReply = TryExplainLastReplyWorkflow(conversation, message);
+        if (!string.IsNullOrWhiteSpace(metaReply))
+        {
+            SetConversationTrace(conversation, utcNow, "meta", "explain-last-reply", usedTools: null, note: "Explained previous reply workflow.");
+            RememberChatTurn(conversation, "assistant", metaReply, utcNow);
+            adminPreference.LastUpdatedAtUtc = utcNow;
+            return metaReply;
         }
 
         var servers = await GetServerSnapshotsAsync();
         var directCommandReply = await TryHandleDirectCommandMessageAsync(adminId, message, servers, utcNow);
         if (!string.IsNullOrWhiteSpace(directCommandReply))
         {
+            SetConversationTrace(conversation, utcNow, "direct", "direct-message-handler", usedTools: null, note: "Handled using deterministic direct parser.");
             RememberChatTurn(conversation, "assistant", directCommandReply, utcNow);
             adminPreference.LastUpdatedAtUtc = utcNow;
             return directCommandReply;
@@ -1354,6 +1413,13 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 if (!string.IsNullOrWhiteSpace(toolReply.LastServerName))
                     conversation.LastServerName = toolReply.LastServerName;
 
+                SetConversationTrace(
+                    conversation,
+                    utcNow,
+                    "llm-tools",
+                    string.IsNullOrWhiteSpace(toolReply.PendingClarificationIntent) ? "tool-reply" : toolReply.PendingClarificationIntent!,
+                    toolReply.UsedTools,
+                    note: "Reply generated through LLM tool-calling.");
                 RememberChatTurn(conversation, "assistant", toolReply.Reply, utcNow);
                 adminPreference.LastUpdatedAtUtc = utcNow;
                 return toolReply.Reply;
@@ -1376,6 +1442,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             };
 
             var clarification = conversation.PendingClarification.Question;
+            SetConversationTrace(conversation, utcNow, "clarification", plan.Intent, usedTools: null, note: "Server clarification required before action.");
             RememberChatTurn(conversation, "assistant", clarification, utcNow);
             adminPreference.LastUpdatedAtUtc = utcNow;
             return clarification;
@@ -1385,6 +1452,11 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         var reply = await ExecuteChatPlanAsync(adminId, plan, servers, utcNow);
         reply = await EnhanceAdminReplyAsync(message, reply, plan, servers, conversation, adminPreference);
         UpdateConversationState(conversation, plan);
+        SetConversationTrace(conversation, utcNow, "deterministic", plan.Intent, usedTools: null, note: "Fallback deterministic planning/execution path.");
+        if (string.Equals(plan.Intent, "unknown", StringComparison.OrdinalIgnoreCase))
+        {
+            RecordLearningIncident(adminId, message, plan.Intent, reply, conversation.LastTrace);
+        }
         RememberChatTurn(conversation, "assistant", reply, utcNow);
         adminPreference.LastUpdatedAtUtc = utcNow;
         return reply;
@@ -1672,6 +1744,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         var toolPrompt = BuildChatToolSystemPrompt(planningContext, conversation, _replyStyleGuidance, _config.Llm);
         var lastServerName = string.Empty;
         var pendingClarificationIntent = string.Empty;
+        var usedTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lifecycleMutations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         try
@@ -1697,7 +1770,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                         {
                             Reply = content,
                             LastServerName = lastServerName,
-                            PendingClarificationIntent = pendingClarificationIntent
+                            PendingClarificationIntent = pendingClarificationIntent,
+                            UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
                         };
                     }
 
@@ -1708,6 +1782,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
                 foreach (var toolCall in response.ToolCalls.Take(6))
                 {
+                    usedTools.Add(NormalizeChatToolName(toolCall.Name));
                     var toolResult = await ExecuteLlmChatToolAsync(adminId, toolCall, servers, utcNow, lifecycleMutations);
                     if (!string.IsNullOrWhiteSpace(toolResult.ResolvedServerName))
                         lastServerName = toolResult.ResolvedServerName!;
@@ -1731,7 +1806,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             {
                 Reply = finalReply.Trim(),
                 LastServerName = lastServerName,
-                PendingClarificationIntent = pendingClarificationIntent
+                PendingClarificationIntent = pendingClarificationIntent,
+                UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
             };
         }
         catch (Exception ex)
@@ -4291,6 +4367,95 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         return $"I couldn't match that to a known server. Known servers: {string.Join(", ", servers.Select(server => server.Name))}.";
     }
 
+    private static bool IsReplyWorkflowQuestion(string message)
+    {
+        var lowered = message.Trim().ToLowerInvariant();
+        return lowered.Contains("how did you get to this reply", StringComparison.Ordinal) ||
+               lowered.Contains("how did you get this reply", StringComparison.Ordinal) ||
+               lowered.Contains("did you look yourself", StringComparison.Ordinal) ||
+               lowered.Contains("used console", StringComparison.Ordinal) ||
+               lowered.Contains("what did you use", StringComparison.Ordinal) ||
+               lowered.Contains("how did you decide", StringComparison.Ordinal);
+    }
+
+    private string? TryExplainLastReplyWorkflow(AdminConversationState conversation, string message)
+    {
+        if (!IsReplyWorkflowQuestion(message))
+            return null;
+
+        var trace = conversation.LastTrace;
+        if (trace is null)
+            return "I don't have a stored trace for the previous reply yet. I can store this from now on.";
+
+        var tools = trace.UsedTools is { Count: > 0 }
+            ? string.Join(", ", trace.UsedTools)
+            : "none";
+        var note = string.IsNullOrWhiteSpace(trace.Note) ? "No extra note." : trace.Note;
+        var previousAssistantReply = conversation.History
+            .Where(entry => string.Equals(entry.Role, "assistant", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(entry => entry.AtUtc)
+            .FirstOrDefault()?.Text;
+        var replyPreview = string.IsNullOrWhiteSpace(previousAssistantReply)
+            ? "No previous assistant reply snapshot."
+            : $"Previous reply preview: {TrimSingleLine(previousAssistantReply, 180)}";
+        return $"Previous reply trace: source={trace.Source}, intent={trace.Intent}, tools={tools}, at={trace.AtUtc:O}. {note} {replyPreview}";
+    }
+
+    private static void SetConversationTrace(
+        AdminConversationState conversation,
+        DateTime atUtc,
+        string source,
+        string intent,
+        IReadOnlyCollection<string>? usedTools,
+        string? note)
+    {
+        var trace = new ChatTurnTrace
+        {
+            AtUtc = atUtc,
+            Source = source,
+            Intent = intent,
+            UsedTools = usedTools?.Where(tool => !string.IsNullOrWhiteSpace(tool)).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList() ?? new List<string>(),
+            Note = note
+        };
+
+        conversation.LastTrace = trace;
+        conversation.TraceHistory.Add(trace);
+        conversation.TraceHistory = conversation.TraceHistory
+            .OrderByDescending(entry => entry.AtUtc)
+            .Take(24)
+            .ToList();
+    }
+
+    private void RecordLearningIncident(string adminId, string message, string intent, string reply, ChatTurnTrace? trace)
+    {
+        try
+        {
+            Directory.CreateDirectory(_learningInboxPath);
+            var incident = new LearningIncidentRecord
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                AtUtc = DateTime.UtcNow,
+                AdminId = adminId,
+                Message = message,
+                Intent = intent,
+                Reply = TrimSingleLine(reply, 400),
+                TraceSource = trace?.Source,
+                TraceIntent = trace?.Intent,
+                TraceTools = trace?.UsedTools?.ToList() ?? new List<string>(),
+                TraceNote = trace?.Note
+            };
+
+            var fileName = $"{incident.AtUtc:yyyyMMddHHmmssfff}-learning-{incident.Id}.json";
+            var path = Path.Combine(_learningInboxPath, fileName);
+            File.WriteAllText(path, JsonSerializer.Serialize(incident, JsonOptions.Default));
+            _memory.RecordCapabilityGap("chat-learning", $"Unmapped chat message persisted for learning: {TrimSingleLine(message, 180)}");
+        }
+        catch (Exception ex)
+        {
+            _memory.RecordAgentError($"learning-incident write failed: {ex.Message}");
+        }
+    }
+
     private static string TrimSingleLine(string input, int maxLength)
     {
         var singleLine = input.Replace('\r', ' ').Replace('\n', ' ').Trim();
@@ -5741,6 +5906,9 @@ Respond as strict JSON:
         Recent incidents:
         {{FormatContextList(context.RecentIncidents)}}
 
+        Learning backlog incidents:
+        {{FormatContextList(context.LearningIncidents)}}
+
         Existing workspace files:
         {{FormatContextList(context.WorkspaceFiles.Select(file => $"{file.RelativePath} ({file.SizeBytes} bytes) preview={TrimForPreview(file.Preview, 120)}"))}}
 
@@ -7124,6 +7292,7 @@ internal sealed class SelfRepairContext
     public List<string> RecentFailures { get; set; } = new();
     public List<string> CapabilityGaps { get; set; } = new();
     public List<string> RecentIncidents { get; set; } = new();
+    public List<string> LearningIncidents { get; set; } = new();
     public List<SelfRepairWorkspaceFilePreview> WorkspaceFiles { get; set; } = new();
     public List<SelfRepairWorkspaceFilePreview> ScopeFiles { get; set; } = new();
 }
@@ -7396,6 +7565,7 @@ internal sealed class ToolDrivenChatReply
     public string Reply { get; set; } = string.Empty;
     public string? LastServerName { get; set; }
     public string? PendingClarificationIntent { get; set; }
+    public List<string> UsedTools { get; set; } = new();
 }
 
 internal sealed class ChatToolExecutionResult
@@ -7493,6 +7663,17 @@ internal sealed class AdminConversationState
     public string? LastServerName { get; set; }
     public PendingChatClarification? PendingClarification { get; set; }
     public List<ChatHistoryEntry> History { get; set; } = new();
+    public ChatTurnTrace? LastTrace { get; set; }
+    public List<ChatTurnTrace> TraceHistory { get; set; } = new();
+}
+
+internal sealed class ChatTurnTrace
+{
+    public DateTime AtUtc { get; set; }
+    public string Source { get; set; } = string.Empty;
+    public string Intent { get; set; } = "unknown";
+    public List<string> UsedTools { get; set; } = new();
+    public string? Note { get; set; }
 }
 
 internal sealed class PendingChatClarification
@@ -7508,6 +7689,20 @@ internal sealed class ChatHistoryEntry
     public string Role { get; set; } = "user";
     public string Text { get; set; } = string.Empty;
     public DateTime AtUtc { get; set; }
+}
+
+internal sealed class LearningIncidentRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public DateTime AtUtc { get; set; }
+    public string AdminId { get; set; } = string.Empty;
+    public string Message { get; set; } = string.Empty;
+    public string Intent { get; set; } = "unknown";
+    public string Reply { get; set; } = string.Empty;
+    public string? TraceSource { get; set; }
+    public string? TraceIntent { get; set; }
+    public List<string> TraceTools { get; set; } = new();
+    public string? TraceNote { get; set; }
 }
 
 internal sealed class AdapterMessage
