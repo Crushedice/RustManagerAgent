@@ -1,7 +1,9 @@
 using System.Net.Http.Headers;
 using System.Net;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Sentry;
@@ -26,6 +28,7 @@ Directory.CreateDirectory(config.Inbox.DecisionInboxPath);
 Directory.CreateDirectory(config.Inbox.ChatInboxPath);
 Directory.CreateDirectory(config.Outbox.MessageOutboxPath);
 Directory.CreateDirectory(config.SelfRepair.WorkspacePath);
+Directory.CreateDirectory(config.SelfRepair.BuildOutputPath);
 
 Console.WriteLine($"Config loaded from {Path.GetFullPath(configPath)}");
 Console.WriteLine($"API base URL: {config.Api.BaseUrl}");
@@ -36,9 +39,28 @@ Console.WriteLine($"Chat inbox: {config.Inbox.ChatInboxPath}");
 Console.WriteLine($"Message outbox: {config.Outbox.MessageOutboxPath}");
 Console.WriteLine($"LLM provider: {config.Llm.Provider}");
 Console.WriteLine($"LLM enabled: {config.Llm.Enabled}");
+Console.WriteLine($"LLM strategy: {config.Llm.RequestStrategy}");
+Console.WriteLine($"LLM secondary enabled: {config.Llm.Secondary.Enabled}");
+if (config.Llm.Secondary.Enabled)
+{
+    Console.WriteLine($"LLM secondary base URL: {config.Llm.Secondary.BaseUrl}");
+    Console.WriteLine($"LLM secondary model: {config.Llm.Secondary.Model}");
+}
 Console.WriteLine($"Self-repair workspace: {config.SelfRepair.WorkspacePath}");
 Console.WriteLine($"Self-repair scope root: {config.SelfRepair.ScopeRootPath}");
 Console.WriteLine($"Self-repair enabled: {config.SelfRepair.Enabled}");
+Console.WriteLine($"Self-repair source root: {config.SelfRepair.SourceRootPath}");
+Console.WriteLine($"Self-repair build output: {config.SelfRepair.BuildOutputPath}");
+Console.WriteLine($"Self-repair source builds enabled: {config.SelfRepair.AllowSourceBuilds}");
+Console.WriteLine($"Self-repair service restarts enabled: {config.SelfRepair.AllowServiceRestarts}");
+Console.WriteLine($"Command execution enabled: {config.CommandExecution.Enabled}");
+Console.WriteLine($"Command free mode: {config.CommandExecution.FreeMode}");
+Console.WriteLine($"Command allowlist entries: {config.CommandExecution.AllowList.Count}");
+Console.WriteLine($"Plugin update monitor enabled: {config.PluginUpdates.Enabled}");
+Console.WriteLine($"Plugin update interval minutes: {config.PluginUpdates.CheckIntervalMinutes}");
+Console.WriteLine($"Git ops enabled: {config.GitOps.Enabled}");
+Console.WriteLine($"Git repo path: {config.GitOps.RepoPath}");
+Console.WriteLine($"Git auto-pull enabled: {config.GitOps.AutoPullEnabled}");
 
 using var api = new RustMgrApiClient(config.Api);
 var executor = new RustMgrExecutor();
@@ -96,6 +118,24 @@ static AgentConfig LoadConfig(string path)
     json.Monitor.LogRulesPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.Monitor.LogRulesPath));
     json.SelfRepair.WorkspacePath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.SelfRepair.WorkspacePath));
     json.SelfRepair.ScopeRootPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.SelfRepair.ScopeRootPath));
+    json.SelfRepair.SourceRootPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.SelfRepair.SourceRootPath));
+    json.SelfRepair.BuildOutputPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.SelfRepair.BuildOutputPath));
+    json.GitOps.RepoPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.GitOps.RepoPath));
+    json.GitOps.RemoteName = RustOpsEnv.ResolvePlaceholders(json.GitOps.RemoteName);
+    json.GitOps.BaseBranch = RustOpsEnv.ResolvePlaceholders(json.GitOps.BaseBranch);
+    json.GitOps.PushBranchPrefix = RustOpsEnv.ResolvePlaceholders(json.GitOps.PushBranchPrefix);
+    json.CommandExecution.AllowList = json.CommandExecution.AllowList
+        .Select(item => RustOpsEnv.ResolvePlaceholders(item))
+        .Where(item => !string.IsNullOrWhiteSpace(item))
+        .ToList();
+    json.PluginUpdates.SearchUrlTemplate = RustOpsEnv.ResolvePlaceholders(json.PluginUpdates.SearchUrlTemplate);
+    json.PluginUpdates.SearchFilter = RustOpsEnv.ResolvePlaceholders(json.PluginUpdates.SearchFilter);
+    json.Llm.RequestStrategy = RustOpsEnv.ResolvePlaceholders(json.Llm.RequestStrategy);
+    json.Llm.Secondary.BaseUrl = RustOpsEnv.ResolvePlaceholders(json.Llm.Secondary.BaseUrl);
+    json.Llm.Secondary.Model = RustOpsEnv.ResolvePlaceholders(json.Llm.Secondary.Model);
+    json.Llm.Secondary.ApiKey = RustOpsEnv.ResolvePlaceholders(json.Llm.Secondary.ApiKey);
+    json.Llm.Secondary.HttpReferer = RustOpsEnv.ResolvePlaceholders(json.Llm.Secondary.HttpReferer);
+    json.Llm.Secondary.AppTitle = RustOpsEnv.ResolvePlaceholders(json.Llm.Secondary.AppTitle);
 
     if (!Path.IsPathRooted(json.Memory.StatePath))
         json.Memory.StatePath = Path.GetFullPath(Path.Combine(dir, json.Memory.StatePath));
@@ -113,6 +153,12 @@ static AgentConfig LoadConfig(string path)
         json.SelfRepair.WorkspacePath = Path.GetFullPath(Path.Combine(dir, json.SelfRepair.WorkspacePath));
     if (!string.IsNullOrWhiteSpace(json.SelfRepair.ScopeRootPath) && !Path.IsPathRooted(json.SelfRepair.ScopeRootPath))
         json.SelfRepair.ScopeRootPath = Path.GetFullPath(Path.Combine(dir, json.SelfRepair.ScopeRootPath));
+    if (!string.IsNullOrWhiteSpace(json.SelfRepair.SourceRootPath) && !Path.IsPathRooted(json.SelfRepair.SourceRootPath))
+        json.SelfRepair.SourceRootPath = Path.GetFullPath(Path.Combine(dir, json.SelfRepair.SourceRootPath));
+    if (!string.IsNullOrWhiteSpace(json.SelfRepair.BuildOutputPath) && !Path.IsPathRooted(json.SelfRepair.BuildOutputPath))
+        json.SelfRepair.BuildOutputPath = Path.GetFullPath(Path.Combine(dir, json.SelfRepair.BuildOutputPath));
+    if (!string.IsNullOrWhiteSpace(json.GitOps.RepoPath) && !Path.IsPathRooted(json.GitOps.RepoPath))
+        json.GitOps.RepoPath = Path.GetFullPath(Path.Combine(dir, json.GitOps.RepoPath));
 
     ValidateResolvedConfig(json);
     return json;
@@ -156,10 +202,50 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
         ?? config.SelfRepair.WorkspacePath;
     config.SelfRepair.ScopeRootPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_SELF_REPAIR_SCOPE_ROOT")
         ?? config.SelfRepair.ScopeRootPath;
+    config.SelfRepair.SourceRootPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_SELF_REPAIR_SOURCE_ROOT")
+        ?? config.SelfRepair.SourceRootPath;
+    config.SelfRepair.BuildOutputPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_SELF_REPAIR_BUILD_OUTPUT")
+        ?? config.SelfRepair.BuildOutputPath;
     config.SelfRepair.AllowScopeFileWrites = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_ALLOW_SCOPE_WRITES", config.SelfRepair.AllowScopeFileWrites);
     config.SelfRepair.ApplyLogRuleUpdates = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_APPLY_LOG_RULES", config.SelfRepair.ApplyLogRuleUpdates);
     config.SelfRepair.ApplyReplyStyleUpdates = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_APPLY_REPLY_STYLE", config.SelfRepair.ApplyReplyStyleUpdates);
+    config.SelfRepair.AllowSourceBuilds = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_ALLOW_SOURCE_BUILDS", config.SelfRepair.AllowSourceBuilds);
+    config.SelfRepair.AllowServiceRestarts = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_ALLOW_SERVICE_RESTARTS", config.SelfRepair.AllowServiceRestarts);
     config.SelfRepair.NotifyAdmins = RustOpsEnv.GetBoolean("RUSTOPS_SELF_REPAIR_NOTIFY_ADMINS", config.SelfRepair.NotifyAdmins);
+
+    config.GitOps.Enabled = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_ENABLED", config.GitOps.Enabled);
+    config.GitOps.RepoPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REPO_PATH")
+        ?? config.GitOps.RepoPath;
+    config.GitOps.RemoteName = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REMOTE")
+        ?? config.GitOps.RemoteName;
+    config.GitOps.BaseBranch = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_BASE_BRANCH")
+        ?? config.GitOps.BaseBranch;
+    config.GitOps.PushBranchPrefix = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_PUSH_BRANCH_PREFIX")
+        ?? config.GitOps.PushBranchPrefix;
+    config.GitOps.AllowPush = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_ALLOW_PUSH", config.GitOps.AllowPush);
+    config.GitOps.AllowManualPullRebuild = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_ALLOW_MANUAL_PULL_REBUILD", config.GitOps.AllowManualPullRebuild);
+    config.GitOps.AutoPullEnabled = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_PULL_ENABLED", config.GitOps.AutoPullEnabled);
+    config.GitOps.AutoPullIntervalMinutes = RustOpsEnv.GetInt32("RUSTOPS_GITOPS_AUTO_PULL_INTERVAL_MINUTES", config.GitOps.AutoPullIntervalMinutes);
+    config.GitOps.AutoPullRebuild = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_PULL_REBUILD", config.GitOps.AutoPullRebuild);
+    config.GitOps.AutoRestartAfterPullRebuild = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_RESTART_AFTER_PULL_REBUILD", config.GitOps.AutoRestartAfterPullRebuild);
+    config.GitOps.RequireCleanWorktreeForPull = RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_REQUIRE_CLEAN_WORKTREE_FOR_PULL", config.GitOps.RequireCleanWorktreeForPull);
+
+    config.CommandExecution.Enabled = RustOpsEnv.GetBoolean("RUSTOPS_COMMANDS_ENABLED", config.CommandExecution.Enabled);
+    config.CommandExecution.FreeMode = RustOpsEnv.GetBoolean("RUSTOPS_COMMANDS_FREE_MODE", config.CommandExecution.FreeMode);
+    config.CommandExecution.DefaultWaitMs = RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_DEFAULT_WAIT_MS", config.CommandExecution.DefaultWaitMs);
+    config.CommandExecution.MaxWaitMs = RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_MAX_WAIT_MS", config.CommandExecution.MaxWaitMs);
+    config.CommandExecution.MaxOutputChars = RustOpsEnv.GetInt32("RUSTOPS_COMMANDS_MAX_OUTPUT_CHARS", config.CommandExecution.MaxOutputChars);
+    var allowListOverride = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_COMMANDS_ALLOWLIST");
+    if (!string.IsNullOrWhiteSpace(allowListOverride))
+        config.CommandExecution.AllowList = ParseCommandAllowList(allowListOverride);
+
+    config.PluginUpdates.Enabled = RustOpsEnv.GetBoolean("RUSTOPS_PLUGIN_UPDATES_ENABLED", config.PluginUpdates.Enabled);
+    config.PluginUpdates.CheckIntervalMinutes = RustOpsEnv.GetInt32("RUSTOPS_PLUGIN_UPDATES_INTERVAL_MINUTES", config.PluginUpdates.CheckIntervalMinutes);
+    config.PluginUpdates.NotifyAdmins = RustOpsEnv.GetBoolean("RUSTOPS_PLUGIN_UPDATES_NOTIFY_ADMINS", config.PluginUpdates.NotifyAdmins);
+    config.PluginUpdates.SearchUrlTemplate = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_PLUGIN_UPDATES_SEARCH_URL")
+        ?? config.PluginUpdates.SearchUrlTemplate;
+    config.PluginUpdates.SearchFilter = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_PLUGIN_UPDATES_FILTER")
+        ?? config.PluginUpdates.SearchFilter;
 
     config.Llm.Provider = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_PROVIDER")
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Provider);
@@ -171,11 +257,28 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Model);
     config.Llm.ApiKey = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_API_KEY", "LM_API_TOKEN")
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ApiKey);
+    config.Llm.HttpReferer = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_HTTP_REFERER", "OPENROUTER_HTTP_REFERER")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.HttpReferer);
+    config.Llm.AppTitle = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_APP_TITLE", "OPENROUTER_APP_TITLE")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.AppTitle);
     config.Llm.UseForRecommendations = RustOpsEnv.GetBoolean("RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS",
         RustOpsEnv.GetBoolean("RUSTOPS_OLLAMA_USE_FOR_RECOMMENDATIONS", config.Llm.UseForRecommendations));
+    config.Llm.RequestStrategy = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_REQUEST_STRATEGY")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.RequestStrategy);
     config.Llm.UseChatSystemPrompt = RustOpsEnv.GetBoolean("RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT", config.Llm.UseChatSystemPrompt);
     config.Llm.ChatSystemPrompt = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ChatSystemPrompt);
+    config.Llm.Secondary.Enabled = RustOpsEnv.GetBoolean("RUSTOPS_LLM_SECONDARY_ENABLED", config.Llm.Secondary.Enabled);
+    config.Llm.Secondary.BaseUrl = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_SECONDARY_BASE_URL")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.BaseUrl);
+    config.Llm.Secondary.Model = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_SECONDARY_MODEL")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.Model);
+    config.Llm.Secondary.ApiKey = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_SECONDARY_API_KEY")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.ApiKey);
+    config.Llm.Secondary.HttpReferer = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_SECONDARY_HTTP_REFERER")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.HttpReferer);
+    config.Llm.Secondary.AppTitle = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_SECONDARY_APP_TITLE")
+        ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.AppTitle);
 }
 
 static void ValidateResolvedConfig(AgentConfig config)
@@ -191,20 +294,78 @@ static void ValidateResolvedConfig(AgentConfig config)
     Check("outbox.messageOutboxPath", config.Outbox.MessageOutboxPath);
     Check("selfRepair.workspacePath", config.SelfRepair.WorkspacePath);
     Check("selfRepair.scopeRootPath", config.SelfRepair.ScopeRootPath);
+    Check("selfRepair.sourceRootPath", config.SelfRepair.SourceRootPath);
+    Check("selfRepair.buildOutputPath", config.SelfRepair.BuildOutputPath);
+    Check("gitOps.repoPath", config.GitOps.RepoPath);
 
     var scopeRoot = Path.GetFullPath(config.SelfRepair.ScopeRootPath);
     var workspacePath = Path.GetFullPath(config.SelfRepair.WorkspacePath);
+    var sourceRootPath = Path.GetFullPath(config.SelfRepair.SourceRootPath);
+    var buildOutputPath = Path.GetFullPath(config.SelfRepair.BuildOutputPath);
     if (!workspacePath.StartsWith(scopeRoot, StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException(
             $"selfRepair.workspacePath must stay inside selfRepair.scopeRootPath. Scope='{scopeRoot}', workspace='{workspacePath}'.");
+    }
+    if (!sourceRootPath.StartsWith(scopeRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            $"selfRepair.sourceRootPath must stay inside selfRepair.scopeRootPath. Scope='{scopeRoot}', source='{sourceRootPath}'.");
+    }
+    if (!buildOutputPath.StartsWith(scopeRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            $"selfRepair.buildOutputPath must stay inside selfRepair.scopeRootPath. Scope='{scopeRoot}', build='{buildOutputPath}'.");
+    }
+    var gitRepoPath = Path.GetFullPath(config.GitOps.RepoPath);
+    if (!gitRepoPath.StartsWith(scopeRoot, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            $"gitOps.repoPath must stay inside selfRepair.scopeRootPath. Scope='{scopeRoot}', repo='{gitRepoPath}'.");
     }
 
     if (config.Llm.Enabled)
     {
         Check("llm.baseUrl", config.Llm.BaseUrl);
         Check("llm.model", config.Llm.Model);
+        if (!IsValidHttpUrl(config.Llm.BaseUrl))
+            throw new InvalidOperationException("llm.baseUrl must be an absolute http/https URL.");
     }
+    if (config.Llm.Secondary.Enabled)
+    {
+        Check("llm.secondary.baseUrl", config.Llm.Secondary.BaseUrl);
+        Check("llm.secondary.model", config.Llm.Secondary.Model);
+        if (!IsValidHttpUrl(config.Llm.Secondary.BaseUrl))
+            throw new InvalidOperationException("llm.secondary.baseUrl must be an absolute http/https URL.");
+    }
+
+    config.CommandExecution.DefaultWaitMs = Math.Clamp(config.CommandExecution.DefaultWaitMs, 200, 20_000);
+    config.CommandExecution.MaxWaitMs = Math.Clamp(config.CommandExecution.MaxWaitMs, 500, 30_000);
+    if (config.CommandExecution.MaxWaitMs < config.CommandExecution.DefaultWaitMs)
+        config.CommandExecution.MaxWaitMs = config.CommandExecution.DefaultWaitMs;
+    config.CommandExecution.MaxOutputChars = Math.Clamp(config.CommandExecution.MaxOutputChars, 500, 64_000);
+    config.CommandExecution.AllowList = config.CommandExecution.AllowList
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Select(value => value.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+    if (!config.CommandExecution.FreeMode && config.CommandExecution.AllowList.Count == 0)
+        throw new InvalidOperationException("commandExecution.allowList must include at least one command when freeMode is disabled.");
+
+    config.PluginUpdates.CheckIntervalMinutes = Math.Clamp(config.PluginUpdates.CheckIntervalMinutes, 5, 24 * 60);
+    if (string.IsNullOrWhiteSpace(config.PluginUpdates.SearchUrlTemplate))
+        throw new InvalidOperationException("pluginUpdates.searchUrlTemplate is required.");
+
+    config.GitOps.AutoPullIntervalMinutes = Math.Clamp(config.GitOps.AutoPullIntervalMinutes, 1, 24 * 60);
+    config.GitOps.RemoteName = string.IsNullOrWhiteSpace(config.GitOps.RemoteName) ? "origin" : config.GitOps.RemoteName.Trim();
+    config.GitOps.BaseBranch = string.IsNullOrWhiteSpace(config.GitOps.BaseBranch) ? "main" : config.GitOps.BaseBranch.Trim();
+    config.GitOps.PushBranchPrefix = string.IsNullOrWhiteSpace(config.GitOps.PushBranchPrefix) ? "agent/" : config.GitOps.PushBranchPrefix.Trim();
+    if (!config.GitOps.PushBranchPrefix.EndsWith("/", StringComparison.Ordinal))
+        config.GitOps.PushBranchPrefix += "/";
+
+    config.Llm.RequestStrategy = (config.Llm.RequestStrategy ?? "fallback").Trim().ToLowerInvariant();
+    if (config.Llm.RequestStrategy is not ("fallback" or "race"))
+        throw new InvalidOperationException("llm.requestStrategy must be 'fallback' or 'race'.");
 
     if (unresolved.Count > 0)
     {
@@ -218,6 +379,24 @@ static void ValidateResolvedConfig(AgentConfig config)
         if (string.IsNullOrWhiteSpace(value) || RustOpsEnv.HasUnresolvedPlaceholder(value))
             unresolved.Add(name);
     }
+}
+
+static List<string> ParseCommandAllowList(string value)
+{
+    return value
+        .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Where(item => !string.IsNullOrWhiteSpace(item))
+        .Select(item => item.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static bool IsValidHttpUrl(string? value)
+{
+    if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+        return false;
+
+    return uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps;
 }
 
 static class AgentLogRulesFile
@@ -278,6 +457,8 @@ internal sealed class RustOpsAgent
         "list_agent_workspace_files",
         "read_agent_workspace_file",
         "write_agent_workspace_file",
+        "git_push_branch",
+        "git_pull_rebuild",
         "update_log_rules",
         "update_reply_style"
     };
@@ -297,6 +478,8 @@ If an admin asks to execute a server console command, use execute_server_command
 If an admin asks what a command does, use get_server_command_memory.
 If an admin teaches command behavior, use teach_server_command.
 If an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.
+If an admin asks to push source changes to git, use git_push_branch.
+If an admin asks to pull latest source updates, use git_pull_rebuild.
 """;
     private readonly AgentConfig _config;
     private readonly RustMgrApiClient _api;
@@ -311,6 +494,7 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
     private DateTime? _lastReplyStyleWriteTimeUtc;
     private string _replyStyleGuidance = string.Empty;
     private DateTime? _lastSelfRepairCycleUtc;
+    private DateTime? _lastGitAutoPullCheckUtc;
     private readonly AgentMemoryStore _memory;
     private volatile bool _stopRequested;
 
@@ -798,6 +982,8 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             serverMemory.LastObservedAtUtc = utcNow;
             serverMemory.LastKnownPid = server.Pid;
         }
+
+        await RunGitAutoPullCycleAsync(utcNow);
     }
 
     private void ObserveStatusTransition(ServerMemory serverMemory, ServerSnapshot server, DateTime utcNow)
@@ -1129,23 +1315,30 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
         var runMatch = Regex.Match(text, @"^(run|execute)\s+command\s+(?<command>.+?)\s+on\s+(?<server>[A-Za-z0-9_\-]+)$", RegexOptions.IgnoreCase);
         if (runMatch.Success)
         {
+            if (!_config.CommandExecution.Enabled)
+                return "Server command execution is disabled by config.";
+
             var requestedServer = runMatch.Groups["server"].Value.Trim();
             var serverName = ResolveServerName(requestedServer, servers);
             if (string.IsNullOrWhiteSpace(serverName))
                 return BuildServerNotFoundReply(servers);
 
             var command = runMatch.Groups["command"].Value.Trim();
-            if (!_config.Policy.IsServerCommandAllowed(command))
-            {
-                return $"Command '{NormalizeCommandKey(command)}' is blocked by policy. Update allowlist or enable allowAnyServerCommand.";
-            }
+            var normalized = NormalizeCommand(command);
+            if (normalized is null)
+                return "Command must be a single line and 256 characters or less.";
+            if (!IsCommandAllowed(normalized, out var policyError))
+                return policyError ?? "Command not allowed by current policy.";
 
             JsonDocument json;
             try
             {
-                json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(serverName)}/command", new
+                json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(serverName)}/command/exec", new
                 {
-                    command
+                    command = normalized,
+                    waitMs = _config.CommandExecution.DefaultWaitMs,
+                    maxLines = 240,
+                    maxBytes = 256 * 1024
                 });
             }
             catch (Exception ex)
@@ -1154,17 +1347,11 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             }
             using (json)
             {
-            var ok = json.RootElement.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
-            var stdout = json.RootElement.TryGetProperty("stdOut", out var stdOutNode) && stdOutNode.ValueKind == JsonValueKind.String
-                ? stdOutNode.GetString() ?? string.Empty
-                : string.Empty;
-            var stderr = json.RootElement.TryGetProperty("stdErr", out var stdErrNode) && stdErrNode.ValueKind == JsonValueKind.String
-                ? stdErrNode.GetString() ?? string.Empty
-                : string.Empty;
-            var summary = BuildCommandOutputSummary(stdout, stderr);
-            RecordCommandKnowledge(serverName, command, summary, ok, adminId, utcNow);
+                var output = ExtractCommandOutputMessages(json.RootElement);
+                var summary = TrimSingleLine(string.Join(" | ", output.Take(8)), 220);
+                RecordCommandKnowledge(serverName, normalized, summary, success: true, adminId, utcNow);
 
-            return $"{serverName}: command '{command}' {(ok ? "executed" : "failed")} | {TrimSingleLine(summary, 260)}";
+                return $"{serverName}: command '{normalized}' executed | {TrimSingleLine(summary, 260)}";
             }
         }
 
@@ -1576,6 +1763,14 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             "Check uMod for newer plugin versions for one server and return update candidates.",
             BuildPluginUpdateToolParameters()),
         BuildToolDefinition(
+            "git_push_branch",
+            "Commit local source changes in gitOps.repoPath to a new branch and push to gitOps.remoteName.",
+            BuildGitPushToolParameters()),
+        BuildToolDefinition(
+            "git_pull_rebuild",
+            "Fetch and pull updates from gitOps.remoteName/gitOps.baseBranch, then rebuild and optionally restart services.",
+            BuildGitPullRebuildToolParameters()),
+        BuildToolDefinition(
             "diagnose_agent_runtime",
             "Inspect agent runtime errors, failed actions, and capability gaps.",
             new { type = "object", additionalProperties = false, properties = new { } }),
@@ -1694,6 +1889,11 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             {
                 type = "string",
                 description = "Console command text, for example oxide.plugins."
+            },
+            waitMs = new
+            {
+                type = "integer",
+                description = "How long to wait for fresh output after sending the command."
             }
         },
         required = new[] { "serverName", "command" }
@@ -1772,6 +1972,36 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             }
         },
         required = new[] { "serverName", "notifyAdmins" }
+    };
+
+    private static object BuildGitPushToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            commitMessage = new
+            {
+                type = "string",
+                description = "Optional commit message for the branch push."
+            }
+        },
+        required = Array.Empty<string>()
+    };
+
+    private static object BuildGitPullRebuildToolParameters() => new
+    {
+        type = "object",
+        additionalProperties = false,
+        properties = new
+        {
+            restartServices = new
+            {
+                type = "boolean",
+                description = "When true, restart managed services after a successful pull and build."
+            }
+        },
+        required = Array.Empty<string>()
     };
 
     private static object BuildWorkspaceListToolParameters() => new
@@ -1957,6 +2187,8 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             "teach_server_command" => ExecuteTeachServerCommandTool(arguments, servers, adminId, utcNow),
             "list_server_plugins" => await ExecuteListServerPluginsToolAsync(arguments, servers),
             "check_plugin_updates" => await ExecuteCheckPluginUpdatesToolAsync(arguments, servers, utcNow),
+            "git_push_branch" => await ExecuteGitPushToolAsync(arguments),
+            "git_pull_rebuild" => await ExecuteGitPullRebuildToolAsync(arguments),
             "diagnose_agent_runtime" => ExecuteDiagnoseAgentRuntimeTool(),
             "list_scope_files" => ExecuteListScopeFilesTool(arguments),
             "read_scope_file" => ExecuteReadScopeFileTool(arguments),
@@ -2019,6 +2251,9 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
 
     private async Task<ChatToolExecutionResult> ExecuteServerCommandToolAsync(JsonElement arguments, List<ServerSnapshot> servers, string adminId, DateTime utcNow)
     {
+        if (!_config.CommandExecution.Enabled)
+            return ChatToolExecutionResult.Error("Server command execution is disabled by config.");
+
         var resolution = ResolveToolServer(arguments, servers, "server-command");
         if (!resolution.Matched)
             return resolution.Result;
@@ -2027,61 +2262,52 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
         var command = ReadToolArgument(arguments, "command");
         if (string.IsNullOrWhiteSpace(command))
             return ChatToolExecutionResult.Error("command is required.", server.Name, "execute_server_command");
-        if (command.Contains('\n') || command.Contains('\r'))
-            return ChatToolExecutionResult.Error("command must be a single line.", server.Name, "execute_server_command");
+        var normalized = NormalizeCommand(command);
+        if (normalized is null)
+            return ChatToolExecutionResult.Error("Command must be a single line and 256 characters or less.", server.Name, "execute_server_command");
 
-        command = command.Trim();
-        if (command.Length > 300)
-            return ChatToolExecutionResult.Error("command length exceeds 300 characters.", server.Name, "execute_server_command");
-        if (!_config.Policy.IsServerCommandAllowed(command))
-        {
-            return ChatToolExecutionResult.Error(
-                $"command '{NormalizeCommandKey(command)}' is blocked by policy. Adjust allowed prefixes or enable allowAnyServerCommand.",
-                server.Name,
-                "execute_server_command");
-        }
+        if (!IsCommandAllowed(normalized, out var policyError))
+            return ChatToolExecutionResult.Error(policyError ?? "Command not allowed by current policy.", server.Name, "execute_server_command");
+
+        var waitMs = ReadToolIntArgument(
+            arguments,
+            "waitMs",
+            _config.CommandExecution.DefaultWaitMs,
+            200,
+            _config.CommandExecution.MaxWaitMs);
 
         JsonDocument json;
         try
         {
-            json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/command", new
+            json = await _api.PostJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/command/exec", new
             {
-                command
+                command = normalized,
+                waitMs,
+                maxLines = 240,
+                maxBytes = 256 * 1024
             });
         }
         catch (Exception ex)
         {
             return ChatToolExecutionResult.Error(ex.Message, server.Name, "execute_server_command");
         }
+
         using (json)
         {
-            var ok = json.RootElement.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
-            var exitCode = json.RootElement.TryGetProperty("exitCode", out var exitCodeNode) && exitCodeNode.ValueKind == JsonValueKind.Number
-                ? exitCodeNode.GetInt32()
-                : 0;
-            var stdout = json.RootElement.TryGetProperty("stdOut", out var stdOutNode) && stdOutNode.ValueKind == JsonValueKind.String
-                ? stdOutNode.GetString() ?? string.Empty
-                : string.Empty;
-            var stderr = json.RootElement.TryGetProperty("stdErr", out var stdErrNode) && stdErrNode.ValueKind == JsonValueKind.String
-                ? stdErrNode.GetString() ?? string.Empty
-                : string.Empty;
-
-            var summary = BuildCommandOutputSummary(stdout, stderr);
-            RecordCommandKnowledge(server.Name, command, summary, ok, adminId, utcNow);
-
-            using var eventsJson = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(server.Name)}/events?lines=20");
-            var recentEvents = ExtractTraceEventMessages(eventsJson.RootElement, 6);
+            var output = ExtractCommandOutputMessages(json.RootElement);
+            var outputPreview = TrimSingleLine(string.Join(" | ", output.Take(8)), 220);
+            RecordCommandKnowledge(server.Name, normalized, outputPreview, success: true, adminId, utcNow);
 
             return ChatToolExecutionResult.Success(SerializeToolPayload(new
             {
-                ok,
+                ok = true,
                 serverName = server.Name,
-                command,
-                exitCode,
-                summary,
-                stdout = TrimSingleLine(stdout, 2000),
-                stderr = TrimSingleLine(stderr, 1200),
-                recentEvents
+                command = normalized,
+                waitMs,
+                outputCount = output.Count,
+                outputPreview = TrimSingleLine(outputPreview, _config.CommandExecution.MaxOutputChars),
+                output,
+                raw = json.RootElement
             }), server.Name);
         }
     }
@@ -2202,6 +2428,9 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
 
     private async Task<ChatToolExecutionResult> ExecuteCheckPluginUpdatesToolAsync(JsonElement arguments, List<ServerSnapshot> servers, DateTime utcNow)
     {
+        if (!_config.PluginUpdates.Enabled)
+            return ChatToolExecutionResult.Error("Plugin update monitor is disabled by config.");
+
         var resolution = ResolveToolServer(arguments, servers, "check-plugin-updates");
         if (!resolution.Matched)
             return resolution.Result;
@@ -2221,7 +2450,7 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
         serverMemory.LastPluginUpdateCheckAtUtc = utcNow;
         serverMemory.LastPluginUpdateSignature = BuildPluginUpdateSignature(updates);
 
-        if (updates.Count > 0 && notifyAdmins)
+        if (updates.Count > 0 && notifyAdmins && _config.PluginUpdates.NotifyAdmins)
         {
             WriteOutboxMessage(new AdapterMessage
             {
@@ -2240,6 +2469,491 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             updateCount = updates.Count,
             updates
         }), resolution.Server.Name);
+    }
+
+    private async Task<ChatToolExecutionResult> ExecuteGitPushToolAsync(JsonElement arguments)
+    {
+        var commitMessage = ReadToolArgument(arguments, "commitMessage");
+        var result = await ExecuteGitPushBranchAsync(commitMessage);
+        if (!result.Success)
+            return ChatToolExecutionResult.Error(result.Summary);
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            branchName = result.BranchName,
+            previousBranch = result.PreviousBranch,
+            commitMessage = result.CommitMessage,
+            stagedFiles = result.StagedFiles,
+            summary = result.Summary
+        }));
+    }
+
+    private async Task<ChatToolExecutionResult> ExecuteGitPullRebuildToolAsync(JsonElement arguments)
+    {
+        var restart = ReadToolBooleanArgument(arguments, "restartServices", false);
+        var result = await ExecuteGitPullRebuildAsync(restart, automatic: false);
+        if (!result.Success)
+            return ChatToolExecutionResult.Error(result.Summary);
+
+        return ChatToolExecutionResult.Success(SerializeToolPayload(new
+        {
+            ok = true,
+            updated = result.Updated,
+            summary = result.Summary,
+            build = result.Build,
+            restart = result.Restart
+        }));
+    }
+
+    private async Task RunGitAutoPullCycleAsync(DateTime utcNow)
+    {
+        if (!_config.GitOps.Enabled || !_config.GitOps.AutoPullEnabled)
+            return;
+
+        var interval = TimeSpan.FromMinutes(Math.Max(1, _config.GitOps.AutoPullIntervalMinutes));
+        if (_lastGitAutoPullCheckUtc.HasValue &&
+            utcNow - _lastGitAutoPullCheckUtc.Value < interval)
+        {
+            return;
+        }
+
+        _lastGitAutoPullCheckUtc = utcNow;
+        try
+        {
+            var result = await ExecuteGitPullRebuildAsync(
+                restartServices: _config.GitOps.AutoRestartAfterPullRebuild,
+                automatic: true);
+
+            if (!result.Updated)
+                return;
+
+            WriteOutboxMessage(new AdapterMessage
+            {
+                CreatedAtUtc = utcNow,
+                Kind = "git-auto-sync",
+                Audience = "admins",
+                Message = result.Success
+                    ? $"Auto pull+rebuild applied from {_config.GitOps.RemoteName}/{_config.GitOps.BaseBranch}. {result.Summary}"
+                    : $"Auto pull+rebuild failed: {result.Summary}"
+            });
+        }
+        catch (Exception ex)
+        {
+            _memory.RecordAgentError($"git-auto-pull failed: {ex.Message}");
+            SentrySdk.CaptureException(ex);
+        }
+    }
+
+    private async Task<GitPushResult> ExecuteGitPushBranchAsync(string? commitMessage)
+    {
+        if (!_config.GitOps.Enabled)
+            return GitPushResult.Fail("Git operations are disabled by config.");
+        if (!_config.GitOps.AllowPush)
+            return GitPushResult.Fail("Git branch push is disabled by config.");
+        if (!Directory.Exists(_config.GitOps.RepoPath))
+            return GitPushResult.Fail($"Git repo path does not exist: {_config.GitOps.RepoPath}");
+        if (!IsPathWithinSelfRepairScope(_config.GitOps.RepoPath))
+            return GitPushResult.Fail("Git repo path is outside self-repair scope.");
+
+        var repoPath = Path.GetFullPath(_config.GitOps.RepoPath);
+        var inRepo = await ExecuteProcessAsync("git", new[] { "rev-parse", "--is-inside-work-tree" }, repoPath, TimeSpan.FromSeconds(12));
+        if (!inRepo.Ok || !string.Equals(inRepo.StdOut?.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+            return GitPushResult.Fail($"Not a git repo: {BuildLifecycleMessage(inRepo, "git rev-parse failed")}");
+
+        var status = await ExecuteProcessAsync("git", new[] { "status", "--porcelain" }, repoPath, TimeSpan.FromSeconds(20));
+        if (!status.Ok)
+            return GitPushResult.Fail($"git status failed: {BuildLifecycleMessage(status, "status failed")}");
+        if (string.IsNullOrWhiteSpace(status.StdOut))
+            return GitPushResult.Fail("No local changes to commit.");
+
+        var currentBranchResult = await ExecuteProcessAsync("git", new[] { "rev-parse", "--abbrev-ref", "HEAD" }, repoPath, TimeSpan.FromSeconds(10));
+        if (!currentBranchResult.Ok || string.IsNullOrWhiteSpace(currentBranchResult.StdOut))
+            return GitPushResult.Fail($"Could not resolve current branch: {BuildLifecycleMessage(currentBranchResult, "branch lookup failed")}");
+        var previousBranch = currentBranchResult.StdOut.Trim();
+
+        var branchName = BuildAgentBranchName();
+        var checkout = await ExecuteProcessAsync("git", new[] { "checkout", "-b", branchName }, repoPath, TimeSpan.FromSeconds(20));
+        if (!checkout.Ok)
+            return GitPushResult.Fail($"Failed to create branch '{branchName}': {BuildLifecycleMessage(checkout, "checkout failed")}");
+
+        var add = await ExecuteProcessAsync("git", new[] { "add", "-A" }, repoPath, TimeSpan.FromSeconds(60));
+        if (!add.Ok)
+        {
+            await ExecuteProcessAsync("git", new[] { "checkout", previousBranch }, repoPath, TimeSpan.FromSeconds(20));
+            return GitPushResult.Fail($"git add failed: {BuildLifecycleMessage(add, "add failed")}", branchName);
+        }
+
+        var staged = await ExecuteProcessAsync("git", new[] { "diff", "--cached", "--name-only" }, repoPath, TimeSpan.FromSeconds(15));
+        if (!staged.Ok)
+        {
+            await ExecuteProcessAsync("git", new[] { "checkout", previousBranch }, repoPath, TimeSpan.FromSeconds(20));
+            return GitPushResult.Fail($"git diff --cached failed: {BuildLifecycleMessage(staged, "diff failed")}", branchName);
+        }
+
+        var stagedFiles = (staged.StdOut ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (stagedFiles.Count == 0)
+        {
+            await ExecuteProcessAsync("git", new[] { "checkout", previousBranch }, repoPath, TimeSpan.FromSeconds(20));
+            return GitPushResult.Fail("No staged changes after git add.", branchName);
+        }
+
+        var resolvedCommitMessage = ResolveGitCommitMessage(commitMessage);
+        var commit = await ExecuteProcessAsync("git", new[] { "commit", "-m", resolvedCommitMessage }, repoPath, TimeSpan.FromSeconds(45));
+        if (!commit.Ok)
+        {
+            await ExecuteProcessAsync("git", new[] { "checkout", previousBranch }, repoPath, TimeSpan.FromSeconds(20));
+            return GitPushResult.Fail($"git commit failed: {BuildLifecycleMessage(commit, "commit failed")}", branchName);
+        }
+
+        var push = await ExecuteProcessAsync(
+            "git",
+            new[] { "push", "-u", _config.GitOps.RemoteName, branchName },
+            repoPath,
+            TimeSpan.FromSeconds(90));
+        if (!push.Ok)
+        {
+            await ExecuteProcessAsync("git", new[] { "checkout", previousBranch }, repoPath, TimeSpan.FromSeconds(20));
+            return GitPushResult.Fail($"git push failed: {BuildLifecycleMessage(push, "push failed")}", branchName);
+        }
+
+        return new GitPushResult
+        {
+            Success = true,
+            BranchName = branchName,
+            PreviousBranch = previousBranch,
+            CommitMessage = resolvedCommitMessage,
+            StagedFiles = stagedFiles,
+            Summary = $"Pushed {stagedFiles.Count} file(s) to branch '{branchName}'."
+        };
+    }
+
+    private async Task<GitSyncResult> ExecuteGitPullRebuildAsync(bool restartServices, bool automatic)
+    {
+        if (!_config.GitOps.Enabled)
+            return GitSyncResult.Fail("Git operations are disabled by config.");
+        if (!automatic && !_config.GitOps.AllowManualPullRebuild)
+            return GitSyncResult.Fail("Manual pull+rebuild is disabled by config.");
+        if (!Directory.Exists(_config.GitOps.RepoPath))
+            return GitSyncResult.Fail($"Git repo path does not exist: {_config.GitOps.RepoPath}");
+        if (!IsPathWithinSelfRepairScope(_config.GitOps.RepoPath))
+            return GitSyncResult.Fail("Git repo path is outside self-repair scope.");
+
+        var repoPath = Path.GetFullPath(_config.GitOps.RepoPath);
+        var inRepo = await ExecuteProcessAsync("git", new[] { "rev-parse", "--is-inside-work-tree" }, repoPath, TimeSpan.FromSeconds(12));
+        if (!inRepo.Ok || !string.Equals(inRepo.StdOut?.Trim(), "true", StringComparison.OrdinalIgnoreCase))
+            return GitSyncResult.Fail($"Not a git repo: {BuildLifecycleMessage(inRepo, "git rev-parse failed")}");
+
+        if (_config.GitOps.RequireCleanWorktreeForPull)
+        {
+            var status = await ExecuteProcessAsync("git", new[] { "status", "--porcelain" }, repoPath, TimeSpan.FromSeconds(20));
+            if (!status.Ok)
+                return GitSyncResult.Fail($"git status failed: {BuildLifecycleMessage(status, "status failed")}");
+            if (!string.IsNullOrWhiteSpace(status.StdOut))
+                return GitSyncResult.Fail("Worktree is not clean; refusing pull+rebuild.");
+        }
+
+        var fetch = await ExecuteProcessAsync("git", new[] { "fetch", _config.GitOps.RemoteName }, repoPath, TimeSpan.FromSeconds(60));
+        if (!fetch.Ok)
+            return GitSyncResult.Fail($"git fetch failed: {BuildLifecycleMessage(fetch, "fetch failed")}");
+
+        var remoteRef = $"{_config.GitOps.RemoteName}/{_config.GitOps.BaseBranch}";
+        var behind = await ExecuteProcessAsync("git", new[] { "rev-list", "--count", $"HEAD..{remoteRef}" }, repoPath, TimeSpan.FromSeconds(20));
+        if (!behind.Ok)
+            return GitSyncResult.Fail($"git rev-list failed: {BuildLifecycleMessage(behind, "rev-list failed")}");
+        var hasUpdates = int.TryParse((behind.StdOut ?? string.Empty).Trim(), out var behindCount) && behindCount > 0;
+        if (!hasUpdates)
+        {
+            return new GitSyncResult
+            {
+                Success = true,
+                Updated = false,
+                Summary = $"No updates on {remoteRef}."
+            };
+        }
+
+        var pull = await ExecuteProcessAsync(
+            "git",
+            new[] { "pull", "--rebase", _config.GitOps.RemoteName, _config.GitOps.BaseBranch },
+            repoPath,
+            TimeSpan.FromSeconds(90));
+        if (!pull.Ok)
+            return GitSyncResult.Fail($"git pull --rebase failed: {BuildLifecycleMessage(pull, "pull failed")}", true);
+
+        BuildFromSourceResult? build = null;
+        if (_config.GitOps.AutoPullRebuild || !automatic)
+        {
+            if (!_config.SelfRepair.AllowSourceBuilds)
+                return GitSyncResult.Fail("Source builds are disabled by config.", true);
+
+            build = await BuildFromSourceAsync("Release", "linux-x64");
+            if (!build.Success)
+                return GitSyncResult.Fail($"Pull succeeded but build failed: {build.Summary}", true, build);
+        }
+
+        RestartServicesResult? restart = null;
+        if (restartServices)
+        {
+            if (!_config.SelfRepair.AllowServiceRestarts)
+                return GitSyncResult.Fail("Restart requested but service restarts are disabled by config.", true, build);
+
+            restart = await RestartManagedServicesAsync();
+            if (!restart.Success)
+                return GitSyncResult.Fail($"Pull/build succeeded but restart failed: {restart.Summary}", true, build, restart);
+        }
+
+        return new GitSyncResult
+        {
+            Success = true,
+            Updated = true,
+            Build = build,
+            Restart = restart,
+            Summary = restartServices
+                ? $"Pulled {remoteRef}, rebuilt, and restarted managed services."
+                : $"Pulled {remoteRef} and rebuilt successfully."
+        };
+    }
+
+    private string BuildAgentBranchName()
+    {
+        var prefix = _config.GitOps.PushBranchPrefix;
+        if (!prefix.EndsWith("/", StringComparison.Ordinal))
+            prefix += "/";
+        return $"{prefix}{DateTime.UtcNow:yyyyMMdd-HHmmss}";
+    }
+
+    private static string SanitizeCommitMessage(string message)
+    {
+        var normalized = string.IsNullOrWhiteSpace(message)
+            ? "agent: self-update"
+            : message.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return normalized.Length <= 120 ? normalized : normalized[..120];
+    }
+
+    private static string ResolveGitCommitMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return $"agent: self-update {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC";
+        return SanitizeCommitMessage(message);
+    }
+
+    private async Task<BuildFromSourceResult> BuildFromSourceAsync(string configuration, string runtime)
+    {
+        var normalizedConfiguration = string.IsNullOrWhiteSpace(configuration) ? "Release" : configuration.Trim();
+        var normalizedRuntime = string.IsNullOrWhiteSpace(runtime) ? "linux-x64" : runtime.Trim();
+
+        var sourceRoot = Path.GetFullPath(_config.SelfRepair.SourceRootPath);
+        var outputRoot = Path.GetFullPath(_config.SelfRepair.BuildOutputPath);
+        if (!IsPathWithinSelfRepairScope(sourceRoot) || !IsPathWithinSelfRepairScope(outputRoot))
+        {
+            return new BuildFromSourceResult
+            {
+                Success = false,
+                Configuration = normalizedConfiguration,
+                Runtime = normalizedRuntime,
+                Summary = "Source/build paths are outside self-repair scope root."
+            };
+        }
+
+        var projects = new[]
+        {
+            new BuildTarget(
+                "agent",
+                Path.Combine(sourceRoot, "agent", "RustOpsAgent", "RustOpsAgent.csproj"),
+                Path.Combine(outputRoot, "agent", "RustOpsAgent")),
+            new BuildTarget(
+                "api",
+                Path.Combine(sourceRoot, "api", "rustmgrapi.csproj"),
+                Path.Combine(outputRoot, "api")),
+            new BuildTarget(
+                "steambot",
+                Path.Combine(sourceRoot, "SteamBot", "OpsSteamBot", "OpsSteamBot.csproj"),
+                Path.Combine(outputRoot, "SteamBot", "OpsSteamBot"))
+        };
+
+        var targetResults = new List<BuildTargetResult>();
+        foreach (var project in projects)
+        {
+            if (!File.Exists(project.ProjectPath))
+            {
+                targetResults.Add(new BuildTargetResult
+                {
+                    Name = project.Name,
+                    Success = false,
+                    ExitCode = -1,
+                    Message = $"Project not found: {project.ProjectPath}"
+                });
+                continue;
+            }
+
+            Directory.CreateDirectory(project.OutputPath);
+            var args = new[]
+            {
+                "publish",
+                project.ProjectPath,
+                "-c", normalizedConfiguration,
+                "-r", normalizedRuntime,
+                "-o", project.OutputPath,
+                "--nologo"
+            };
+
+            var result = await ExecuteProcessAsync("dotnet", args, sourceRoot, TimeSpan.FromMinutes(20));
+            targetResults.Add(new BuildTargetResult
+            {
+                Name = project.Name,
+                Success = result.Ok,
+                ExitCode = result.ExitCode,
+                Message = BuildLifecycleMessage(result, "build result unavailable")
+            });
+        }
+
+        var failedTargets = targetResults.Where(target => !target.Success).ToList();
+        var summary = failedTargets.Count == 0
+            ? $"Published {targetResults.Count} targets to {outputRoot}."
+            : $"Build failed for: {string.Join(", ", failedTargets.Select(target => target.Name))}.";
+
+        return new BuildFromSourceResult
+        {
+            Success = failedTargets.Count == 0,
+            Configuration = normalizedConfiguration,
+            Runtime = normalizedRuntime,
+            Targets = targetResults,
+            Summary = summary
+        };
+    }
+
+    private async Task<RestartServicesResult> RestartManagedServicesAsync()
+    {
+        var units = new[]
+        {
+            "rustmgrapi.service",
+            "rustopsagent.service",
+            "opssteambot.service"
+        };
+
+        var serviceResults = new List<ServiceRestartResult>();
+        foreach (var unit in units)
+        {
+            var restart = await ExecuteProcessAsync(
+                "systemctl",
+                new[] { "restart", unit },
+                _selfRepairScopeRootPath,
+                TimeSpan.FromSeconds(45));
+
+            if (!restart.Ok)
+            {
+                restart = await ExecuteProcessAsync(
+                    "sudo",
+                    new[] { "systemctl", "restart", unit },
+                    _selfRepairScopeRootPath,
+                    TimeSpan.FromSeconds(60));
+            }
+
+            serviceResults.Add(new ServiceRestartResult
+            {
+                Unit = unit,
+                Success = restart.Ok,
+                ExitCode = restart.ExitCode,
+                Message = BuildLifecycleMessage(restart, "restart result unavailable")
+            });
+        }
+
+        var failures = serviceResults.Where(result => !result.Success).ToList();
+        return new RestartServicesResult
+        {
+            Success = failures.Count == 0,
+            Services = serviceResults,
+            Summary = failures.Count == 0
+                ? "Managed services restarted."
+                : $"Failed to restart: {string.Join(", ", failures.Select(f => f.Unit))}."
+        };
+    }
+
+    private static async Task<CommandExecutionResult> ExecuteProcessAsync(
+        string fileName,
+        IEnumerable<string> args,
+        string workingDirectory,
+        TimeSpan timeout)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = fileName,
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        foreach (var arg in args)
+            psi.ArgumentList.Add(arg);
+
+        try
+        {
+            using var process = new Process { StartInfo = psi };
+            if (!process.Start())
+            {
+                return new CommandExecutionResult
+                {
+                    Ok = false,
+                    ExitCode = -1,
+                    Arguments = new[] { fileName }.Concat(args),
+                    StdErr = $"Failed to start '{fileName}'."
+                };
+            }
+
+            var stdOutTask = process.StandardOutput.ReadToEndAsync();
+            var stdErrTask = process.StandardError.ReadToEndAsync();
+            using var cts = new CancellationTokenSource(timeout);
+
+            try
+            {
+                await process.WaitForExitAsync(cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                        process.Kill(true);
+                }
+                catch
+                {
+                }
+
+                return new CommandExecutionResult
+                {
+                    Ok = false,
+                    ExitCode = -1,
+                    TimedOut = true,
+                    Arguments = new[] { fileName }.Concat(args),
+                    StdErr = $"Command timed out after {timeout.TotalSeconds:0}s."
+                };
+            }
+
+            return new CommandExecutionResult
+            {
+                Ok = process.ExitCode == 0,
+                ExitCode = process.ExitCode,
+                Arguments = new[] { fileName }.Concat(args),
+                StdOut = (await stdOutTask).Trim(),
+                StdErr = (await stdErrTask).Trim()
+            };
+        }
+        catch (Exception ex)
+        {
+            return new CommandExecutionResult
+            {
+                Ok = false,
+                ExitCode = -1,
+                Arguments = new[] { fileName }.Concat(args),
+                StdErr = ex.Message
+            };
+        }
     }
 
     private ChatToolExecutionResult ExecuteDiagnoseAgentRuntimeTool()
@@ -2276,6 +2990,27 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
                     .OrderByDescending(run => run.AtUtc)
                     .Take(8)
                     .ToList()
+            },
+            commandExecution = new
+            {
+                enabled = _config.CommandExecution.Enabled,
+                freeMode = _config.CommandExecution.FreeMode,
+                allowList = _config.CommandExecution.AllowList
+            },
+            gitOps = new
+            {
+                enabled = _config.GitOps.Enabled,
+                repoPath = _config.GitOps.RepoPath,
+                remote = _config.GitOps.RemoteName,
+                baseBranch = _config.GitOps.BaseBranch,
+                branchPrefix = _config.GitOps.PushBranchPrefix,
+                allowPush = _config.GitOps.AllowPush,
+                allowManualPullRebuild = _config.GitOps.AllowManualPullRebuild,
+                autoPullEnabled = _config.GitOps.AutoPullEnabled,
+                autoPullIntervalMinutes = _config.GitOps.AutoPullIntervalMinutes,
+                autoPullRebuild = _config.GitOps.AutoPullRebuild,
+                autoRestartAfterPullRebuild = _config.GitOps.AutoRestartAfterPullRebuild,
+                requireCleanWorktreeForPull = _config.GitOps.RequireCleanWorktreeForPull
             }
         };
 
@@ -2832,11 +3567,14 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             "restart-server" => "restart_server",
             "get-server-players" => "get_server_players",
             "get-server-events" => "get_server_events",
+            "exec-server-command" => "execute_server_command",
             "execute-server-command" => "execute_server_command",
             "get-server-command-memory" => "get_server_command_memory",
             "teach-server-command" => "teach_server_command",
             "list-server-plugins" => "list_server_plugins",
             "check-plugin-updates" => "check_plugin_updates",
+            "git-push-branch" => "git_push_branch",
+            "git-pull-rebuild" => "git_pull_rebuild",
             "diagnose-agent-runtime" => "diagnose_agent_runtime",
             "list-scope-files" => "list_scope_files",
             "read-scope-file" => "read_scope_file",
@@ -3225,6 +3963,8 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             "- validate oxide sandbox",
             "- list plugins modded",
             "- check plugin updates modded",
+            "- push my self-repair changes to git",
+            "- pull latest git updates and rebuild",
             "- inspect host network throughput",
             "- restart onegrid",
             "- show pending actions",
@@ -4036,9 +4776,64 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
         return firstToken.Trim().ToLowerInvariant();
     }
 
+    private bool IsCommandAllowed(string command, out string? error)
+    {
+        if (!_config.CommandExecution.Enabled)
+        {
+            error = "Server command execution is disabled by config.";
+            return false;
+        }
+
+        if (_config.CommandExecution.FreeMode)
+        {
+            error = null;
+            return true;
+        }
+
+        if (_config.CommandExecution.AllowList.Any(allowed =>
+                string.Equals(allowed, NormalizeCommandKey(command), StringComparison.OrdinalIgnoreCase)))
+        {
+            error = null;
+            return true;
+        }
+
+        error = $"Command '{NormalizeCommandKey(command)}' is blocked by command allowlist.";
+        return false;
+    }
+
+    private static string? NormalizeCommand(string? command)
+    {
+        if (string.IsNullOrWhiteSpace(command))
+            return null;
+
+        var normalized = command.Trim();
+        if (normalized.Length > 256 || normalized.Contains('\n') || normalized.Contains('\r'))
+            return null;
+
+        return normalized;
+    }
+
+    private static List<string> ExtractCommandOutputMessages(JsonElement root)
+    {
+        if (!root.TryGetProperty("output", out var outputNode) || outputNode.ValueKind != JsonValueKind.Object)
+            return new List<string>();
+        if (!outputNode.TryGetProperty("messages", out var messagesNode) || messagesNode.ValueKind != JsonValueKind.Array)
+            return new List<string>();
+
+        return messagesNode.EnumerateArray()
+            .Select(item => item.GetString())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Select(item => item!.Trim())
+            .TakeLast(240)
+            .ToList();
+    }
+
     private async Task TryCheckPluginUpdatesAsync(string serverName, ServerMemory serverMemory, DateTime utcNow)
     {
-        var intervalMinutes = Math.Max(10, _config.Monitor.PluginUpdateCheckMinutes);
+        if (!_config.PluginUpdates.Enabled)
+            return;
+
+        var intervalMinutes = Math.Max(5, _config.PluginUpdates.CheckIntervalMinutes);
         serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
         if (serverMemory.LastPluginUpdateCheckAtUtc.HasValue &&
             utcNow - serverMemory.LastPluginUpdateCheckAtUtc.Value < TimeSpan.FromMinutes(intervalMinutes))
@@ -4063,6 +4858,9 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
             return;
 
         serverMemory.LastPluginUpdateSignature = signature;
+        if (!_config.PluginUpdates.NotifyAdmins)
+            return;
+
         WriteOutboxMessage(new AdapterMessage
         {
             CreatedAtUtc = utcNow,
@@ -4105,7 +4903,8 @@ If an admin asks about plugins or updates, use list_server_plugins and check_plu
                 continue;
 
             var query = Uri.EscapeDataString(plugin.Name);
-            var url = $"https://umod.org/plugins/search.json?query={query}&page=1&sort=title&sortdir=asc&filter=rust";
+            var filterValue = Uri.EscapeDataString(_config.PluginUpdates.SearchFilter ?? string.Empty);
+            var url = string.Format(_config.PluginUpdates.SearchUrlTemplate, query, filterValue);
             string jsonText;
             try
             {
@@ -4357,7 +5156,10 @@ internal sealed class RustMgrApiClient : IDisposable
         return JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
     }
 
-    public void Dispose() => _http.Dispose();
+    public void Dispose()
+    {
+        _http.Dispose();
+    }
 
     private static string FormatApiError(HttpStatusCode statusCode, string body)
     {
@@ -4390,20 +5192,23 @@ internal sealed class LlmClient : IDisposable
 {
     private readonly LlmSettings _settings;
     private readonly Action<LlmInteractionRecord>? _interactionRecorder;
-    private readonly HttpClient _http = new();
+    private readonly List<LlmEndpointRuntime> _endpoints = new();
+    private string? _lastEndpointFailure;
 
     public LlmClient(LlmSettings settings, Action<LlmInteractionRecord>? interactionRecorder = null)
     {
         _settings = settings;
         _interactionRecorder = interactionRecorder;
-        var baseUrl = settings.BaseUrl.Trim();
-        if (!baseUrl.EndsWith("/", StringComparison.Ordinal))
-            baseUrl += "/";
-        _http.BaseAddress = new Uri(baseUrl, UriKind.Absolute);
-        _http.Timeout = TimeSpan.FromMinutes(2);
 
-        if (!string.IsNullOrWhiteSpace(settings.ApiKey))
-            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
+        _endpoints.Add(CreateEndpoint("primary", settings.BaseUrl, settings.Model, settings.ApiKey, settings.HttpReferer, settings.AppTitle));
+        if (settings.Secondary.Enabled)
+            _endpoints.Add(CreateEndpoint(
+                "secondary",
+                settings.Secondary.BaseUrl,
+                settings.Secondary.Model,
+                settings.Secondary.ApiKey,
+                string.IsNullOrWhiteSpace(settings.Secondary.HttpReferer) ? settings.HttpReferer : settings.Secondary.HttpReferer,
+                string.IsNullOrWhiteSpace(settings.Secondary.AppTitle) ? settings.AppTitle : settings.Secondary.AppTitle));
     }
 
     public async Task<string?> TrySummarizeIncidentAsync(
@@ -4735,7 +5540,7 @@ Respond as strict JSON:
 
         if (contentText is null)
         {
-            lastFailure = "chat-completions unavailable";
+            lastFailure = BuildStepFailure("chat-completions unavailable");
             contentText = await TryGenerateWithEndpointAsync(
                 "/v1/responses",
                 new
@@ -4748,7 +5553,7 @@ Respond as strict JSON:
 
         if (contentText is null)
         {
-            lastFailure = "responses unavailable";
+            lastFailure = BuildStepFailure("responses unavailable");
             contentText = await TryGenerateWithEndpointAsync(
                 "/api/v1/chat",
                 new
@@ -4758,6 +5563,9 @@ Respond as strict JSON:
                 },
                 ExtractNativeChatText);
         }
+
+        if (contentText is null)
+            lastFailure = BuildStepFailure(lastFailure ?? "native-chat unavailable");
 
         RecordInteraction(interactionType, !string.IsNullOrWhiteSpace(contentText), context, contentText ?? lastFailure);
         return contentText;
@@ -4838,21 +5646,50 @@ Respond as strict JSON:
             tools
         };
 
-        var httpResult = await PostWithDynamicEndpointAsync("/v1/chat/completions", payload);
-        if (!httpResult.Ok || string.IsNullOrWhiteSpace(httpResult.Body))
+        LlmToolChatResponse? result = null;
+        var failures = new List<string>();
+        foreach (var endpoint in _endpoints)
         {
-            RecordInteraction("chat-tool-turn", false, messages.LastOrDefault(message => message.Role == "user")?.Content, $"http {httpResult.StatusCode}");
-            return null;
+            var httpResult = await PostWithDynamicEndpointAsync(endpoint, "/v1/chat/completions", payload);
+            if (!httpResult.Ok || string.IsNullOrWhiteSpace(httpResult.Body))
+            {
+                failures.Add(DescribeHttpFailure(httpResult));
+                continue;
+            }
+
+            var body = httpResult.Body.TrimStart();
+            if (!body.StartsWith("{", StringComparison.Ordinal) &&
+                !body.StartsWith("[", StringComparison.Ordinal))
+            {
+                failures.Add($"{endpoint.Name}: non-JSON response (status {httpResult.StatusCode}): {TrimForPreview(httpResult.Body, 140)}");
+                continue;
+            }
+
+            try
+            {
+                using var json = JsonDocument.Parse(httpResult.Body);
+                result = ExtractToolChatResponse(json.RootElement);
+                if (result is not null)
+                    break;
+
+                failures.Add($"{endpoint.Name}: JSON response missing expected tool call fields.");
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{endpoint.Name}: JSON parse failed: {TrimForPreview(ex.Message, 140)}");
+            }
         }
 
-        using var json = JsonDocument.Parse(httpResult.Body);
-        var result = ExtractToolChatResponse(json.RootElement);
+        _lastEndpointFailure = result is null && failures.Count > 0
+            ? string.Join(" | ", failures.Distinct(StringComparer.OrdinalIgnoreCase).Take(3))
+            : null;
+
         RecordInteraction(
             "chat-tool-turn",
             result is not null,
             messages.LastOrDefault(message => message.Role == "user")?.Content,
             result is null
-                ? "tool response parse failed"
+                ? BuildStepFailure("tool response parse failed")
                 : result.ToolCalls.Count > 0
                     ? $"tool calls: {string.Join(", ", result.ToolCalls.Select(call => call.Name))}"
                     : result.Content);
@@ -4880,7 +5717,7 @@ Respond as strict JSON:
             "chat-tool-final",
             !string.IsNullOrWhiteSpace(content),
             messages.LastOrDefault(message => message.Role == "user")?.Content,
-            content);
+            content ?? BuildStepFailure("chat completion unavailable"));
 
         return content;
     }
@@ -4939,47 +5776,161 @@ Respond as strict JSON:
 
     private async Task<string?> TryGenerateWithEndpointAsync(string path, object payload, Func<JsonElement, string?> extractor)
     {
-        var httpResult = await PostWithDynamicEndpointAsync(path, payload);
-        if (!httpResult.Ok || string.IsNullOrWhiteSpace(httpResult.Body))
-            return null;
+        var failures = new List<string>();
+        if (_settings.RequestStrategy.Equals("race", StringComparison.OrdinalIgnoreCase) && _endpoints.Count > 1)
+        {
+            var tasks = _endpoints.Select(endpoint => TryGenerateWithEndpointAsync(endpoint, path, payload, extractor)).ToList();
+            while (tasks.Count > 0)
+            {
+                var completed = await Task.WhenAny(tasks);
+                tasks.Remove(completed);
+                var attempt = await completed;
+                if (!string.IsNullOrWhiteSpace(attempt.Content))
+                {
+                    _lastEndpointFailure = null;
+                    return attempt.Content;
+                }
 
-        using var json = JsonDocument.Parse(httpResult.Body);
-        return extractor(json.RootElement);
+                if (!string.IsNullOrWhiteSpace(attempt.Failure))
+                    failures.Add(attempt.Failure!);
+            }
+
+            _lastEndpointFailure = failures.Count == 0
+                ? null
+                : string.Join(" | ", failures.Distinct(StringComparer.OrdinalIgnoreCase).Take(3));
+            return null;
+        }
+
+        foreach (var endpoint in _endpoints)
+        {
+            var attempt = await TryGenerateWithEndpointAsync(endpoint, path, payload, extractor);
+            if (!string.IsNullOrWhiteSpace(attempt.Content))
+            {
+                _lastEndpointFailure = null;
+                return attempt.Content;
+            }
+
+            if (!string.IsNullOrWhiteSpace(attempt.Failure))
+                failures.Add(attempt.Failure!);
+        }
+
+        _lastEndpointFailure = failures.Count == 0
+            ? null
+            : string.Join(" | ", failures.Distinct(StringComparer.OrdinalIgnoreCase).Take(3));
+        return null;
     }
 
-    private async Task<LlmHttpResult> PostWithDynamicEndpointAsync(string canonicalPath, object payload)
+    private async Task<LlmAttemptResult> TryGenerateWithEndpointAsync(
+        LlmEndpointRuntime endpoint,
+        string path,
+        object payload,
+        Func<JsonElement, string?> extractor)
     {
-        var body = JsonSerializer.Serialize(payload);
-        var candidates = BuildEndpointCandidates(canonicalPath).ToList();
+        var httpResult = await PostWithDynamicEndpointAsync(endpoint, path, payload);
+        if (!httpResult.Ok || string.IsNullOrWhiteSpace(httpResult.Body))
+        {
+            return new LlmAttemptResult
+            {
+                Failure = DescribeHttpFailure(httpResult)
+            };
+        }
+
+        var body = httpResult.Body.TrimStart();
+        if (!body.StartsWith("{", StringComparison.Ordinal) &&
+            !body.StartsWith("[", StringComparison.Ordinal))
+        {
+            return new LlmAttemptResult
+            {
+                Failure = $"{endpoint.Name}: non-JSON response (status {httpResult.StatusCode}): {TrimForPreview(httpResult.Body, 140)}"
+            };
+        }
+
+        try
+        {
+            using var json = JsonDocument.Parse(httpResult.Body);
+            var extracted = extractor(json.RootElement);
+            if (!string.IsNullOrWhiteSpace(extracted))
+            {
+                return new LlmAttemptResult
+                {
+                    Content = extracted
+                };
+            }
+
+            return new LlmAttemptResult
+            {
+                Failure = $"{endpoint.Name}: JSON response missing expected completion fields."
+            };
+        }
+        catch (Exception ex)
+        {
+            return new LlmAttemptResult
+            {
+                Failure = $"{endpoint.Name}: JSON parse failed: {TrimForPreview(ex.Message, 140)}"
+            };
+        }
+    }
+
+    private async Task<LlmHttpResult> PostWithDynamicEndpointAsync(LlmEndpointRuntime endpoint, string canonicalPath, object payload)
+    {
+        var body = BuildEndpointRequestBody(payload, endpoint.Model);
+        var candidates = BuildEndpointCandidates(endpoint.Client.BaseAddress, canonicalPath).ToList();
 
         LlmHttpResult? lastFailure = null;
         foreach (var candidate in candidates)
         {
             using var content = new StringContent(body, Encoding.UTF8, "application/json");
-            using var response = await _http.PostAsync(candidate, content);
-            var responseBody = await response.Content.ReadAsStringAsync();
-            if (response.IsSuccessStatusCode)
+            try
             {
-                return new LlmHttpResult
+                using var response = await endpoint.Client.PostAsync(candidate, content);
+                var responseBody = await response.Content.ReadAsStringAsync();
+                if (response.IsSuccessStatusCode)
                 {
-                    Ok = true,
+                    return new LlmHttpResult
+                    {
+                        Ok = true,
+                        StatusCode = (int)response.StatusCode,
+                        Body = responseBody,
+                        EndpointName = endpoint.Name,
+                        EndpointModel = endpoint.Model
+                    };
+                }
+
+                lastFailure = new LlmHttpResult
+                {
+                    Ok = false,
                     StatusCode = (int)response.StatusCode,
-                    Body = responseBody
+                    Body = responseBody,
+                    EndpointName = endpoint.Name,
+                    EndpointModel = endpoint.Model
                 };
             }
-
-            lastFailure = new LlmHttpResult
+            catch (Exception ex)
             {
-                Ok = false,
-                StatusCode = (int)response.StatusCode,
-                Body = responseBody
-            };
+                lastFailure = new LlmHttpResult
+                {
+                    Ok = false,
+                    StatusCode = 0,
+                    Body = ex.Message,
+                    EndpointName = endpoint.Name,
+                    EndpointModel = endpoint.Model
+                };
+            }
         }
 
         return lastFailure ?? new LlmHttpResult { Ok = false, StatusCode = 0, Body = null };
     }
 
-    private IEnumerable<string> BuildEndpointCandidates(string canonicalPath)
+    private static string BuildEndpointRequestBody(object payload, string model)
+    {
+        var node = JsonNode.Parse(JsonSerializer.Serialize(payload));
+        if (node is JsonObject obj)
+            obj["model"] = model;
+
+        return node?.ToJsonString() ?? JsonSerializer.Serialize(payload);
+    }
+
+    private static IEnumerable<string> BuildEndpointCandidates(Uri? baseAddress, string canonicalPath)
     {
         var normalized = canonicalPath.Trim();
         normalized = normalized.TrimStart('/');
@@ -4995,11 +5946,7 @@ Respond as strict JSON:
                 candidates.Add(candidate);
         }
 
-        // Absolute and relative defaults.
-        Add("/" + normalized);
-        Add(normalized);
-
-        var basePath = _http.BaseAddress?.AbsolutePath ?? "/";
+        var basePath = baseAddress?.AbsolutePath ?? "/";
         if (!string.IsNullOrWhiteSpace(basePath) && !string.Equals(basePath, "/", StringComparison.Ordinal))
         {
             var trimmedBasePath = basePath.TrimEnd('/');
@@ -5009,7 +5956,18 @@ Respond as strict JSON:
                 Add(string.Empty);
 
             // Prefix style, e.g. /openai + /v1/chat/completions
-            Add($"{trimmedBasePath}/{normalized}");
+            if (!(normalized.StartsWith("v1/", StringComparison.OrdinalIgnoreCase) &&
+                  trimmedBasePath.EndsWith("/v1", StringComparison.OrdinalIgnoreCase)))
+            {
+                Add($"{trimmedBasePath}/{normalized}");
+            }
+
+            // Base already ends with /v1 (or /api/v1) and normalized also starts with v1/.
+            if (normalized.StartsWith("v1/", StringComparison.OrdinalIgnoreCase) &&
+                trimmedBasePath.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+            {
+                Add($"{trimmedBasePath}/{normalized["v1/".Length..]}");
+            }
 
             var v1Index = trimmedBasePath.IndexOf("/v1/", StringComparison.OrdinalIgnoreCase);
             if (v1Index >= 0)
@@ -5027,7 +5985,50 @@ Respond as strict JSON:
             }
         }
 
+        // Absolute and relative defaults.
+        Add("/" + normalized);
+        Add(normalized);
+
         return candidates;
+    }
+
+    private static LlmEndpointRuntime CreateEndpoint(
+        string name,
+        string baseUrl,
+        string model,
+        string? apiKey,
+        string? httpReferer,
+        string? appTitle)
+    {
+        var normalizedBaseUrl = baseUrl.Trim();
+        if (!normalizedBaseUrl.EndsWith("/", StringComparison.Ordinal))
+            normalizedBaseUrl += "/";
+
+        var client = new HttpClient
+        {
+            BaseAddress = new Uri(normalizedBaseUrl, UriKind.Absolute),
+            Timeout = TimeSpan.FromMinutes(2)
+        };
+
+        var normalizedToken = NormalizeBearerToken(apiKey);
+        if (!string.IsNullOrWhiteSpace(normalizedToken))
+            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", normalizedToken);
+
+        var isOpenRouter = normalizedBaseUrl.Contains("openrouter.ai", StringComparison.OrdinalIgnoreCase);
+        var resolvedReferer = string.IsNullOrWhiteSpace(httpReferer) && isOpenRouter ? "http://localhost" : httpReferer;
+        var resolvedTitle = string.IsNullOrWhiteSpace(appTitle) && isOpenRouter ? "RustOpsAgent" : appTitle;
+
+        if (!string.IsNullOrWhiteSpace(resolvedReferer))
+            client.DefaultRequestHeaders.TryAddWithoutValidation("HTTP-Referer", resolvedReferer);
+        if (!string.IsNullOrWhiteSpace(resolvedTitle))
+            client.DefaultRequestHeaders.TryAddWithoutValidation("X-OpenRouter-Title", resolvedTitle);
+
+        return new LlmEndpointRuntime
+        {
+            Name = name,
+            Model = model,
+            Client = client
+        };
     }
 
     private sealed class LlmHttpResult
@@ -5035,6 +6036,21 @@ Respond as strict JSON:
         public bool Ok { get; set; }
         public int StatusCode { get; set; }
         public string? Body { get; set; }
+        public string? EndpointName { get; set; }
+        public string? EndpointModel { get; set; }
+    }
+
+    private sealed class LlmAttemptResult
+    {
+        public string? Content { get; set; }
+        public string? Failure { get; set; }
+    }
+
+    private sealed class LlmEndpointRuntime
+    {
+        public string Name { get; init; } = "primary";
+        public string Model { get; init; } = string.Empty;
+        public HttpClient Client { get; init; } = new();
     }
 
     private void RecordInteraction(string interactionType, bool success, string? context, string? response)
@@ -5048,6 +6064,33 @@ Respond as strict JSON:
             Context = string.IsNullOrWhiteSpace(context) ? null : TrimForPreview(context, 120),
             ResponsePreview = string.IsNullOrWhiteSpace(response) ? null : TrimForPreview(response, 180)
         });
+    }
+
+    private string BuildStepFailure(string baseMessage)
+    {
+        var detail = string.IsNullOrWhiteSpace(_lastEndpointFailure) ? null : _lastEndpointFailure;
+        return string.IsNullOrWhiteSpace(detail) ? baseMessage : $"{baseMessage}: {detail}";
+    }
+
+    private static string DescribeHttpFailure(LlmHttpResult result)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(result.EndpointName) ? "endpoint" : result.EndpointName;
+        if (string.IsNullOrWhiteSpace(result.Body))
+            return $"{endpoint}: HTTP {result.StatusCode}";
+
+        return $"{endpoint}: HTTP {result.StatusCode} {TrimForPreview(result.Body, 140)}";
+    }
+
+    private static string? NormalizeBearerToken(string? apiKey)
+    {
+        if (string.IsNullOrWhiteSpace(apiKey))
+            return null;
+
+        var token = apiKey.Trim();
+        if (token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            token = token["Bearer ".Length..].Trim();
+
+        return string.IsNullOrWhiteSpace(token) ? null : token;
     }
 
     private static string TrimForPreview(string input, int maxLength)
@@ -5264,7 +6307,11 @@ Respond as strict JSON:
             ? node.GetString()
             : null;
 
-    public void Dispose() => _http.Dispose();
+    public void Dispose()
+    {
+        foreach (var endpoint in _endpoints)
+            endpoint.Client.Dispose();
+    }
 }
 
 internal sealed class AgentMemoryStore
@@ -5409,6 +6456,9 @@ internal sealed class AgentConfig
     public OutboxSettings Outbox { get; set; } = new();
     public PolicySettings Policy { get; set; } = new();
     public SelfRepairSettings SelfRepair { get; set; } = new();
+    [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
+    [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
+    [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
     [JsonPropertyName("ollama")] public LlmSettings? LegacyOllama { get; set; }
     [JsonIgnore] public string BaseDirectory { get; set; } = string.Empty;
@@ -5502,10 +6552,57 @@ internal sealed class SelfRepairSettings
     public int MaxFileBytes { get; set; } = 32 * 1024;
     public string ScopeRootPath { get; set; } = "/opt/rust-manager";
     public string WorkspacePath { get; set; } = "data/self-repair";
+    public string SourceRootPath { get; set; } = "/opt/rust-manager/src";
+    public string BuildOutputPath { get; set; } = "/opt/rust-manager";
     public bool AllowScopeFileWrites { get; set; } = true;
     public bool ApplyLogRuleUpdates { get; set; } = true;
     public bool ApplyReplyStyleUpdates { get; set; } = true;
+    public bool AllowSourceBuilds { get; set; } = true;
+    public bool AllowServiceRestarts { get; set; } = true;
     public bool NotifyAdmins { get; set; } = false;
+}
+
+internal sealed class GitOpsSettings
+{
+    public bool Enabled { get; set; }
+    public string RepoPath { get; set; } = "/opt/rust-manager/src";
+    public string RemoteName { get; set; } = "origin";
+    public string BaseBranch { get; set; } = "main";
+    public string PushBranchPrefix { get; set; } = "agent/";
+    public bool AllowPush { get; set; }
+    public bool AllowManualPullRebuild { get; set; } = true;
+    public bool AutoPullEnabled { get; set; }
+    public int AutoPullIntervalMinutes { get; set; } = 15;
+    public bool AutoPullRebuild { get; set; } = true;
+    public bool AutoRestartAfterPullRebuild { get; set; }
+    public bool RequireCleanWorktreeForPull { get; set; } = true;
+}
+
+internal sealed class CommandExecutionSettings
+{
+    public bool Enabled { get; set; } = true;
+    public bool FreeMode { get; set; }
+    public int DefaultWaitMs { get; set; } = 2500;
+    public int MaxWaitMs { get; set; } = 12_000;
+    public int MaxOutputChars { get; set; } = 8000;
+    public List<string> AllowList { get; set; } = new()
+    {
+        "playerlist",
+        "serverinfo",
+        "bans",
+        "oxide.plugins",
+        "status",
+        "version"
+    };
+}
+
+internal sealed class PluginUpdateSettings
+{
+    public bool Enabled { get; set; } = true;
+    public int CheckIntervalMinutes { get; set; } = 60;
+    public bool NotifyAdmins { get; set; } = true;
+    public string SearchUrlTemplate { get; set; } = "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}";
+    public string SearchFilter { get; set; } = "rust";
 }
 
 internal sealed class LlmSettings
@@ -5515,7 +6612,11 @@ internal sealed class LlmSettings
     public string BaseUrl { get; set; } = "http://127.0.0.1:1234";
     public string Model { get; set; } = "llmster";
     public string ApiKey { get; set; } = string.Empty;
+    public string HttpReferer { get; set; } = "http://localhost";
+    public string AppTitle { get; set; } = "RustOpsAgent";
     public bool UseForRecommendations { get; set; } = true;
+    public string RequestStrategy { get; set; } = "fallback";
+    public SecondaryLlmSettings Secondary { get; set; } = new();
     public bool UseChatSystemPrompt { get; set; } = false;
     public string ChatSystemPrompt { get; set; } = """
 You are a local Rust server operations agent talking to an admin.
@@ -5533,7 +6634,19 @@ If an admin asks to execute a server console command, use execute_server_command
 If an admin asks what a command does, use get_server_command_memory.
 If an admin teaches command behavior, use teach_server_command.
 If an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.
+If an admin asks to push source changes to git, use git_push_branch.
+If an admin asks to pull latest source updates, use git_pull_rebuild.
 """;
+}
+
+internal sealed class SecondaryLlmSettings
+{
+    public bool Enabled { get; set; }
+    public string BaseUrl { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public string ApiKey { get; set; } = string.Empty;
+    public string HttpReferer { get; set; } = string.Empty;
+    public string AppTitle { get; set; } = string.Empty;
 }
 
 internal sealed class ServerSnapshot
@@ -5788,6 +6901,91 @@ internal sealed class SelfRepairAction
     public List<string>? IgnoreContains { get; set; }
     public List<string>? StartupIgnoreContains { get; set; }
     public List<string>? IncidentContains { get; set; }
+}
+
+internal sealed class BuildFromSourceResult
+{
+    public bool Success { get; set; }
+    public string Configuration { get; set; } = "Release";
+    public string Runtime { get; set; } = "linux-x64";
+    public List<BuildTargetResult> Targets { get; set; } = new();
+    public string Summary { get; set; } = string.Empty;
+}
+
+internal sealed class BuildTarget
+{
+    public BuildTarget(string name, string projectPath, string outputPath)
+    {
+        Name = name;
+        ProjectPath = projectPath;
+        OutputPath = outputPath;
+    }
+
+    public string Name { get; }
+    public string ProjectPath { get; }
+    public string OutputPath { get; }
+}
+
+internal sealed class BuildTargetResult
+{
+    public string Name { get; set; } = string.Empty;
+    public bool Success { get; set; }
+    public int ExitCode { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+
+internal sealed class RestartServicesResult
+{
+    public bool Success { get; set; }
+    public List<ServiceRestartResult> Services { get; set; } = new();
+    public string Summary { get; set; } = string.Empty;
+}
+
+internal sealed class ServiceRestartResult
+{
+    public string Unit { get; set; } = string.Empty;
+    public bool Success { get; set; }
+    public int ExitCode { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+
+internal sealed class GitPushResult
+{
+    public bool Success { get; set; }
+    public string Summary { get; set; } = string.Empty;
+    public string BranchName { get; set; } = string.Empty;
+    public string PreviousBranch { get; set; } = string.Empty;
+    public string CommitMessage { get; set; } = string.Empty;
+    public List<string> StagedFiles { get; set; } = new();
+
+    public static GitPushResult Fail(string summary, string branchName = "") => new()
+    {
+        Success = false,
+        Summary = summary,
+        BranchName = branchName
+    };
+}
+
+internal sealed class GitSyncResult
+{
+    public bool Success { get; set; }
+    public bool Updated { get; set; }
+    public string Summary { get; set; } = string.Empty;
+    public BuildFromSourceResult? Build { get; set; }
+    public RestartServicesResult? Restart { get; set; }
+
+    public static GitSyncResult Fail(
+        string summary,
+        bool updated = false,
+        BuildFromSourceResult? build = null,
+        RestartServicesResult? restart = null) => new()
+    {
+        Success = false,
+        Updated = updated,
+        Summary = summary,
+        Build = build,
+        Restart = restart
+    };
 }
 
 internal sealed class IncidentMemory
@@ -6071,3 +7269,6 @@ internal sealed class AdapterMessage
     public string? ActionId { get; set; }
     public string Message { get; set; } = string.Empty;
 }
+
+
+

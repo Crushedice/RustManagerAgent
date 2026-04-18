@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http.Json;
 using Sentry;
 
@@ -244,7 +245,7 @@ app.MapPut("/agent/log-rules", async (HttpRequest request) =>
     });
 });
 
-app.MapGet("/agent/llm/config", () =>
+IResult ReadLlmConfig()
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
     var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
@@ -259,80 +260,144 @@ app.MapGet("/agent/llm/config", () =>
         effective = memory.RuntimeStatus,
         note = "Changes are written to the shared env file and agentsettings.json, then apply after restarting rustopsagent.service."
     });
-});
+}
 
-app.MapGet("/agent/ollama/config", () =>
+IResult WriteLlmConfig(AgentLlmConfigUpdate request)
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
     var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
-    var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
+    var current = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
 
+    var normalized = new AgentLlmConfigView
+    {
+        Provider = string.IsNullOrWhiteSpace(request.Provider) ? current.Provider : request.Provider.Trim(),
+        Enabled = request.Enabled,
+        BaseUrl = string.IsNullOrWhiteSpace(request.BaseUrl) ? current.BaseUrl : request.BaseUrl.Trim(),
+        Model = string.IsNullOrWhiteSpace(request.Model) ? current.Model : request.Model.Trim(),
+        ApiKey = request.ApiKey?.Trim() ?? string.Empty,
+        HttpReferer = string.IsNullOrWhiteSpace(request.HttpReferer) ? current.HttpReferer : request.HttpReferer.Trim(),
+        AppTitle = string.IsNullOrWhiteSpace(request.AppTitle) ? current.AppTitle : request.AppTitle.Trim(),
+        UseForRecommendations = request.UseForRecommendations,
+        RequestStrategy = string.IsNullOrWhiteSpace(request.RequestStrategy) ? current.RequestStrategy : request.RequestStrategy.Trim().ToLowerInvariant(),
+        Secondary = request.Secondary is null
+            ? current.Secondary
+            : new AgentLlmEndpointConfigView
+            {
+                Enabled = request.Secondary.Enabled,
+                BaseUrl = request.Secondary.BaseUrl?.Trim() ?? string.Empty,
+                Model = request.Secondary.Model?.Trim() ?? string.Empty,
+                ApiKey = request.Secondary.ApiKey?.Trim() ?? string.Empty,
+                HttpReferer = request.Secondary.HttpReferer?.Trim() ?? string.Empty,
+                AppTitle = request.Secondary.AppTitle?.Trim() ?? string.Empty
+            },
+        UseChatSystemPrompt = request.UseChatSystemPrompt,
+        ChatSystemPrompt = request.ChatSystemPrompt ?? current.ChatSystemPrompt
+    };
+
+    var validationError = ValidateLlmConfig(normalized);
+    if (validationError is not null)
+        return Results.BadRequest(new ApiError("invalid_request", validationError));
+
+    UpsertEnvFileValues(sharedEnvPath, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["RUSTOPS_LLM_PROVIDER"] = normalized.Provider,
+        ["RUSTOPS_LLM_ENABLED"] = normalized.Enabled ? "true" : "false",
+        ["RUSTOPS_LLM_BASE_URL"] = normalized.BaseUrl,
+        ["RUSTOPS_LLM_MODEL"] = normalized.Model,
+        ["RUSTOPS_LLM_API_KEY"] = normalized.ApiKey?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_HTTP_REFERER"] = normalized.HttpReferer?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_APP_TITLE"] = normalized.AppTitle?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = normalized.UseForRecommendations ? "true" : "false",
+        ["RUSTOPS_LLM_REQUEST_STRATEGY"] = normalized.RequestStrategy,
+        ["RUSTOPS_LLM_SECONDARY_ENABLED"] = normalized.Secondary.Enabled ? "true" : "false",
+        ["RUSTOPS_LLM_SECONDARY_BASE_URL"] = normalized.Secondary.BaseUrl,
+        ["RUSTOPS_LLM_SECONDARY_MODEL"] = normalized.Secondary.Model,
+        ["RUSTOPS_LLM_SECONDARY_API_KEY"] = normalized.Secondary.ApiKey?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_SECONDARY_HTTP_REFERER"] = normalized.Secondary.HttpReferer?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_SECONDARY_APP_TITLE"] = normalized.Secondary.AppTitle?.Trim() ?? string.Empty,
+        ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = normalized.UseChatSystemPrompt ? "true" : "false",
+        ["RUSTOPS_LLM_CHAT_SYSTEM_PROMPT"] = normalized.ChatSystemPrompt ?? string.Empty
+    });
+    UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, normalized);
+
+    return Results.Ok(new
+    {
+        path = sharedEnvPath,
+        agentSettingsPath = agentPaths.AgentSettingsPath,
+        savedAtUtc = DateTime.UtcNow,
+        restartRequired = true
+    });
+}
+
+app.MapGet("/agent/llm/config", ReadLlmConfig);
+app.MapGet("/agent/ollama/config", ReadLlmConfig);
+app.MapPut("/agent/llm/config", WriteLlmConfig);
+app.MapPut("/agent/ollama/config", WriteLlmConfig);
+
+IResult ReadCommandConfig()
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var values = ReadAgentCommandConfig(sharedEnvPath, agentPaths.AgentSettingsPath);
     return Results.Ok(new
     {
         path = sharedEnvPath,
         agentSettingsPath = agentPaths.AgentSettingsPath,
         restartRequired = true,
         values,
-        effective = memory.RuntimeStatus,
-        note = "Changes are written to the shared env file and agentsettings.json, then apply after restarting rustopsagent.service."
+        note = "Changes are written to the shared env file and apply after restarting rustopsagent.service."
     });
-});
+}
 
-app.MapPut("/agent/llm/config", (AgentLlmConfigUpdate request) =>
+IResult WriteCommandConfig(AgentCommandConfigUpdate request)
 {
-    if (string.IsNullOrWhiteSpace(request.Model))
-        return Results.BadRequest(new ApiError("invalid_request", "Model is required."));
-
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var current = ReadAgentCommandConfig(sharedEnvPath, agentPaths.AgentSettingsPath);
+
+    var normalized = new AgentCommandConfigView
+    {
+        Enabled = request.Enabled,
+        FreeMode = request.FreeMode,
+        DefaultWaitMs = request.DefaultWaitMs <= 0 ? current.DefaultWaitMs : request.DefaultWaitMs,
+        MaxWaitMs = request.MaxWaitMs <= 0 ? current.MaxWaitMs : request.MaxWaitMs,
+        MaxOutputChars = request.MaxOutputChars <= 0 ? current.MaxOutputChars : request.MaxOutputChars,
+        AllowList = (request.AllowList ?? current.AllowList)
+            .Select(value => value?.Trim() ?? string.Empty)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList()
+    };
+
+    if (normalized.DefaultWaitMs < 200 || normalized.DefaultWaitMs > 20_000)
+        return Results.BadRequest(new ApiError("invalid_request", "defaultWaitMs must be between 200 and 20000."));
+    if (normalized.MaxWaitMs < 500 || normalized.MaxWaitMs > 30_000)
+        return Results.BadRequest(new ApiError("invalid_request", "maxWaitMs must be between 500 and 30000."));
+    if (normalized.MaxWaitMs < normalized.DefaultWaitMs)
+        return Results.BadRequest(new ApiError("invalid_request", "maxWaitMs must be greater than or equal to defaultWaitMs."));
+    if (normalized.MaxOutputChars < 500 || normalized.MaxOutputChars > 64_000)
+        return Results.BadRequest(new ApiError("invalid_request", "maxOutputChars must be between 500 and 64000."));
+    if (!normalized.FreeMode && normalized.AllowList.Count == 0)
+        return Results.BadRequest(new ApiError("invalid_request", "allowList must include at least one command when freeMode is disabled."));
 
     UpsertEnvFileValues(sharedEnvPath, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
     {
-        ["RUSTOPS_LLM_PROVIDER"] = string.IsNullOrWhiteSpace(request.Provider) ? "lmstudio" : request.Provider.Trim(),
-        ["RUSTOPS_LLM_ENABLED"] = request.Enabled ? "true" : "false",
-        ["RUSTOPS_LLM_BASE_URL"] = request.BaseUrl.Trim(),
-        ["RUSTOPS_LLM_MODEL"] = request.Model.Trim(),
-        ["RUSTOPS_LLM_API_KEY"] = request.ApiKey?.Trim() ?? string.Empty,
-        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false",
-        ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = request.UseChatSystemPrompt ? "true" : "false"
+        ["RUSTOPS_COMMANDS_ENABLED"] = normalized.Enabled ? "true" : "false",
+        ["RUSTOPS_COMMANDS_FREE_MODE"] = normalized.FreeMode ? "true" : "false",
+        ["RUSTOPS_COMMANDS_DEFAULT_WAIT_MS"] = normalized.DefaultWaitMs.ToString(),
+        ["RUSTOPS_COMMANDS_MAX_WAIT_MS"] = normalized.MaxWaitMs.ToString(),
+        ["RUSTOPS_COMMANDS_MAX_OUTPUT_CHARS"] = normalized.MaxOutputChars.ToString(),
+        ["RUSTOPS_COMMANDS_ALLOWLIST"] = string.Join(",", normalized.AllowList)
     });
-    UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, request);
 
     return Results.Ok(new
     {
         path = sharedEnvPath,
-        agentSettingsPath = agentPaths.AgentSettingsPath,
         savedAtUtc = DateTime.UtcNow,
         restartRequired = true
     });
-});
+}
 
-app.MapPut("/agent/ollama/config", (AgentLlmConfigUpdate request) =>
-{
-    if (string.IsNullOrWhiteSpace(request.Model))
-        return Results.BadRequest(new ApiError("invalid_request", "Model is required."));
-
-    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-
-    UpsertEnvFileValues(sharedEnvPath, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-    {
-        ["RUSTOPS_LLM_PROVIDER"] = string.IsNullOrWhiteSpace(request.Provider) ? "lmstudio" : request.Provider.Trim(),
-        ["RUSTOPS_LLM_ENABLED"] = request.Enabled ? "true" : "false",
-        ["RUSTOPS_LLM_BASE_URL"] = request.BaseUrl.Trim(),
-        ["RUSTOPS_LLM_MODEL"] = request.Model.Trim(),
-        ["RUSTOPS_LLM_API_KEY"] = request.ApiKey?.Trim() ?? string.Empty,
-        ["RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS"] = request.UseForRecommendations ? "true" : "false",
-        ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = request.UseChatSystemPrompt ? "true" : "false"
-    });
-    UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, request);
-
-    return Results.Ok(new
-    {
-        path = sharedEnvPath,
-        agentSettingsPath = agentPaths.AgentSettingsPath,
-        savedAtUtc = DateTime.UtcNow,
-        restartRequired = true
-    });
-});
+app.MapGet("/agent/commands/config", ReadCommandConfig);
+app.MapPut("/agent/commands/config", WriteCommandConfig);
 
 app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnapshotAsync()));
 
@@ -792,6 +857,58 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
+app.MapPost("/servers/{server}/command/exec", async (string server, ServerCommandExecRequest request) =>
+{
+    if (!await IsValidServerAsync(server))
+        return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
+
+    if (request is null || string.IsNullOrWhiteSpace(request.Command))
+        return Results.BadRequest(new ApiError("invalid_request", "Command is required."));
+
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."));
+
+    var normalized = NormalizeConfig(server, cfg);
+    var command = request.Command.Trim();
+    if (command.Length > 256)
+        return Results.BadRequest(new ApiError("invalid_request", "Command length exceeds 256 characters."));
+    if (command.Contains('\n') || command.Contains('\r'))
+        return Results.BadRequest(new ApiError("invalid_request", "Command must be a single line."));
+
+    var logPath = GetServerLogPath(normalized);
+    var startOffset = File.Exists(logPath)
+        ? new FileInfo(logPath).Length
+        : 0L;
+    var waitMs = Math.Clamp(request.WaitMs <= 0 ? 2500 : request.WaitMs, 200, 20_000);
+    var maxBytes = Math.Clamp(request.MaxBytes <= 0 ? 128 * 1024 : request.MaxBytes, 4 * 1024, 512 * 1024);
+    var maxLines = Math.Clamp(request.MaxLines <= 0 ? 120 : request.MaxLines, 1, 600);
+
+    var commandResult = await ExecRustMgrAsync("send", server, command);
+    if (!commandResult.Ok)
+    {
+        return Results.BadRequest(new
+        {
+            ok = false,
+            server,
+            command,
+            commandResult
+        });
+    }
+
+    var output = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+    return Results.Ok(new
+    {
+        ok = true,
+        server,
+        command,
+        waitMs,
+        logPath,
+        commandResult,
+        output
+    });
+});
+
 // ── Console log snapshot ──────────────────────────────────────────────────────
 app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 {
@@ -1126,6 +1243,63 @@ static LogSliceResult ReadLogSlice(string path, long? offset, int maxBytes)
     };
 }
 
+static async Task<CommandOutputCapture> ReadCommandOutputDeltaAsync(
+    string path,
+    long startOffset,
+    int waitMs,
+    int maxBytes,
+    int maxLines)
+{
+    var capture = new CommandOutputCapture
+    {
+        Exists = File.Exists(path),
+        StartOffset = startOffset,
+        EndOffset = startOffset
+    };
+
+    if (!capture.Exists)
+        return capture;
+
+    var entries = new List<LogEntry>();
+    var endAt = DateTime.UtcNow.AddMilliseconds(Math.Max(200, waitMs));
+    var settleUntilUtc = DateTime.MinValue;
+    var nextOffset = startOffset;
+
+    while (DateTime.UtcNow < endAt)
+    {
+        var slice = ReadLogSlice(path, nextOffset, maxBytes);
+        capture.Exists = slice.Exists;
+        capture.EndOffset = slice.EndOffset;
+        capture.Truncated = capture.Truncated || slice.Truncated;
+        capture.Reset = capture.Reset || slice.Reset;
+        nextOffset = slice.EndOffset;
+
+        if (slice.Entries.Count > 0)
+        {
+            entries.AddRange(slice.Entries);
+            if (entries.Count > maxLines * 4)
+                entries = entries.TakeLast(maxLines * 4).ToList();
+
+            settleUntilUtc = DateTime.UtcNow.AddMilliseconds(350);
+        }
+
+        if (settleUntilUtc != DateTime.MinValue && DateTime.UtcNow >= settleUntilUtc)
+            break;
+
+        await Task.Delay(120);
+    }
+
+    capture.Entries = entries.TakeLast(maxLines).ToList();
+    capture.Count = capture.Entries.Count;
+    capture.Messages = capture.Entries
+        .Select(entry => entry.Message)
+        .Where(message => !string.IsNullOrWhiteSpace(message))
+        .TakeLast(maxLines)
+        .ToList();
+
+    return capture;
+}
+
 static string GetServerLogPath(ServerConfig cfg) =>
     Path.IsPathRooted(cfg.LogFile)
         ? cfg.LogFile
@@ -1409,17 +1583,136 @@ static AgentLlmConfigView ReadAgentLlmConfig(string envPath, string agentSetting
             ?? GetEnvValue(env, "LM_API_TOKEN")
             ?? llm?.ApiKey
             ?? string.Empty,
+        HttpReferer = GetEnvValue(env, "RUSTOPS_LLM_HTTP_REFERER")
+            ?? llm?.HttpReferer
+            ?? string.Empty,
+        AppTitle = GetEnvValue(env, "RUSTOPS_LLM_APP_TITLE")
+            ?? llm?.AppTitle
+            ?? string.Empty,
         UseForRecommendations = TryParseBooleanValue(
             GetEnvValue(env, "RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS")
             ?? GetEnvValue(env, "RUSTOPS_OLLAMA_USE_FOR_RECOMMENDATIONS"),
             llm?.UseForRecommendations ?? true),
+        RequestStrategy = (GetEnvValue(env, "RUSTOPS_LLM_REQUEST_STRATEGY")
+                ?? llm?.RequestStrategy
+                ?? "fallback")
+            .Trim()
+            .ToLowerInvariant() is "race" ? "race" : "fallback",
+        Secondary = new AgentLlmEndpointConfigView
+        {
+            Enabled = TryParseBooleanValue(
+                GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_ENABLED"),
+                llm?.Secondary?.Enabled ?? false),
+            BaseUrl = GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_BASE_URL")
+                ?? llm?.Secondary?.BaseUrl
+                ?? string.Empty,
+            Model = GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_MODEL")
+                ?? llm?.Secondary?.Model
+                ?? string.Empty,
+            ApiKey = GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_API_KEY")
+                ?? llm?.Secondary?.ApiKey
+                ?? string.Empty,
+            HttpReferer = GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_HTTP_REFERER")
+                ?? llm?.Secondary?.HttpReferer
+                ?? string.Empty,
+            AppTitle = GetEnvValue(env, "RUSTOPS_LLM_SECONDARY_APP_TITLE")
+                ?? llm?.Secondary?.AppTitle
+                ?? string.Empty
+        },
         UseChatSystemPrompt = TryParseBooleanValue(
             GetEnvValue(env, "RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"),
             llm?.UseChatSystemPrompt ?? false),
         ChatSystemPrompt = GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
             ?? llm?.ChatSystemPrompt
-            ?? "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates."
+            ?? "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild."
     };
+}
+
+static AgentCommandConfigView ReadAgentCommandConfig(string envPath, string agentSettingsPath)
+{
+    var env = ReadEnvFileKeyValues(envPath);
+    var settings = TryLoadAgentSettingsFile(agentSettingsPath);
+    var commandSettings = settings?.CommandExecution;
+
+    var allowList = ParseCommandAllowList(GetEnvValue(env, "RUSTOPS_COMMANDS_ALLOWLIST"));
+    if (allowList.Count == 0 && commandSettings?.AllowList is not null)
+        allowList = commandSettings.AllowList
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    if (allowList.Count == 0)
+        allowList = AgentCommandConfigView.DefaultAllowList.ToList();
+
+    return new AgentCommandConfigView
+    {
+        Enabled = TryParseBooleanValue(
+            GetEnvValue(env, "RUSTOPS_COMMANDS_ENABLED"),
+            commandSettings?.Enabled ?? true),
+        FreeMode = TryParseBooleanValue(
+            GetEnvValue(env, "RUSTOPS_COMMANDS_FREE_MODE"),
+            commandSettings?.FreeMode ?? false),
+        DefaultWaitMs = TryParseInt32Value(
+            GetEnvValue(env, "RUSTOPS_COMMANDS_DEFAULT_WAIT_MS"),
+            commandSettings?.DefaultWaitMs ?? 2500,
+            200,
+            20_000),
+        MaxWaitMs = TryParseInt32Value(
+            GetEnvValue(env, "RUSTOPS_COMMANDS_MAX_WAIT_MS"),
+            commandSettings?.MaxWaitMs ?? 12_000,
+            500,
+            30_000),
+        MaxOutputChars = TryParseInt32Value(
+            GetEnvValue(env, "RUSTOPS_COMMANDS_MAX_OUTPUT_CHARS"),
+            commandSettings?.MaxOutputChars ?? 8000,
+            500,
+            64_000),
+        AllowList = allowList
+    };
+}
+
+static string? ValidateLlmConfig(AgentLlmConfigView config)
+{
+    if (config.Enabled)
+    {
+        if (string.IsNullOrWhiteSpace(config.Model))
+            return "Primary model is required.";
+        if (string.IsNullOrWhiteSpace(config.BaseUrl))
+            return "Primary baseUrl is required.";
+        if (!IsValidHttpUrl(config.BaseUrl))
+            return "Primary baseUrl must be a valid absolute http/https URL.";
+        if (!string.IsNullOrWhiteSpace(config.HttpReferer) && !IsValidHttpUrl(config.HttpReferer))
+            return "Primary httpReferer must be a valid absolute http/https URL when provided.";
+    }
+
+    if (!string.Equals(config.RequestStrategy, "fallback", StringComparison.OrdinalIgnoreCase) &&
+        !string.Equals(config.RequestStrategy, "race", StringComparison.OrdinalIgnoreCase))
+    {
+        return "requestStrategy must be either 'fallback' or 'race'.";
+    }
+
+    if (config.Secondary.Enabled)
+    {
+        if (string.IsNullOrWhiteSpace(config.Secondary.Model))
+            return "Secondary model is required when secondary endpoint is enabled.";
+        if (string.IsNullOrWhiteSpace(config.Secondary.BaseUrl))
+            return "Secondary baseUrl is required when secondary endpoint is enabled.";
+        if (!IsValidHttpUrl(config.Secondary.BaseUrl))
+            return "Secondary baseUrl must be a valid absolute http/https URL.";
+        if (!string.IsNullOrWhiteSpace(config.Secondary.HttpReferer) && !IsValidHttpUrl(config.Secondary.HttpReferer))
+            return "Secondary httpReferer must be a valid absolute http/https URL when provided.";
+    }
+
+    return null;
+}
+
+static bool IsValidHttpUrl(string? value)
+{
+    if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+        return false;
+
+    return uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps;
 }
 
 static AgentSettingsFileView? TryLoadAgentSettingsFile(string path)
@@ -1501,6 +1794,29 @@ static bool TryParseBooleanValue(string? value, bool fallback)
            value.Equals("on", StringComparison.OrdinalIgnoreCase);
 }
 
+static int TryParseInt32Value(string? value, int fallback, int min, int max)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return Math.Clamp(fallback, min, max);
+
+    return int.TryParse(value, out var parsed)
+        ? Math.Clamp(parsed, min, max)
+        : Math.Clamp(fallback, min, max);
+}
+
+static List<string> ParseCommandAllowList(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return new List<string>();
+
+    return value
+        .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Where(item => !string.IsNullOrWhiteSpace(item))
+        .Select(item => item.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
 static void UpsertEnvFileValues(string path, Dictionary<string, string> updates)
 {
     var lines = File.Exists(path) ? File.ReadAllLines(path).ToList() : new List<string>();
@@ -1532,7 +1848,7 @@ static void UpsertEnvFileValues(string path, Dictionary<string, string> updates)
     File.WriteAllLines(path, lines);
 }
 
-static void UpsertAgentSettingsLlmValues(string path, AgentLlmConfigUpdate update)
+static void UpsertAgentSettingsLlmValues(string path, AgentLlmConfigView update)
 {
     JsonObject root;
     if (File.Exists(path))
@@ -1557,7 +1873,19 @@ static void UpsertAgentSettingsLlmValues(string path, AgentLlmConfigUpdate updat
     llm["baseUrl"] = update.BaseUrl.Trim();
     llm["model"] = update.Model.Trim();
     llm["apiKey"] = update.ApiKey?.Trim() ?? string.Empty;
+    llm["httpReferer"] = update.HttpReferer?.Trim() ?? string.Empty;
+    llm["appTitle"] = update.AppTitle?.Trim() ?? string.Empty;
     llm["useForRecommendations"] = update.UseForRecommendations;
+    llm["requestStrategy"] = string.IsNullOrWhiteSpace(update.RequestStrategy) ? "fallback" : update.RequestStrategy.Trim().ToLowerInvariant();
+    llm["secondary"] = new JsonObject
+    {
+        ["enabled"] = update.Secondary.Enabled,
+        ["baseUrl"] = update.Secondary.BaseUrl,
+        ["model"] = update.Secondary.Model,
+        ["apiKey"] = update.Secondary.ApiKey?.Trim() ?? string.Empty,
+        ["httpReferer"] = update.Secondary.HttpReferer?.Trim() ?? string.Empty,
+        ["appTitle"] = update.Secondary.AppTitle?.Trim() ?? string.Empty
+    };
     llm["useChatSystemPrompt"] = update.UseChatSystemPrompt;
     llm["chatSystemPrompt"] = update.ChatSystemPrompt ?? string.Empty;
     root["llm"] = llm;
@@ -2234,13 +2562,14 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Mailboxes</h2><div id="mailboxes" class="mailbox-grid"></div></div>
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
+        <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
       </div>
     </section>
 
     <section id="llmGroup" class="section-group">
       <div class="grid">
         <div class="card"><h2>LLM Runtime</h2><div id="ollamaRuntime" class="kv"></div><div id="llmRuntimeDetails" class="list" style="margin-top:12px;"></div></div>
-        <div class="card"><h2>LM Studio Control <span class="legend" data-tip="This writes LLM settings to the shared env plus agentsettings.json. Restart rustopsagent.service after saving. Disable 'Send system prompt' to avoid sending agent premise/context each LLM chat turn.">?</span></h2><div id="ollamaConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="ollamaEnabled" type="checkbox"> LLM enabled</label><label class="check"><input id="ollamaUseRecommendations" type="checkbox"> Use for recommendations</label></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmUseChatSystemPrompt" type="checkbox"> Send system prompt</label></div><div style="margin-top:12px;"><label for="llmChatSystemPrompt" class="tiny muted">System prompt text (used only when enabled)</label><textarea id="llmChatSystemPrompt" spellcheck="false" style="margin-top:8px; min-height:180px;"></textarea></div><div class="row" style="margin-top:12px;"><div><label for="ollamaBaseUrl" class="tiny muted">Base URL</label><input id="ollamaBaseUrl" type="text" placeholder="http://127.0.0.1:1234"></div><div><label for="ollamaModel" class="tiny muted">Model</label><input id="ollamaModel" type="text" placeholder="llmster"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmProvider" class="tiny muted">Provider</label><input id="llmProvider" type="text" placeholder="lmstudio"></div><div><label for="llmApiKey" class="tiny muted">API token (optional)</label><input id="llmApiKey" type="password" placeholder="LM Studio API token"></div></div><div class="toolbar"><div id="ollamaSaveStatus" class="muted">No changes saved yet.</div><button id="saveOllamaConfig">Save LLM Settings</button></div></div>
+        <div class="card"><h2>LM Studio Control <span class="legend" data-tip="This writes LLM settings to the shared env plus agentsettings.json. Restart rustopsagent.service after saving. You can disable system prompt injection and also configure secondary endpoint fallback/race behavior.">?</span></h2><div id="ollamaConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="ollamaEnabled" type="checkbox"> LLM enabled</label><label class="check"><input id="ollamaUseRecommendations" type="checkbox"> Use for recommendations</label></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmUseChatSystemPrompt" type="checkbox"> Send system prompt</label></div><div style="margin-top:12px;"><label for="llmChatSystemPrompt" class="tiny muted">System prompt text (used only when enabled)</label><textarea id="llmChatSystemPrompt" spellcheck="false" style="margin-top:8px; min-height:180px;"></textarea></div><div class="row" style="margin-top:12px;"><div><label for="ollamaBaseUrl" class="tiny muted">Primary Base URL</label><input id="ollamaBaseUrl" type="text" placeholder="http://127.0.0.1:1234"></div><div><label for="ollamaModel" class="tiny muted">Primary Model</label><input id="ollamaModel" type="text" placeholder="llmster"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmProvider" class="tiny muted">Provider</label><input id="llmProvider" type="text" placeholder="lmstudio"></div><div><label for="llmApiKey" class="tiny muted">Primary API token (optional)</label><input id="llmApiKey" type="password" placeholder="LM Studio API token"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmHttpReferer" class="tiny muted">Primary HTTP-Referer (optional)</label><input id="llmHttpReferer" type="text" placeholder="http://localhost"></div><div><label for="llmAppTitle" class="tiny muted">Primary App Title (optional)</label><input id="llmAppTitle" type="text" placeholder="RustOpsAgent"></div></div><div class="row" style="margin-top:12px;"><label class="check"><input id="llmSecondaryEnabled" type="checkbox"> Secondary endpoint enabled</label><div><label for="llmRequestStrategy" class="tiny muted">Request strategy</label><select id="llmRequestStrategy"><option value="fallback">fallback</option><option value="race">race</option></select></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryBaseUrl" class="tiny muted">Secondary Base URL</label><input id="llmSecondaryBaseUrl" type="text" placeholder="http://127.0.0.1:8000"></div><div><label for="llmSecondaryModel" class="tiny muted">Secondary Model</label><input id="llmSecondaryModel" type="text" placeholder="model-fallback"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryApiKey" class="tiny muted">Secondary API token (optional)</label><input id="llmSecondaryApiKey" type="password" placeholder="Bearer token"></div></div><div class="row" style="margin-top:12px;"><div><label for="llmSecondaryHttpReferer" class="tiny muted">Secondary HTTP-Referer (optional)</label><input id="llmSecondaryHttpReferer" type="text" placeholder="http://localhost"></div><div><label for="llmSecondaryAppTitle" class="tiny muted">Secondary App Title (optional)</label><input id="llmSecondaryAppTitle" type="text" placeholder="RustOpsAgent"></div></div><div class="toolbar"><div id="ollamaSaveStatus" class="muted">No changes saved yet.</div><button id="saveOllamaConfig">Save LLM Settings</button></div></div>
         <div class="card"><h2>Installed Models</h2><div id="ollamaModels" class="list"></div></div>
         <div class="card"><h2>Loaded Models</h2><div id="ollamaRunning" class="list"></div></div>
         <div class="card wide"><h2>Current Model Details</h2><div class="codebox"><pre id="currentModelDetails">No model details loaded.</pre></div></div>
@@ -2314,9 +2643,23 @@ static string BuildDashboardHtml() => """
       $('feedback').innerHTML = (summary.recentFeedback || []).map(entry => item(`${entry.verdict || 'note'} | ${entry.serverName || 'general'}`, entry.note || '', `${esc(fmt(entry.receivedAtUtc))} | ${esc(entry.adminId || 'unknown admin')}`)).join('') || '<div class="muted">No recent feedback.</div>';
     }
 
+    function renderCommandConfig(commandConfig) {
+      const values = commandConfig?.values || {};
+      const allowList = Array.isArray(values.allowList) ? values.allowList : [];
+      $('commandConfigMeta').textContent = `${commandConfig?.path || 'n/a'} | restart rustopsagent.service after save`;
+      $('commandEnabled').checked = values.enabled !== false;
+      $('commandFreeMode').checked = !!values.freeMode;
+      $('commandDefaultWaitMs').value = Number(values.defaultWaitMs || 2500);
+      $('commandMaxWaitMs').value = Number(values.maxWaitMs || 12000);
+      $('commandMaxOutputChars').value = Number(values.maxOutputChars || 8000);
+      $('commandAllowList').value = allowList.join('\n');
+      $('commandAllowList').disabled = !!values.freeMode;
+    }
+
     function renderLlm(summary, llmSummary, llmConfig) {
       const runtime = summary.runtimeStatus || {};
       const values = llmConfig?.values || {};
+      const secondary = values.secondary || {};
       const configuredModel = runtime.llmModel || values.model || llmSummary?.currentModel || 'n/a';
       const configuredBaseUrl = runtime.llmBaseUrl || values.baseUrl || llmSummary?.baseUrl || 'n/a';
       const provider = runtime.llmProvider || values.provider || llmSummary?.provider || 'lmstudio';
@@ -2335,18 +2678,28 @@ static string BuildDashboardHtml() => """
 
       $('llmRuntimeDetails').innerHTML = [
         item('LM Studio reachability', reachable ? 'Reachable from API host.' : 'Not reachable from API host.', `${pill(reachable ? 'active' : 'offline')}${llmSummary?.error ? ` | ${esc(llmSummary.error)}` : ''}`),
-        item('Configured model', configuredModel, `Loaded ${esc(loadedModels.length)} | Installed ${esc(installedModels.length)}`)
+        item('Configured model', configuredModel, `Loaded ${esc(loadedModels.length)} | Installed ${esc(installedModels.length)}`),
+        item('Routing', values.requestStrategy === 'race' ? 'race' : 'fallback', secondary.enabled ? 'secondary enabled' : 'secondary disabled')
       ].join('');
 
       $('ollamaConfigMeta').textContent = `${llmConfig?.path || 'n/a'} | restart rustopsagent.service after save`;
       $('ollamaEnabled').checked = !!values.enabled;
       $('ollamaUseRecommendations').checked = !!values.useForRecommendations;
       $('llmUseChatSystemPrompt').checked = !!values.useChatSystemPrompt;
-      $('llmChatSystemPrompt').value = values.chatSystemPrompt || 'You are a local Rust server operations agent talking to an admin.\\nUse the provided tools to inspect state and perform bounded operations.\\nPrefer using tools over guessing.\\nFor start, stop, restart, and validate-oxide you must target a known server.\\nIf the server is unclear, ask a concise clarification question instead of guessing.\\nUse recent memory, incidents, and action history to explain what is happening.\\nReply naturally, with concrete operational language.\\nStart with the direct answer, then key evidence or next action.\\nDo not invent facts.\\nYou may use self-diagnostics and workspace tools to improve your own behavior.\\nAny file writes must stay inside the configured self-repair scope root.\\nIf an admin asks to execute a server console command, use execute_server_command.\\nIf an admin asks what a command does, use get_server_command_memory.\\nIf an admin teaches command behavior, use teach_server_command.\\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.';
+      $('llmChatSystemPrompt').value = values.chatSystemPrompt || 'You are a local Rust server operations agent talking to an admin.\\nUse the provided tools to inspect state and perform bounded operations.\\nPrefer using tools over guessing.\\nFor start, stop, restart, and validate-oxide you must target a known server.\\nIf the server is unclear, ask a concise clarification question instead of guessing.\\nUse recent memory, incidents, and action history to explain what is happening.\\nReply naturally, with concrete operational language.\\nStart with the direct answer, then key evidence or next action.\\nDo not invent facts.\\nYou may use self-diagnostics and workspace tools to improve your own behavior.\\nAny file writes must stay inside the configured self-repair scope root.\\nIf an admin asks to execute a server console command, use execute_server_command.\\nIf an admin asks what a command does, use get_server_command_memory.\\nIf an admin teaches command behavior, use teach_server_command.\\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\\nIf an admin asks to push source changes to git, use git_push_branch.\\nIf an admin asks to pull latest source updates, use git_pull_rebuild.';
       $('ollamaBaseUrl').value = values.baseUrl || 'http://127.0.0.1:1234';
       $('ollamaModel').value = values.model || '';
       $('llmProvider').value = values.provider || 'lmstudio';
       $('llmApiKey').value = values.apiKey || '';
+      $('llmHttpReferer').value = values.httpReferer || '';
+      $('llmAppTitle').value = values.appTitle || '';
+      $('llmRequestStrategy').value = values.requestStrategy === 'race' ? 'race' : 'fallback';
+      $('llmSecondaryEnabled').checked = !!secondary.enabled;
+      $('llmSecondaryBaseUrl').value = secondary.baseUrl || '';
+      $('llmSecondaryModel').value = secondary.model || '';
+      $('llmSecondaryApiKey').value = secondary.apiKey || '';
+      $('llmSecondaryHttpReferer').value = secondary.httpReferer || '';
+      $('llmSecondaryAppTitle').value = secondary.appTitle || '';
 
       $('ollamaModels').innerHTML = installedModels.map(model => `<div class="item"><div style="display:flex;justify-content:space-between;gap:8px;align-items:center;"><strong>${esc(model.name || model.id || 'unnamed model')}</strong><button type="button" class="ghost use-model" data-model="${esc(model.id || model.name || '')}">Use</button></div><div class="muted" style="margin-top:6px;">${esc(model.publisher || 'publisher n/a')} | ${esc(model.architecture || 'architecture n/a')} | ${esc(model.parameterSize || 'params n/a')} | ${esc(model.quantization || 'quant n/a')}</div><div class="tiny muted" style="margin-top:8px;">${esc(bytes(model.sizeBytes))}${model.maxContextLength ? ` | context ${esc(model.maxContextLength)}` : ''}${model.loaded ? ' | loaded' : ''}</div></div>`).join('') || '<div class="muted">No installed models reported.</div>';
       $('ollamaRunning').innerHTML = loadedModels.map(model => item(model.name || 'unnamed model', `${model.state || 'state n/a'}${model.contextLength ? ` | ctx ${esc(model.contextLength)}` : ''}`, model.preset || 'no preset reported')).join('') || '<div class="muted">No models currently loaded.</div>';
@@ -2357,12 +2710,13 @@ static string BuildDashboardHtml() => """
     async function load() {
       localStorage.setItem('rustops.apiKey', keyInput.value.trim());
       try {
-        const [summary, _, llmSummary, llmConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config')]);
+        const [summary, _, llmSummary, llmConfig, commandConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config')]);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
         $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions')].join('');
         renderServers(summary.servers || []);
         renderAgent(summary);
         renderLlm(summary, llmSummary, llmConfig);
+        renderCommandConfig(commandConfig);
       } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
     }
 
@@ -2373,16 +2727,40 @@ static string BuildDashboardHtml() => """
 
     async function saveOllamaConfig() {
       try {
-        await fetchJson('/agent/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: $('llmProvider').value.trim() || 'lmstudio', enabled: $('ollamaEnabled').checked, baseUrl: $('ollamaBaseUrl').value.trim(), model: $('ollamaModel').value.trim(), apiKey: $('llmApiKey').value.trim(), useForRecommendations: $('ollamaUseRecommendations').checked, useChatSystemPrompt: $('llmUseChatSystemPrompt').checked, chatSystemPrompt: $('llmChatSystemPrompt').value }) });
+        await fetchJson('/agent/llm/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider: $('llmProvider').value.trim() || 'lmstudio', enabled: $('ollamaEnabled').checked, baseUrl: $('ollamaBaseUrl').value.trim(), model: $('ollamaModel').value.trim(), apiKey: $('llmApiKey').value.trim(), httpReferer: $('llmHttpReferer').value.trim(), appTitle: $('llmAppTitle').value.trim(), useForRecommendations: $('ollamaUseRecommendations').checked, requestStrategy: $('llmRequestStrategy').value, secondary: { enabled: $('llmSecondaryEnabled').checked, baseUrl: $('llmSecondaryBaseUrl').value.trim(), model: $('llmSecondaryModel').value.trim(), apiKey: $('llmSecondaryApiKey').value.trim(), httpReferer: $('llmSecondaryHttpReferer').value.trim(), appTitle: $('llmSecondaryAppTitle').value.trim() }, useChatSystemPrompt: $('llmUseChatSystemPrompt').checked, chatSystemPrompt: $('llmChatSystemPrompt').value }) });
         $('ollamaSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
         await load();
       } catch (error) { alert(`Failed to save LLM settings: ${error.message}`); }
+    }
+
+    async function saveCommandConfig() {
+      try {
+        await fetchJson('/agent/commands/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabled: $('commandEnabled').checked,
+            freeMode: $('commandFreeMode').checked,
+            defaultWaitMs: Number($('commandDefaultWaitMs').value || 2500),
+            maxWaitMs: Number($('commandMaxWaitMs').value || 12000),
+            maxOutputChars: Number($('commandMaxOutputChars').value || 8000),
+            allowList: $('commandAllowList').value
+              .split(/\r?\n|,/)
+              .map(v => v.trim())
+              .filter(v => v.length > 0)
+          })
+        });
+        $('commandSaveStatus').textContent = `Saved ${new Date().toLocaleString()} | restart rustopsagent.service`;
+        await load();
+      } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
     }
 
     tabs.forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.target)));
     $('refresh').addEventListener('click', load);
     $('saveRules').addEventListener('click', saveRules);
     $('saveOllamaConfig').addEventListener('click', saveOllamaConfig);
+    $('saveCommandConfig').addEventListener('click', saveCommandConfig);
+    $('commandFreeMode').addEventListener('change', () => { $('commandAllowList').disabled = $('commandFreeMode').checked; });
     document.addEventListener('click', event => { const target = event.target; if (target instanceof HTMLElement && target.classList.contains('use-model')) $('ollamaModel').value = target.dataset.model || ''; });
     if (keyInput.value) load();
   </script>
@@ -2617,6 +2995,15 @@ static ValidationResult ValidateJsonFile(string path)
 static ValidationResult ValidateOxidePluginFile(string path)
 {
     var text = File.ReadAllText(path);
+    var infoMatch = Regex.Match(
+        text,
+        "\\[\\s*Info\\s*\\(\\s*\"(?<name>[^\"]+)\"\\s*,\\s*\"(?<author>[^\"]+)\"\\s*,\\s*\"(?<version>[^\"]+)\"\\s*\\)\\s*\\]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    var pluginName = infoMatch.Success ? infoMatch.Groups["name"].Value.Trim() : null;
+    var pluginAuthor = infoMatch.Success ? infoMatch.Groups["author"].Value.Trim() : null;
+    var pluginVersion = infoMatch.Success ? infoMatch.Groups["version"].Value.Trim() : null;
+    var pluginSlug = !string.IsNullOrWhiteSpace(pluginName) ? ToPluginSlug(pluginName) : null;
+
     var hasPluginBase =
         text.Contains(": RustPlugin", StringComparison.Ordinal) ||
         text.Contains(": CovalencePlugin", StringComparison.Ordinal) ||
@@ -2628,7 +3015,11 @@ static ValidationResult ValidateOxidePluginFile(string path)
         {
             Path = path,
             Ok = false,
-            Message = "Missing expected Oxide plugin base class."
+            Message = "Missing expected Oxide plugin base class.",
+            PluginName = pluginName,
+            PluginAuthor = pluginAuthor,
+            PluginVersion = pluginVersion,
+            PluginSlug = pluginSlug
         };
     }
 
@@ -2640,11 +3031,29 @@ static ValidationResult ValidateOxidePluginFile(string path)
         {
             Path = path,
             Ok = false,
-            Message = $"Brace mismatch: {open} '{{' vs {close} '}}'."
+            Message = $"Brace mismatch: {open} '{{' vs {close} '}}'.",
+            PluginName = pluginName,
+            PluginAuthor = pluginAuthor,
+            PluginVersion = pluginVersion,
+            PluginSlug = pluginSlug
         };
     }
 
-    return new ValidationResult { Path = path, Ok = true };
+    return new ValidationResult
+    {
+        Path = path,
+        Ok = true,
+        PluginName = pluginName,
+        PluginAuthor = pluginAuthor,
+        PluginVersion = pluginVersion,
+        PluginSlug = pluginSlug
+    };
+}
+
+static string ToPluginSlug(string input)
+{
+    var slug = Regex.Replace(input.Trim().ToLowerInvariant(), "[^a-z0-9]+", "-");
+    return slug.Trim('-');
 }
 
 
@@ -2755,6 +3164,14 @@ public sealed class ServerCommandRequest
     public string Command { get; set; } = string.Empty;
 }
 
+public sealed class ServerCommandExecRequest
+{
+    public string Command { get; set; } = string.Empty;
+    public int WaitMs { get; set; } = 2500;
+    public int MaxLines { get; set; } = 120;
+    public int MaxBytes { get; set; } = 128 * 1024;
+}
+
 public sealed class ModerationRequest
 {
     public string  SteamId { get; set; } = string.Empty;
@@ -2805,6 +3222,18 @@ public sealed class LogSliceResult
     public List<LogEntry> Entries { get; set; } = new();
 }
 
+public sealed class CommandOutputCapture
+{
+    public bool Exists { get; set; }
+    public long StartOffset { get; set; }
+    public long EndOffset { get; set; }
+    public bool Truncated { get; set; }
+    public bool Reset { get; set; }
+    public int Count { get; set; }
+    public List<LogEntry> Entries { get; set; } = new();
+    public List<string> Messages { get; set; } = new();
+}
+
 public sealed class TraceEvent
 {
     public DateTime? Timestamp { get; set; }
@@ -2818,6 +3247,10 @@ public sealed class ValidationResult
     public string Path { get; set; } = string.Empty;
     public bool Ok { get; set; }
     public string? Message { get; set; }
+    public string? PluginName { get; set; }
+    public string? PluginAuthor { get; set; }
+    public string? PluginVersion { get; set; }
+    public string? PluginSlug { get; set; }
 }
 
 public sealed class ManagedTaskInfo
@@ -2950,13 +3383,69 @@ public class AgentLlmConfigUpdate
     public string BaseUrl { get; set; } = "http://127.0.0.1:1234";
     public string Model { get; set; } = string.Empty;
     public string? ApiKey { get; set; }
+    public string? HttpReferer { get; set; }
+    public string? AppTitle { get; set; }
     public bool UseForRecommendations { get; set; } = true;
+    public string RequestStrategy { get; set; } = "fallback";
+    public AgentLlmEndpointConfigView? Secondary { get; set; }
     public bool UseChatSystemPrompt { get; set; }
     public string? ChatSystemPrompt { get; set; }
 }
 
-public sealed class AgentLlmConfigView : AgentLlmConfigUpdate
+public sealed class AgentLlmConfigView
 {
+    public string Provider { get; set; } = "lmstudio";
+    public bool Enabled { get; set; }
+    public string BaseUrl { get; set; } = "http://127.0.0.1:1234";
+    public string Model { get; set; } = string.Empty;
+    public string? ApiKey { get; set; }
+    public string? HttpReferer { get; set; }
+    public string? AppTitle { get; set; }
+    public bool UseForRecommendations { get; set; } = true;
+    public string RequestStrategy { get; set; } = "fallback";
+    public AgentLlmEndpointConfigView Secondary { get; set; } = new();
+    public bool UseChatSystemPrompt { get; set; }
+    public string? ChatSystemPrompt { get; set; }
+}
+
+public sealed class AgentLlmEndpointConfigView
+{
+    public bool Enabled { get; set; }
+    public string BaseUrl { get; set; } = string.Empty;
+    public string Model { get; set; } = string.Empty;
+    public string? ApiKey { get; set; }
+    public string? HttpReferer { get; set; }
+    public string? AppTitle { get; set; }
+}
+
+public class AgentCommandConfigUpdate
+{
+    public bool Enabled { get; set; } = true;
+    public bool FreeMode { get; set; }
+    public int DefaultWaitMs { get; set; } = 2500;
+    public int MaxWaitMs { get; set; } = 12_000;
+    public int MaxOutputChars { get; set; } = 8000;
+    public List<string>? AllowList { get; set; }
+}
+
+public sealed class AgentCommandConfigView
+{
+    public static readonly IReadOnlyList<string> DefaultAllowList = new[]
+    {
+        "playerlist",
+        "serverinfo",
+        "bans",
+        "oxide.plugins",
+        "status",
+        "version"
+    };
+
+    public bool Enabled { get; set; } = true;
+    public bool FreeMode { get; set; }
+    public int DefaultWaitMs { get; set; } = 2500;
+    public int MaxWaitMs { get; set; } = 12_000;
+    public int MaxOutputChars { get; set; } = 8000;
+    public List<string> AllowList { get; set; } = DefaultAllowList.ToList();
 }
 
 public sealed class LlmSummaryView
@@ -2998,6 +3487,7 @@ public sealed class AgentSettingsFileView
     [JsonPropertyName("inbox")] public AgentSettingsInboxView? Inbox { get; set; }
     [JsonPropertyName("outbox")] public AgentSettingsOutboxView? Outbox { get; set; }
     [JsonPropertyName("monitor")] public AgentSettingsMonitorView? Monitor { get; set; }
+    [JsonPropertyName("commandExecution")] public AgentSettingsCommandExecutionView? CommandExecution { get; set; }
     [JsonPropertyName("llm")] public AgentSettingsLlmView? Llm { get; set; }
     [JsonPropertyName("ollama")] public AgentSettingsLlmView? LegacyOllama { get; set; }
 }
@@ -3024,6 +3514,16 @@ public sealed class AgentSettingsMonitorView
     [JsonPropertyName("logRulesPath")] public string? LogRulesPath { get; set; }
 }
 
+public sealed class AgentSettingsCommandExecutionView
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("freeMode")] public bool FreeMode { get; set; }
+    [JsonPropertyName("defaultWaitMs")] public int DefaultWaitMs { get; set; } = 2500;
+    [JsonPropertyName("maxWaitMs")] public int MaxWaitMs { get; set; } = 12_000;
+    [JsonPropertyName("maxOutputChars")] public int MaxOutputChars { get; set; } = 8000;
+    [JsonPropertyName("allowList")] public List<string> AllowList { get; set; } = AgentCommandConfigView.DefaultAllowList.ToList();
+}
+
 public sealed class AgentSettingsLlmView
 {
     [JsonPropertyName("provider")] public string? Provider { get; set; }
@@ -3031,9 +3531,23 @@ public sealed class AgentSettingsLlmView
     [JsonPropertyName("baseUrl")] public string? BaseUrl { get; set; }
     [JsonPropertyName("model")] public string? Model { get; set; }
     [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
+    [JsonPropertyName("httpReferer")] public string? HttpReferer { get; set; }
+    [JsonPropertyName("appTitle")] public string? AppTitle { get; set; }
     [JsonPropertyName("useForRecommendations")] public bool UseForRecommendations { get; set; } = true;
+    [JsonPropertyName("requestStrategy")] public string? RequestStrategy { get; set; }
+    [JsonPropertyName("secondary")] public AgentSettingsLlmEndpointView? Secondary { get; set; }
     [JsonPropertyName("useChatSystemPrompt")] public bool UseChatSystemPrompt { get; set; }
     [JsonPropertyName("chatSystemPrompt")] public string? ChatSystemPrompt { get; set; }
+}
+
+public sealed class AgentSettingsLlmEndpointView
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("baseUrl")] public string? BaseUrl { get; set; }
+    [JsonPropertyName("model")] public string? Model { get; set; }
+    [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
+    [JsonPropertyName("httpReferer")] public string? HttpReferer { get; set; }
+    [JsonPropertyName("appTitle")] public string? AppTitle { get; set; }
 }
 
 public sealed class BotSettingsFileView
