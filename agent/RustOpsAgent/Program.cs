@@ -8,7 +8,8 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Sentry;
 
-var configPath = args.FirstOrDefault() ?? Path.Combine(AppContext.BaseDirectory, "agentsettings.json");
+var startupOptions = ParseStartupOptions(args);
+var configPath = startupOptions.ConfigPath ?? Path.Combine(AppContext.BaseDirectory, "agentsettings.json");
 RustOpsEnv.LoadFromDefaultLocations(configPath);
 using var sentry = RustOpsSentry.Initialize("rustopsagent");
 
@@ -21,7 +22,7 @@ if (!File.Exists(configPath))
     return 1;
 }
 
-var config = LoadConfig(configPath);
+var config = LoadConfig(configPath, startupOptions.StatePathOverride);
 Directory.CreateDirectory(Path.GetDirectoryName(config.Memory.StatePath)!);
 Directory.CreateDirectory(config.Inbox.FeedbackInboxPath);
 Directory.CreateDirectory(config.Inbox.DecisionInboxPath);
@@ -31,6 +32,8 @@ Directory.CreateDirectory(config.SelfRepair.WorkspacePath);
 Directory.CreateDirectory(config.SelfRepair.BuildOutputPath);
 
 Console.WriteLine($"Config loaded from {Path.GetFullPath(configPath)}");
+if (!string.IsNullOrWhiteSpace(startupOptions.StatePathOverride))
+    Console.WriteLine($"State path override: {config.Memory.StatePath}");
 Console.WriteLine($"API base URL: {config.Api.BaseUrl}");
 Console.WriteLine($"Agent state path: {config.Memory.StatePath}");
 Console.WriteLine($"Feedback inbox: {config.Inbox.FeedbackInboxPath}");
@@ -90,7 +93,7 @@ finally
     await RustOpsSentry.FlushAsync();
 }
 
-static AgentConfig LoadConfig(string path)
+static AgentConfig LoadConfig(string path, string? statePathOverride = null)
 {
     var rawJson = File.ReadAllText(path);
     using var jsonDocument = JsonDocument.Parse(rawJson);
@@ -106,9 +109,14 @@ static AgentConfig LoadConfig(string path)
         json.Llm = json.LegacyOllama;
     }
 
-    ApplyEnvironmentOverrides(json);
-
     var dir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+    var declaredStatePath = RustOpsEnv.ResolveConfiguredPath(
+        json.Memory.StatePath,
+        dir,
+        Path.Combine(dir, "data", "agent-state.json"));
+
+    ApplyEnvironmentOverrides(json, statePathOverride);
+
     json.BaseDirectory = dir;
     json.Memory.StatePath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.Memory.StatePath));
     json.Inbox.FeedbackInboxPath = RustOpsEnv.NormalizePath(RustOpsEnv.ResolvePlaceholders(json.Inbox.FeedbackInboxPath));
@@ -160,18 +168,19 @@ static AgentConfig LoadConfig(string path)
     if (!string.IsNullOrWhiteSpace(json.GitOps.RepoPath) && !Path.IsPathRooted(json.GitOps.RepoPath))
         json.GitOps.RepoPath = Path.GetFullPath(Path.Combine(dir, json.GitOps.RepoPath));
 
-    ValidateResolvedConfig(json);
+    ValidateResolvedConfig(json, declaredStatePath);
     return json;
 }
 
-static void ApplyEnvironmentOverrides(AgentConfig config)
+static void ApplyEnvironmentOverrides(AgentConfig config, string? statePathOverride = null)
 {
     config.Api.BaseUrl = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_API_BASE_URL")
         ?? RustOpsEnv.ResolvePlaceholders(config.Api.BaseUrl);
     config.Api.ApiKey = RustOpsEnv.FirstNonEmptyEnvironment("RUSTMGR_API_KEY", "RUSTOPS_API_KEY")
         ?? RustOpsEnv.ResolvePlaceholders(config.Api.ApiKey);
 
-    config.Memory.StatePath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_STATE_PATH")
+    config.Memory.StatePath = statePathOverride
+        ?? RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_STATE_PATH")
         ?? config.Memory.StatePath;
     config.Inbox.FeedbackInboxPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_FEEDBACK_INBOX_PATH")
         ?? config.Inbox.FeedbackInboxPath;
@@ -281,7 +290,7 @@ static void ApplyEnvironmentOverrides(AgentConfig config)
         ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Secondary.AppTitle);
 }
 
-static void ValidateResolvedConfig(AgentConfig config)
+static void ValidateResolvedConfig(AgentConfig config, string declaredStatePath)
 {
     var unresolved = new List<string>();
 
@@ -297,6 +306,14 @@ static void ValidateResolvedConfig(AgentConfig config)
     Check("selfRepair.sourceRootPath", config.SelfRepair.SourceRootPath);
     Check("selfRepair.buildOutputPath", config.SelfRepair.BuildOutputPath);
     Check("gitOps.repoPath", config.GitOps.RepoPath);
+
+    if (!PathsEqual(declaredStatePath, config.Memory.StatePath))
+    {
+        Console.Error.WriteLine(
+            $"State path mismatch detected. agentsettings.json memory.statePath resolves to '{declaredStatePath}', " +
+            $"but the effective agent/API state path is '{config.Memory.StatePath}'. " +
+            "If this was not intentional, the dashboard can appear empty because it reads the API-resolved path.");
+    }
 
     var scopeRoot = Path.GetFullPath(config.SelfRepair.ScopeRootPath);
     var workspacePath = Path.GetFullPath(config.SelfRepair.WorkspacePath);
@@ -379,6 +396,69 @@ static void ValidateResolvedConfig(AgentConfig config)
         if (string.IsNullOrWhiteSpace(value) || RustOpsEnv.HasUnresolvedPlaceholder(value))
             unresolved.Add(name);
     }
+}
+
+static bool PathsEqual(string left, string right)
+{
+    var comparison = OperatingSystem.IsWindows()
+        ? StringComparison.OrdinalIgnoreCase
+        : StringComparison.Ordinal;
+    return string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), comparison);
+}
+
+static AgentStartupOptions ParseStartupOptions(string[] args)
+{
+    var options = new AgentStartupOptions();
+
+    for (var index = 0; index < args.Length; index++)
+    {
+        var arg = args[index]?.Trim();
+        if (string.IsNullOrWhiteSpace(arg))
+            continue;
+
+        if (arg.Equals("--config", StringComparison.OrdinalIgnoreCase))
+        {
+            if (index + 1 >= args.Length || string.IsNullOrWhiteSpace(args[index + 1]))
+                throw new InvalidOperationException("--config requires a path value.");
+
+            options.ConfigPath = args[++index].Trim();
+            continue;
+        }
+
+        if (arg.StartsWith("--config=", StringComparison.OrdinalIgnoreCase))
+        {
+            options.ConfigPath = arg["--config=".Length..].Trim();
+            continue;
+        }
+
+        if (arg.Equals("--state-path", StringComparison.OrdinalIgnoreCase))
+        {
+            if (index + 1 >= args.Length || string.IsNullOrWhiteSpace(args[index + 1]))
+                throw new InvalidOperationException("--state-path requires a path value.");
+
+            options.StatePathOverride = args[++index].Trim();
+            continue;
+        }
+
+        if (arg.StartsWith("--state-path=", StringComparison.OrdinalIgnoreCase))
+        {
+            options.StatePathOverride = arg["--state-path=".Length..].Trim();
+            continue;
+        }
+
+        if (arg.StartsWith("--", StringComparison.Ordinal))
+            throw new InvalidOperationException($"Unknown argument '{arg}'.");
+
+        if (string.IsNullOrWhiteSpace(options.ConfigPath))
+        {
+            options.ConfigPath = arg;
+            continue;
+        }
+
+        throw new InvalidOperationException($"Unexpected extra argument '{arg}'.");
+    }
+
+    return options;
 }
 
 static List<string> ParseCommandAllowList(string value)
@@ -644,13 +724,13 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         if (run.AppliedActions > 0 && _config.SelfRepair.NotifyAdmins)
         {
-           // WriteOutboxMessage(new AdapterMessage
-           // {
-           //     CreatedAtUtc = utcNow,
-           //     Kind = "self-repair",
-           //     Audience = "admins",
-           //     Message = $"Capability evolution applied {run.AppliedActions} action(s): {run.Summary}"
-           // });
+            WriteOutboxMessage(new AdapterMessage
+            {
+                CreatedAtUtc = utcNow,
+                Kind = "self-repair",
+                Audience = "admins",
+                Message = BuildSelfRepairNotification(run)
+            });
         }
     }
 
@@ -692,6 +772,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             WorkspaceFiles = workspaceFiles,
             ScopeFiles = scopeFiles
         };
+    }
+
+    private string BuildSelfRepairNotification(SelfRepairRunRecord run)
+    {
+        var summary = $"Capability evolution applied {run.AppliedActions} action(s): {TrimSingleLine(run.Summary, 220)}";
+        if (run.Notes.Count == 0)
+            return summary;
+
+        return $"{summary} | {TrimSingleLine(run.Notes[0], 90)}";
     }
 
     private List<string> EnumerateLearningIncidentPreviews()
@@ -1350,7 +1439,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 Console.Error.WriteLine($"Failed to process chat file '{path}': {ex.Message}");
                 _memory.RecordAgentError($"chat-inbox: {Path.GetFileName(path)} failed: {ex.Message}");
                 if (!string.IsNullOrWhiteSpace(item?.AdminId) && !string.IsNullOrWhiteSpace(item?.Message))
-                    RecordLearningIncident(item.AdminId!, item.Message!, "processing-error", ex.Message, null, "processing-error");
+                    RecordLearningIncident(
+                        item.AdminId!,
+                        item.Message!,
+                        "processing-error",
+                        ex.Message,
+                        null,
+                        "processing-error",
+                        "processing-error",
+                        $"Chat inbox processing failed: {TrimSingleLine(ex.Message, 220)}");
                 SentrySdk.CaptureException(ex);
                 _memory.Save(_config.Memory.StatePath);
             }
@@ -1368,6 +1465,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         var adminPreference = _memory.GetOrCreateAdmin(adminId);
         var conversation = adminPreference.Conversation ??= new AdminConversationState();
+        var deferredChatFailures = new List<DeferredChatFailure>();
         RememberChatTurn(conversation, "user", message, utcNow);
 
         var preferenceAck = TryCaptureAdminPreferenceFromChat(adminPreference, message, utcNow);
@@ -1400,7 +1498,9 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         if (_config.Llm.Enabled)
         {
-            var toolReply = await TryHandleChatWithLlmToolsAsync(adminId, message, servers, conversation, adminPreference, utcNow);
+            var toolAttempt = await TryHandleChatWithLlmToolsAsync(adminId, message, servers, conversation, adminPreference, utcNow);
+            deferredChatFailures = toolAttempt.DeferredFailures;
+            var toolReply = toolAttempt.Reply;
             if (toolReply is not null)
             {
                 if (!string.IsNullOrWhiteSpace(toolReply.PendingClarificationIntent))
@@ -1451,6 +1551,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
             var clarification = conversation.PendingClarification.Question;
             SetConversationTrace(conversation, utcNow, "clarification", plan.Intent, usedTools: null, note: "Server clarification required before action.");
+            PersistDeferredChatFailures(adminId, message, conversation.LastTrace, deferredChatFailures);
             RememberChatTurn(conversation, "assistant", clarification, utcNow);
             adminPreference.LastUpdatedAtUtc = utcNow;
             return clarification;
@@ -1463,6 +1564,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         SetConversationTrace(conversation, utcNow, "deterministic", plan.Intent, usedTools: null, note: "Fallback deterministic planning/execution path.");
         if (string.Equals(plan.Intent, "unknown", StringComparison.OrdinalIgnoreCase))
         {
+            PersistDeferredChatFailures(adminId, message, conversation.LastTrace, deferredChatFailures);
             RecordLearningIncident(adminId, message, plan.Intent, reply, conversation.LastTrace, "unknown-intent");
         }
         RememberChatTurn(conversation, "assistant", reply, utcNow);
@@ -1738,7 +1840,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         return summary;
     }
 
-    private async Task<ToolDrivenChatReply?> TryHandleChatWithLlmToolsAsync(
+    private async Task<ToolDrivenChatAttempt> TryHandleChatWithLlmToolsAsync(
         string adminId,
         string message,
         List<ServerSnapshot> servers,
@@ -1754,6 +1856,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         var pendingClarificationIntent = string.Empty;
         var usedTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var lifecycleMutations = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var recordedToolFailures = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var deferredFailures = new List<DeferredChatFailure>();
 
         try
         {
@@ -1761,7 +1865,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             {
                 var response = await _llm.RequestToolChatTurnAsync(toolPrompt, messages, toolDefinitions);
                 if (response is null)
-                    return null;
+                {
+                    QueueDeferredChatFailure(
+                        deferredFailures,
+                        "llm-unavailable",
+                        "LLM returned no tool-chat response.",
+                        "llm-unavailable",
+                        "llm-chat-tools");
+                    return ToolDrivenChatAttempt.Failed(deferredFailures);
+                }
 
                 if (response.ToolCalls.Count == 0)
                 {
@@ -1770,21 +1882,31 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                     {
                         if (LooksLikeCapabilityDenial(content))
                         {
-                            _memory.RecordCapabilityGap("llm-chat-tools", $"LLM produced capability denial instead of tool usage: {TrimSingleLine(content, 220)}");
-                            RecordLearningIncident(adminId, message, "capability-denial", content, conversation.LastTrace, "capability-denial");
-                            return null;
+                            QueueDeferredChatFailure(
+                                deferredFailures,
+                                "capability-denial",
+                                content,
+                                "capability-denial",
+                                "llm-chat-tools");
+                            return ToolDrivenChatAttempt.Failed(deferredFailures);
                         }
 
-                        return new ToolDrivenChatReply
+                        return ToolDrivenChatAttempt.Success(new ToolDrivenChatReply
                         {
                             Reply = StripProcessNarration(content).Trim(),
                             LastServerName = lastServerName,
                             PendingClarificationIntent = pendingClarificationIntent,
                             UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
-                        };
+                        });
                     }
 
-                    return null;
+                    QueueDeferredChatFailure(
+                        deferredFailures,
+                        "llm-empty-response",
+                        "LLM returned an empty tool-chat response.",
+                        "llm-empty-response",
+                        "llm-chat-tools");
+                    return ToolDrivenChatAttempt.Failed(deferredFailures);
                 }
 
                 messages.Add(LlmChatMessage.Assistant(response.Content, response.ToolCalls));
@@ -1799,6 +1921,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                     if (!string.IsNullOrWhiteSpace(toolResult.PendingClarificationIntent))
                         pendingClarificationIntent = toolResult.PendingClarificationIntent!;
 
+                    RecordToolFailureIfNeeded(
+                        toolCall.Name,
+                        toolResult,
+                        deferredFailures,
+                        recordedToolFailures);
+
                     messages.Add(LlmChatMessage.Tool(toolCall.Id, toolCall.Name, toolResult.Content));
                 }
             }
@@ -1809,23 +1937,151 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             var finalReply = await _llm.RequestChatCompletionAsync(finalPrompt, messages);
 
             if (string.IsNullOrWhiteSpace(finalReply))
-                return null;
+            {
+                QueueDeferredChatFailure(
+                    deferredFailures,
+                    "llm-empty-response",
+                    "LLM exhausted tool rounds without producing a final reply.",
+                    "llm-empty-response",
+                    "llm-chat-tools");
+                return ToolDrivenChatAttempt.Failed(deferredFailures);
+            }
 
-            return new ToolDrivenChatReply
+            return ToolDrivenChatAttempt.Success(new ToolDrivenChatReply
             {
                 Reply = StripProcessNarration(finalReply).Trim(),
                 LastServerName = lastServerName,
                 PendingClarificationIntent = pendingClarificationIntent,
                 UsedTools = usedTools.OrderBy(tool => tool, StringComparer.OrdinalIgnoreCase).ToList()
-            };
+            });
         }
         catch (Exception ex)
         {
             _memory.RecordAgentError($"llm-chat-tools failed: {ex.Message}");
-            RecordLearningIncident(adminId, message, "tool-failure", ex.Message, conversation.LastTrace, "tool-failure");
+            QueueDeferredChatFailure(
+                deferredFailures,
+                "tool-failure",
+                ex.Message,
+                "tool-failure",
+                "tool-error");
             SentrySdk.CaptureException(ex);
-            return null;
+            return ToolDrivenChatAttempt.Failed(deferredFailures);
         }
+    }
+
+    private void RecordToolFailureIfNeeded(
+        string? toolName,
+        ChatToolExecutionResult toolResult,
+        List<DeferredChatFailure> deferredFailures,
+        HashSet<string> recordedToolFailures)
+    {
+        if (!string.IsNullOrWhiteSpace(toolResult.PendingClarificationIntent))
+            return;
+
+        var errorMessage = TryReadToolErrorMessage(toolResult.Content);
+        if (string.IsNullOrWhiteSpace(errorMessage))
+            return;
+
+        var normalizedToolName = NormalizeChatToolName(toolName);
+        var category = ClassifyToolFailureCategory(errorMessage);
+        var summary = $"{normalizedToolName}: {TrimSingleLine(errorMessage, 240)}";
+        var dedupeKey = $"{category}|{summary}";
+        if (!recordedToolFailures.Add(dedupeKey))
+            return;
+
+        QueueDeferredChatFailure(
+            deferredFailures,
+            normalizedToolName,
+            summary,
+            category,
+            category == "policy-denied" ? "policy-denied" : "tool-error");
+    }
+
+    private static void QueueDeferredChatFailure(
+        List<DeferredChatFailure> deferredFailures,
+        string intent,
+        string reply,
+        string category,
+        string capabilityGapCategory)
+    {
+        var normalizedReply = TrimSingleLine(reply, 240);
+        if (deferredFailures.Any(item =>
+                string.Equals(item.Intent, intent, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.Category, category, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.Reply, normalizedReply, StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        deferredFailures.Add(new DeferredChatFailure
+        {
+            Intent = intent,
+            Reply = normalizedReply,
+            Category = category,
+            CapabilityGapCategory = capabilityGapCategory
+        });
+    }
+
+    private void PersistDeferredChatFailures(
+        string adminId,
+        string message,
+        ChatTurnTrace? trace,
+        IEnumerable<DeferredChatFailure> deferredFailures)
+    {
+        foreach (var failure in deferredFailures)
+        {
+            RecordLearningIncident(
+                adminId,
+                message,
+                failure.Intent,
+                failure.Reply,
+                trace,
+                failure.Category,
+                failure.CapabilityGapCategory,
+                failure.Reply);
+        }
+    }
+
+    private static string? TryReadToolErrorMessage(string content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+            return null;
+
+        try
+        {
+            using var json = JsonDocument.Parse(content);
+            if (json.RootElement.ValueKind != JsonValueKind.Object)
+                return null;
+
+            if (json.RootElement.TryGetProperty("ok", out var okNode) &&
+                okNode.ValueKind == JsonValueKind.False)
+            {
+                if (json.RootElement.TryGetProperty("error", out var errorNode) &&
+                    errorNode.ValueKind == JsonValueKind.String)
+                {
+                    return errorNode.GetString()?.Trim();
+                }
+
+                return "Tool returned ok=false.";
+            }
+        }
+        catch
+        {
+        }
+
+        return null;
+    }
+
+    private static string ClassifyToolFailureCategory(string errorMessage)
+    {
+        if (errorMessage.Contains("policy", StringComparison.OrdinalIgnoreCase) ||
+            (errorMessage.Contains("approval", StringComparison.OrdinalIgnoreCase) &&
+             errorMessage.Contains("required", StringComparison.OrdinalIgnoreCase)))
+        {
+            return "policy-denied";
+        }
+
+        return "tool-error";
     }
 
     private static List<LlmChatMessage> BuildToolConversationMessages(AdminConversationState conversation, string message)
@@ -1932,6 +2188,10 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         BuildToolDefinition(
             "get_server_players",
             "Get the current player list snapshot for one named server.",
+            BuildServerToolParameters()),
+        BuildToolDefinition(
+            "get_server_bans",
+            "Get the current ban list snapshot for one named server.",
             BuildServerToolParameters()),
         BuildToolDefinition(
             "get_server_events",
@@ -2376,6 +2636,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             "stop_server" => await ExecuteLifecycleToolAsync(adminId, arguments, servers, utcNow, lifecycleMutations, "stop-server"),
             "restart_server" => await ExecuteLifecycleToolAsync(adminId, arguments, servers, utcNow, lifecycleMutations, "restart-server"),
             "get_server_players" => await ExecuteServerPlayersToolAsync(arguments, servers),
+            "get_server_bans" => await ExecuteServerBansToolAsync(arguments, servers),
             "get_server_events" => await ExecuteServerEventsToolAsync(arguments, servers),
             "execute_server_command" => await ExecuteServerCommandToolAsync(arguments, servers, adminId, utcNow),
             "get_server_command_memory" => ExecuteServerCommandMemoryTool(arguments, servers),
@@ -2433,6 +2694,16 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         return ChatToolExecutionResult.Success(json.RootElement.GetRawText(), resolution.Server.Name);
     }
 
+    private async Task<ChatToolExecutionResult> ExecuteServerBansToolAsync(JsonElement arguments, List<ServerSnapshot> servers)
+    {
+        var resolution = ResolveToolServer(arguments, servers, "server-bans");
+        if (!resolution.Matched)
+            return resolution.Result;
+
+        using var json = await _api.GetJsonAsync($"/servers/{Uri.EscapeDataString(resolution.Server!.Name)}/bans");
+        return ChatToolExecutionResult.Success(json.RootElement.GetRawText(), resolution.Server.Name);
+    }
+
     private async Task<ChatToolExecutionResult> ExecuteServerEventsToolAsync(JsonElement arguments, List<ServerSnapshot> servers)
     {
         var resolution = ResolveToolServer(arguments, servers, "server-events");
@@ -2456,13 +2727,13 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         var command = ReadToolArgument(arguments, "command");
         if (string.IsNullOrWhiteSpace(command))
-            return ChatToolExecutionResult.Error("command is required.", server.Name, "execute_server_command");
+            return ChatToolExecutionResult.Error("command is required.", server.Name);
         var normalized = NormalizeCommand(command);
         if (normalized is null)
-            return ChatToolExecutionResult.Error("Command must be a single line and 256 characters or less.", server.Name, "execute_server_command");
+            return ChatToolExecutionResult.Error("Command must be a single line and 256 characters or less.", server.Name);
 
         if (!IsCommandAllowed(normalized, out var policyError))
-            return ChatToolExecutionResult.Error(policyError ?? "Command not allowed by current policy.", server.Name, "execute_server_command");
+            return ChatToolExecutionResult.Error(policyError ?? "Command not allowed by current policy.", server.Name);
 
         var waitMs = ReadToolIntArgument(
             arguments,
@@ -2484,7 +2755,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
         catch (Exception ex)
         {
-            return ChatToolExecutionResult.Error(ex.Message, server.Name, "execute_server_command");
+            return ChatToolExecutionResult.Error(ex.Message, server.Name);
         }
 
         using (json)
@@ -2552,7 +2823,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         var purpose = ReadToolArgument(arguments, "purpose");
         var usefulWhen = ReadToolArgument(arguments, "usefulWhen");
         if (string.IsNullOrWhiteSpace(command))
-            return ChatToolExecutionResult.Error("command is required.", resolution.Server!.Name, "teach_server_command");
+            return ChatToolExecutionResult.Error("command is required.", resolution.Server!.Name);
 
         RecordCommandKnowledge(
             resolution.Server!.Name,
@@ -2596,7 +2867,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
         catch (Exception ex)
         {
-            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name, "list_server_plugins");
+            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name);
         }
         var serverMemory = _memory.GetOrCreateServer(resolution.Server.Name);
         serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
@@ -2638,7 +2909,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
         catch (Exception ex)
         {
-            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name, "check_plugin_updates");
+            return ChatToolExecutionResult.Error(ex.Message, resolution.Server!.Name);
         }
         var serverMemory = _memory.GetOrCreateServer(resolution.Server.Name);
         serverMemory.KnownPlugins ??= new List<KnownPluginRecord>();
@@ -3549,8 +3820,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         {
             return ChatToolExecutionResult.Error(
                 $"A lifecycle action has already been executed for {resolution.Server.Name} in this turn.",
-                resolution.Server.Name,
-                actionType);
+                resolution.Server.Name);
         }
 
         var interpretation = new ChatInterpretation
@@ -3579,7 +3849,7 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
 
         var question = BuildClarificationQuestion(intent, servers);
         return ToolServerResolution.NeedsClarification(
-            ChatToolExecutionResult.Error(question, pendingClarificationIntent: intent),
+            ChatToolExecutionResult.Clarification(question, intent),
             intent);
     }
 
@@ -4428,7 +4698,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             .ToList();
     }
 
-    private void RecordLearningIncident(string adminId, string message, string intent, string reply, ChatTurnTrace? trace, string category = "unknown")
+    private void RecordLearningIncident(
+        string adminId,
+        string message,
+        string intent,
+        string reply,
+        ChatTurnTrace? trace,
+        string category = "unknown",
+        string? capabilityGapCategory = null,
+        string? capabilityGapDescription = null)
     {
         try
         {
@@ -4451,7 +4729,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             var fileName = $"{incident.AtUtc:yyyyMMddHHmmssfff}-learning-{incident.Id}.json";
             var path = Path.Combine(_learningInboxPath, fileName);
             File.WriteAllText(path, JsonSerializer.Serialize(incident, JsonOptions.Default));
-            _memory.RecordCapabilityGap("chat-learning", $"Unmapped chat message persisted for learning: {TrimSingleLine(message, 180)}");
+            if (!string.IsNullOrWhiteSpace(capabilityGapCategory) && !string.IsNullOrWhiteSpace(capabilityGapDescription))
+            {
+                _memory.RecordCapabilityGap(
+                    capabilityGapCategory,
+                    TrimSingleLine(capabilityGapDescription, 240));
+            }
         }
         catch (Exception ex)
         {
@@ -7463,6 +7746,12 @@ internal sealed class ChatInboxItem
     public string? Channel { get; set; }
 }
 
+internal sealed class AgentStartupOptions
+{
+    public string? ConfigPath { get; set; }
+    public string? StatePathOverride { get; set; }
+}
+
 internal sealed class FeedbackEntry
 {
     public DateTime ReceivedAtUtc { get; set; }
@@ -7577,6 +7866,30 @@ internal sealed class ToolDrivenChatReply
     public List<string> UsedTools { get; set; } = new();
 }
 
+internal sealed class ToolDrivenChatAttempt
+{
+    public ToolDrivenChatReply? Reply { get; set; }
+    public List<DeferredChatFailure> DeferredFailures { get; set; } = new();
+
+    public static ToolDrivenChatAttempt Success(ToolDrivenChatReply reply) => new()
+    {
+        Reply = reply
+    };
+
+    public static ToolDrivenChatAttempt Failed(IEnumerable<DeferredChatFailure> deferredFailures) => new()
+    {
+        DeferredFailures = deferredFailures.ToList()
+    };
+}
+
+internal sealed class DeferredChatFailure
+{
+    public string Intent { get; set; } = string.Empty;
+    public string Reply { get; set; } = string.Empty;
+    public string Category { get; set; } = "unknown";
+    public string CapabilityGapCategory { get; set; } = "unknown";
+}
+
 internal sealed class ChatToolExecutionResult
 {
     public string Content { get; set; } = "{}";
@@ -7591,8 +7904,20 @@ internal sealed class ChatToolExecutionResult
 
     public static ChatToolExecutionResult Error(
         string message,
-        string? resolvedServerName = null,
-        string? pendingClarificationIntent = null) => new()
+        string? resolvedServerName = null) => new()
+    {
+        Content = JsonSerializer.Serialize(new
+        {
+            ok = false,
+            error = message
+        }, JsonOptions.Default),
+        ResolvedServerName = resolvedServerName
+    };
+
+    public static ChatToolExecutionResult Clarification(
+        string message,
+        string pendingClarificationIntent,
+        string? resolvedServerName = null) => new()
     {
         Content = JsonSerializer.Serialize(new
         {
@@ -7711,6 +8036,9 @@ internal sealed class LearningIncidentRecord
     // "unknown-intent" – agent couldn't map the message to a known action
     // "tool-failure"   – LLM tool loop threw or exhausted retries
     // "capability-denial" – LLM said it couldn't do something instead of using tools
+    // "policy-denied" – a tool request was blocked by policy or approval rules
+    // "llm-unavailable" – the LLM returned no tool-chat response
+    // "llm-empty-response" – the LLM returned whitespace/no final answer
     // "processing-error" – exception while processing the chat inbox file
     public string Category { get; set; } = "unknown";
     public string Reply { get; set; } = string.Empty;
@@ -7730,6 +8058,3 @@ internal sealed class AdapterMessage
     public string? ActionId { get; set; }
     public string Message { get; set; } = string.Empty;
 }
-
-
-

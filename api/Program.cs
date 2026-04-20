@@ -1748,47 +1748,35 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
     {
         AgentSettingsPath = agentSettingsPath,
         BotSettingsPath = botSettingsPath,
-        StatePath = ResolveConfiguredPath(
+        StatePath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_STATE_PATH") ?? agentSettings?.Memory?.StatePath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "agent-state.json")),
-        FeedbackInboxPath = ResolveConfiguredPath(
+        FeedbackInboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_FEEDBACK_INBOX_PATH") ?? agentSettings?.Inbox?.FeedbackInboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "feedback-inbox")),
-        DecisionInboxPath = ResolveConfiguredPath(
+        DecisionInboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_DECISION_INBOX_PATH") ?? agentSettings?.Inbox?.DecisionInboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "decision-inbox")),
-        ChatInboxPath = ResolveConfiguredPath(
+        ChatInboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_CHAT_INBOX_PATH") ?? agentSettings?.Inbox?.ChatInboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "chat-inbox")),
-        MessageOutboxPath = ResolveConfiguredPath(
+        MessageOutboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_PATH") ?? agentSettings?.Outbox?.MessageOutboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "message-outbox")),
-        SentOutboxPath = ResolveConfiguredPath(
+        SentOutboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_SENT_PATH") ?? botSettings?.Agent?.SentOutboxPath,
             botBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "message-outbox-sent")),
-        LogRulesPath = ResolveConfiguredPath(
+        LogRulesPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_LOG_RULES_PATH") ?? agentSettings?.Monitor?.LogRulesPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "agent-log-rules.json"))
     };
-}
-
-static string ResolveConfiguredPath(string? configuredPath, string baseDir, string fallback)
-{
-    var raw = RustOpsEnv.ResolvePlaceholders(configuredPath);
-    if (string.IsNullOrWhiteSpace(raw))
-        raw = fallback;
-
-    var normalized = RustOpsEnv.NormalizePath(raw);
-    return Path.IsPathRooted(normalized)
-        ? Path.GetFullPath(normalized)
-        : Path.GetFullPath(Path.Combine(baseDir, normalized));
 }
 
 static AgentLlmConfigView ReadAgentLlmConfig(string envPath, string agentSettingsPath, DashboardRuntimeStatus runtimeStatus)
@@ -4050,5 +4038,4 @@ public sealed class RustRcon : IAsyncDisposable
         return ValueTask.CompletedTask;
     }
 }
-
 

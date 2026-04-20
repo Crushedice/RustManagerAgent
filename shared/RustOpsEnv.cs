@@ -86,6 +86,18 @@ internal static partial class RustOpsEnv
             .Replace('/', Path.DirectorySeparatorChar);
     }
 
+    public static string ResolveConfiguredPath(string? configuredPath, string baseDir, string fallback)
+    {
+        var raw = ResolvePlaceholders(configuredPath);
+        if (string.IsNullOrWhiteSpace(raw))
+            raw = fallback;
+
+        var normalized = NormalizePath(raw);
+        return Path.IsPathRooted(normalized)
+            ? Path.GetFullPath(normalized)
+            : Path.GetFullPath(Path.Combine(baseDir, normalized));
+    }
+
     public static bool HasUnresolvedPlaceholder(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
