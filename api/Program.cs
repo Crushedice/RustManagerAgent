@@ -2336,6 +2336,9 @@ static JsonElement FindArrayPropertyIgnoreCase(JsonElement element, params strin
 
 static string? ReadStringAny(JsonElement element, params string[] names)
 {
+    if (element.ValueKind != JsonValueKind.Object)
+        return null;
+
     foreach (var property in element.EnumerateObject())
     {
         if (!names.Contains(property.Name, StringComparer.OrdinalIgnoreCase))
@@ -2350,6 +2353,9 @@ static string? ReadStringAny(JsonElement element, params string[] names)
 
 static int? ReadIntAny(JsonElement element, params string[] names)
 {
+    if (element.ValueKind != JsonValueKind.Object)
+        return null;
+
     foreach (var property in element.EnumerateObject())
     {
         if (!names.Contains(property.Name, StringComparer.OrdinalIgnoreCase))
@@ -2367,6 +2373,9 @@ static int? ReadIntAny(JsonElement element, params string[] names)
 
 static double? ReadDoubleAny(JsonElement element, params string[] names)
 {
+    if (element.ValueKind != JsonValueKind.Object)
+        return null;
+
     foreach (var property in element.EnumerateObject())
     {
         if (!names.Contains(property.Name, StringComparer.OrdinalIgnoreCase))
