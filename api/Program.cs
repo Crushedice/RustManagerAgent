@@ -20,6 +20,7 @@ builder.Services.Configure<JsonOptions>(options =>
 {
     options.SerializerOptions.WriteIndented = true;
     options.SerializerOptions.DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull;
+    options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
 });
 
 var app = builder.Build();
@@ -2260,6 +2261,26 @@ static async Task<PlayerSnapshot?> TryReadPlayerSnapshotAsync(string server)
         PlayerNames = names
     };
 }
+	
+static string ResolveConfiguredPath(string? configuredPath, string baseDir, string fallback)
+{
+    var raw = RustOpsEnv.ResolvePlaceholders(configuredPath);
+    if (string.IsNullOrWhiteSpace(raw))
+        raw = fallback;
+    var normalized = RustOpsEnv.NormalizePath(raw);
+    return Path.IsPathRooted(normalized)
+        ? Path.GetFullPath(normalized)
+        : Path.GetFullPath(Path.Combine(baseDir, normalized));
+}
+static string? NormalizeBearerToken(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return null;
+    var token = value.Trim();
+    if (token.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        token = token["Bearer ".Length..].Trim();
+    return string.IsNullOrWhiteSpace(token) ? null : token;
+}
 
 static async Task<ServerInfoSnapshot?> TryReadServerInfoSnapshotAsync(string server)
 {
@@ -2862,6 +2883,7 @@ static string BuildDashboardHtml() => """
       if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
       return response.json();
     }
+
 
     function activateTab(target) {
       tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.target === target));

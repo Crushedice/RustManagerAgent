@@ -251,6 +251,13 @@ build_start_command() {
 
     cmd+="+rcon.password $(quote_arg "$CFG_RCON_PASSWORD") "
 
+    # Enable WebSocket RCON unless the user has already set +rcon.web in additionalArgs.
+    # Without +rcon.web 1 the RCON port only accepts legacy TCP; WebSocket RCON is required
+    # for send, query, and the API command endpoints to work.
+    if [[ "${CFG_ADDITIONAL_ARGS:-}" != *"+rcon.web"* ]]; then
+        cmd+="+rcon.web 1 "
+    fi
+
     if [[ -n "$CFG_SERVER_REPORTS_ENDPOINT" ]]; then
         cmd+="+server.reportsserverendpoint $(quote_arg "$CFG_SERVER_REPORTS_ENDPOINT") "
     fi
@@ -743,14 +750,16 @@ rcon_send() {
     fi
 
     python3 - "$rcon_port" "$rcon_password" "$command" "$return_output" <<'PY'
-import sys, socket, base64, json
+import sys, socket, base64, json, os
 
 port = int(sys.argv[1])
 password = sys.argv[2]
 command = sys.argv[3]
 return_output = sys.argv[4] == "1"
 
-key = base64.b64encode(b"0123456789ABCDEF").decode('utf-8')
+# Use a proper random WebSocket key (RFC 6455 §4.1)
+raw_key = os.urandom(16)
+key = base64.b64encode(raw_key).decode('utf-8')
 req = (f"GET /{password} HTTP/1.1\r\n"
        f"Host: 127.0.0.1:{port}\r\n"
        f"Upgrade: websocket\r\n"
@@ -758,8 +767,10 @@ req = (f"GET /{password} HTTP/1.1\r\n"
        f"Sec-WebSocket-Key: {key}\r\n"
        f"Sec-WebSocket-Version: 13\r\n\r\n")
 
+# Shorter timeout for fire-and-forget, longer when we need a reply
+connect_timeout = 8.0 if return_output else 4.0
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(10.0)
+s.settimeout(connect_timeout)
 try:
     s.connect(("127.0.0.1", port))
     s.sendall(req.encode('utf-8'))
@@ -783,7 +794,8 @@ try:
         frame.append(127 | 0x80)
         frame.extend(len(payload).to_bytes(8, 'big'))
 
-    mask = b'\x00\x00\x00\x00'
+    # RFC 6455: client frames MUST be masked with a random 4-byte key
+    mask = os.urandom(4)
     frame.extend(mask)
     for i in range(len(payload)):
         frame.append(payload[i] ^ mask[i % 4])
@@ -842,14 +854,30 @@ send_one() {
     local cmd="$*"
 
     [[ -n "$cmd" ]] || die "Missing command"
-    tmux_has_session "$server" || die "Server not running: $server"
+
+    # Gate on the actual process, not on tmux. RCON works regardless of session state.
     local pid
     pid="$(server_pid "$server" || true)"
-    [[ -n "$pid" ]] || die "tmux session exists but RustDedicated pid is missing for $server"
+    [[ -n "$pid" ]] || die "Server not running: $server"
 
-    rcon_send "$server" "$cmd" "0" || tmux send-keys -t "$(session_name "$server")" "$cmd" C-m
-    trace_server_command "$server" "send: $cmd"
-    echo "sent to $server: $cmd"
+    if rcon_send "$server" "$cmd" "0"; then
+        trace_server_command "$server" "send(rcon): $cmd"
+        echo "sent to $server: $cmd"
+        return 0
+    fi
+
+    # RCON unavailable — fall back to tmux send-keys if the session exists.
+    # Note: this path only works when the process reads stdin from the terminal,
+    # which is not reliable for RustDedicated in batchmode. It is kept as a
+    # last resort so graceful shutdown commands ("quit") can still be attempted.
+    if tmux_has_session "$server"; then
+        tmux send-keys -t "$(session_name "$server")" "$cmd" C-m
+        trace_server_command "$server" "send(tmux-fallback): $cmd"
+        echo "sent to $server: $cmd"
+        return 0
+    fi
+
+    die "Failed to send command to $server: RCON connection refused and no tmux session. Ensure +rcon.web 1 is set and the server is fully started."
 }
 
 commands_one() {
@@ -902,7 +930,10 @@ query_one() {
             ;;
     esac
 
-    tmux_has_session "$server" || die "Server not running: $server"
+    # Gate on the actual process, not on tmux session state.
+    local pid
+    pid="$(server_pid "$server" || true)"
+    [[ -n "$pid" ]] || die "Server not running: $server"
 
     local out
     if out="$(rcon_send "$server" "$query" "1")"; then
@@ -910,7 +941,7 @@ query_one() {
         return 0
     fi
 
-    die "Failed to query '$query' on $server via RCON"
+    die "Failed to query '$query' on $server via RCON. Ensure the server is fully started and +rcon.web 1 is active (run 'sync-config $server' then restart)."
 }
 
 config_show_one() {

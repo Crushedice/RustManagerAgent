@@ -559,12 +559,20 @@ REPLY RULES — follow these without exception:
 - Keep replies concise enough to read in a Steam chat window. Avoid wall-of-text.
 - Do not invent facts, server states, or action outcomes.
 
+CORE CAPABILITIES — assume these are available when relevant:
+- list configured servers and report current status, uptime signals, player counts, map, fps, and warning counts
+- inspect server health, recent errors, restart evidence, events, players, and bans
+- validate Oxide/uMod plugins and configs, list installed plugins, and check plugin updates
+- execute approved server lifecycle actions and allowed console commands
+- inspect host network throughput and diagnose agent runtime problems
+
 If an admin asks to execute a server console command, use execute_server_command.
 If an admin asks what a command does, use get_server_command_memory.
 If an admin teaches command behavior, use teach_server_command.
 If an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.
 If an admin asks to push source changes to git, use git_push_branch.
 If an admin asks to pull latest source updates, use git_pull_rebuild.
+- If an admin asks whether you can monitor server uptime or health, answer yes and ask which server if one was not specified.
 """;
     private readonly AgentConfig _config;
     private readonly RustMgrApiClient _api;
@@ -1487,6 +1495,15 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         }
 
         var servers = await GetServerSnapshotsAsync();
+        var capabilityReply = TryHandleCapabilityQuestionMessage(message, servers);
+        if (!string.IsNullOrWhiteSpace(capabilityReply))
+        {
+            SetConversationTrace(conversation, utcNow, "direct", "capability-help", usedTools: null, note: "Answered capability/help question deterministically.");
+            RememberChatTurn(conversation, "assistant", capabilityReply, utcNow);
+            adminPreference.LastUpdatedAtUtc = utcNow;
+            return capabilityReply;
+        }
+
         var directCommandReply = await TryHandleDirectCommandMessageAsync(adminId, message, servers, utcNow);
         if (!string.IsNullOrWhiteSpace(directCommandReply))
         {
@@ -1659,6 +1676,61 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         return $"{requestedServerName}: {known.Command} | purpose={known.Purpose ?? "unknown"} | usefulWhen={known.UsefulWhen ?? "unknown"} | lastOutput={known.LastOutputSummary ?? "n/a"} | observations={known.Observations}";
     }
 
+    private string? TryHandleCapabilityQuestionMessage(string message, List<ServerSnapshot> servers)
+    {
+        var lowered = message.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(lowered))
+            return null;
+
+        var asksAboutCapabilities =
+            lowered.Contains("what can you do", StringComparison.Ordinal) ||
+            lowered.Contains("what do you do", StringComparison.Ordinal) ||
+            lowered.Contains("what are your capabilities", StringComparison.Ordinal) ||
+            lowered.Contains("what can u do", StringComparison.Ordinal) ||
+            lowered.Contains("what all can you do", StringComparison.Ordinal) ||
+            lowered.Contains("what tools do you have", StringComparison.Ordinal) ||
+            lowered.Contains("what features", StringComparison.Ordinal) ||
+            lowered.Contains("what are you able to", StringComparison.Ordinal);
+
+        var asksAboutHealthCapability =
+            (lowered.Contains("can you", StringComparison.Ordinal) ||
+             lowered.Contains("are you able to", StringComparison.Ordinal) ||
+             lowered.Contains("do you", StringComparison.Ordinal)) &&
+            (lowered.Contains("health", StringComparison.Ordinal) ||
+             lowered.Contains("uptime", StringComparison.Ordinal) ||
+             lowered.Contains("status", StringComparison.Ordinal) ||
+             lowered.Contains("monitor", StringComparison.Ordinal));
+
+        if (asksAboutHealthCapability)
+        {
+            var resolvedServer = ResolveServerName(message, servers);
+            if (!string.IsNullOrWhiteSpace(resolvedServer))
+                return $"Yes. I can check status and health for {resolvedServer}, including recent errors, restart evidence, players, bans, and plugin state.";
+
+            return "Yes. I can check server status and health, including uptime signals, recent errors, restart evidence, players, bans, plugin state, and host network. Name the server and I’ll check it.";
+        }
+
+        if (!asksAboutCapabilities)
+            return null;
+
+        return BuildCapabilitySummaryReply(servers);
+    }
+
+    private string BuildCapabilitySummaryReply(List<ServerSnapshot> servers)
+    {
+        var knownServers = servers.Count == 0
+            ? "No servers are currently listed by the API."
+            : $"Known servers: {string.Join(", ", servers.Select(server => server.Name))}.";
+
+        return string.Join('\n',
+            "I can manage Rust server ops chat requests.",
+            knownServers,
+            "I can list servers and check status, health, recent incidents, pending actions, players, bans, recent events, and host network throughput.",
+            "I can validate Oxide plugins/configs, list installed plugins, and check plugin updates.",
+            "I can run allowed server console commands, remember command behavior, and queue start/stop/restart actions when policy allows.",
+            "Examples: 'status vanilla', 'health modded', 'players vanilla', 'bans vanilla', 'recent events onegrid', 'check plugin updates modded', 'validate oxide sandbox'.");
+    }
+
     private static string? TryCaptureAdminPreferenceFromChat(AdminPreference adminPreference, string message, DateTime utcNow)
     {
         var lowered = message.Trim().ToLowerInvariant();
@@ -1734,6 +1806,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         AdminPreference adminPreference)
     {
         if (!_config.Llm.Enabled || string.IsNullOrWhiteSpace(deterministicReply))
+            return deterministicReply;
+
+        if (plan.Intent is "help" or "unknown")
+            return deterministicReply;
+
+        if (!string.IsNullOrWhiteSpace(TryHandleCapabilityQuestionMessage(request, servers)))
             return deterministicReply;
 
         var planningContext = BuildChatPlanningContext(request, servers, conversation, adminPreference);
@@ -4494,10 +4572,12 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         return string.Join('\n',
             "I can take natural-language admin requests.",
             "Examples:",
+            "- what can you do",
             "- what servers are running",
             "- status vanilla",
             "- health modded",
             "- players vanilla",
+            "- bans vanilla",
             "- recent events onegrid",
             "- run command oxide.plugins on modded",
             "- what does command oxide.plugins do on modded",
@@ -7140,11 +7220,20 @@ internal sealed class AgentMemoryStore
             .ToList();
     }
 
+    // State file uses camelCase so the API dashboard can read it with TryGetProperty("camelKey").
+    private static readonly JsonSerializerOptions _stateFileOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     public void Save(string path)
     {
         LastSavedAtUtc = DateTime.UtcNow;
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, JsonSerializer.Serialize(this, JsonOptions.Default));
+        File.WriteAllText(path, JsonSerializer.Serialize(this, _stateFileOptions));
     }
 }
 
