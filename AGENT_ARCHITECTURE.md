@@ -73,3 +73,12 @@ Future agent policy module; this should be gated and auditable before enabling a
 3. Add a plugin inventory/update subsystem.
 4. Add a memory store for incidents, prior actions, and admin preferences.
 5. Rewire the Steam bot so it forwards to the agent instead of calling the API directly.
+
+## Modular agent implementation status (this branch)
+
+The agent has been refactored toward a modular architecture:
+- `Core/Interaction/` now contains routing primitives (`AdminIntentClassifier`, `ToolRegistry`, `ActionExecutor`, `ResponseComposer`, `AgentInteractionRouter`).
+- `RustDomain/Operations/` isolates Rust-specific operational modules (RCON client surface, tmux server manager, log manager, uMod/config helpers, and focused network inspection).
+- `Memory/NeoCortex/` splits memory ownership into category banks (`operational-state`, `selection-state`, and `incidents-evolution`) while preserving compatibility with the legacy state snapshot file.
+
+This keeps Rust as the active domain while preparing for future non-Rust domain modules without coupling core orchestration to Rust-only concerns.

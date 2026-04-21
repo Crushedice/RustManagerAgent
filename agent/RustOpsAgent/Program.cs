@@ -506,7 +506,7 @@ static class AgentLogRulesFile
     }
 }
 
-internal sealed class RustOpsAgent
+internal sealed partial class RustOpsAgent
 {
     private static readonly Regex CompileErrorPattern = new(@"\bCS\d{4}\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex OxideInfoAttributePattern = new(@"\[\s*Info\s*\(\s*""(?<title>[^""]+)""\s*,\s*""(?<author>[^""]*)""\s*,\s*""(?<version>[^""]+)""\s*\)\s*\]", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -592,6 +592,8 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     private DateTime? _lastGitAutoPullCheckUtc;
     private readonly AgentMemoryStore _memory;
     private volatile bool _stopRequested;
+    private readonly AgentInteractionRouter _interactionRouter;
+    private readonly FocusedNetworkInspector _networkInspector = new();
 
     public RustOpsAgent(AgentConfig config, RustMgrApiClient api, RustMgrExecutor executor, LlmClient llm, AgentLogRules logRules, AgentMemoryStore memory)
     {
@@ -608,6 +610,11 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
         _learningInboxPath = Path.Combine(_selfRepairWorkspacePath, "learning", "inbox");
         _learningArchivePath = Path.Combine(_selfRepairWorkspacePath, "learning", "archive");
         _memory = memory;
+        _interactionRouter = new AgentInteractionRouter(
+            new AdminIntentClassifier(),
+            new ToolRegistry(),
+            new ActionExecutor(ExecuteChatPlanAsync, TryHandleDirectCommandMessageAsync),
+            new ResponseComposer());
         EnsureSelfRepairWorkspace();
         RefreshReplyStyleIfChanged(force: true);
     }
@@ -1502,6 +1509,32 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             RememberChatTurn(conversation, "assistant", capabilityReply, utcNow);
             adminPreference.LastUpdatedAtUtc = utcNow;
             return capabilityReply;
+        }
+
+        var routedReply = await _interactionRouter.TryHandleAsync(new AgentInteractionContext(adminId, message, utcNow, servers, conversation, adminPreference));
+        if (routedReply is not null)
+        {
+            SetConversationTrace(conversation, utcNow, "router", routedReply.Intent, routedReply.UsedTools, note: routedReply.Notes);
+            if (!string.IsNullOrWhiteSpace(routedReply.ServerName))
+                conversation.LastServerName = routedReply.ServerName;
+            if (routedReply.PendingClarification)
+            {
+                conversation.PendingClarification = new PendingChatClarification
+                {
+                    Intent = routedReply.Intent,
+                    OriginalMessage = message,
+                    Question = routedReply.Reply,
+                    RequestedAtUtc = utcNow
+                };
+            }
+            else
+            {
+                conversation.PendingClarification = null;
+            }
+
+            RememberChatTurn(conversation, "assistant", routedReply.Reply, utcNow);
+            adminPreference.LastUpdatedAtUtc = utcNow;
+            return routedReply.Reply;
         }
 
         var directCommandReply = await TryHandleDirectCommandMessageAsync(adminId, message, servers, utcNow);
@@ -3116,7 +3149,16 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
             return GitPushResult.Fail($"Could not resolve current branch: {BuildLifecycleMessage(currentBranchResult, "branch lookup failed")}");
         var previousBranch = currentBranchResult.StdOut.Trim();
 
+        if (string.Equals(previousBranch, _config.GitOps.BaseBranch, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(_config.GitOps.BaseBranch, "main", StringComparison.OrdinalIgnoreCase) &&
+            string.IsNullOrWhiteSpace(_config.GitOps.PushBranchPrefix))
+        {
+            return GitPushResult.Fail("GitOps push branch prefix is required; refusing direct-main workflow.");
+        }
+
         var branchName = BuildAgentBranchName();
+        if (string.Equals(branchName, _config.GitOps.BaseBranch, StringComparison.OrdinalIgnoreCase))
+            return GitPushResult.Fail("Refusing to push agent-authored changes directly to the base branch.");
         var checkout = await ExecuteProcessAsync("git", new[] { "checkout", "-b", branchName }, repoPath, TimeSpan.FromSeconds(20));
         if (!checkout.Ok)
             return GitPushResult.Fail($"Failed to create branch '{branchName}': {BuildLifecycleMessage(checkout, "checkout failed")}");
@@ -5245,6 +5287,10 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
     {
         using var json = await _api.GetJsonAsync("/host/network/summary");
         var summary = "Host network counters inspected.";
+        var focusedInterfaces = json.RootElement.TryGetProperty("interfaces", out var allInterfaces) && allInterfaces.ValueKind == JsonValueKind.Array
+            ? _networkInspector.FilterInterfaces(allInterfaces)
+            : new JsonArray();
+
         var sampleSeconds = json.RootElement.TryGetProperty("sampleSeconds", out var sampleSecondsNode) && sampleSecondsNode.ValueKind == JsonValueKind.Number
             ? sampleSecondsNode.GetDouble()
             : (double?)null;
@@ -5303,12 +5349,11 @@ If an admin asks to pull latest source updates, use git_pull_rebuild.
                 ? $"Host network activity over the last {sampleSeconds.Value:0.##}s on {interesting.GetArrayLength()} interface(s). {string.Join(" | ", details)}"
                 : $"Host network activity detected on {interesting.GetArrayLength()} interface(s). {string.Join(" | ", details)}";
         }
-        else if (json.RootElement.TryGetProperty("interfaces", out var interfacesNode) &&
-                 interfacesNode.ValueKind == JsonValueKind.Array)
+        else if (focusedInterfaces.Count > 0)
         {
             summary = sampleSeconds.HasValue
-                ? $"Host network counters inspected across {interfacesNode.GetArrayLength()} interface(s) over {sampleSeconds.Value:0.##}s; no spikes or error-heavy interfaces detected."
-                : $"Host network counters inspected across {interfacesNode.GetArrayLength()} interface(s); waiting for a follow-up sample to calculate throughput.";
+                ? $"Focused network inspection across {focusedInterfaces.Count} interface(s) (eth0/wt1/wg1) over {sampleSeconds.Value:0.##}s; no spikes detected."
+                : $"Focused network inspection across {focusedInterfaces.Count} interface(s) (eth0/wt1/wg1); waiting for follow-up sample.";
         }
 
         return new ActionExecutionRecord
@@ -7122,11 +7167,8 @@ internal sealed class AgentMemoryStore
 
     public static AgentMemoryStore Load(string path)
     {
-        if (!File.Exists(path))
-            return new AgentMemoryStore();
-
-        return JsonSerializer.Deserialize<AgentMemoryStore>(File.ReadAllText(path), JsonOptions.Default)
-            ?? new AgentMemoryStore();
+        var banks = new NeoCortexMemoryBank(path);
+        return banks.Load(path);
     }
 
     public ServerMemory GetOrCreateServer(string name)
@@ -7232,8 +7274,8 @@ internal sealed class AgentMemoryStore
     public void Save(string path)
     {
         LastSavedAtUtc = DateTime.UtcNow;
-        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-        File.WriteAllText(path, JsonSerializer.Serialize(this, _stateFileOptions));
+        var banks = new NeoCortexMemoryBank(path);
+        banks.Save(this, path);
     }
 }
 
