@@ -1,3 +1,5 @@
+using System.Text.Json;
+
 internal sealed class NeoCortexMemoryBank
 {
     private readonly string _rootPath;
