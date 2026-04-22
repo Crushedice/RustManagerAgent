@@ -13,7 +13,8 @@ internal sealed class RustOpsApiClient : IDisposable
     {
         _http = new HttpClient
         {
-            BaseAddress = new Uri(settings.BaseUrl.TrimEnd('/') + "/")
+            BaseAddress = new Uri(settings.BaseUrl.TrimEnd('/') + "/"),
+            Timeout = TimeSpan.FromSeconds(20)
         };
 
         _http.DefaultRequestHeaders.Accept.Clear();

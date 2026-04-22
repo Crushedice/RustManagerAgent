@@ -120,11 +120,11 @@ internal sealed class NeoCortexStore : IEvolutionStore
             }
         }
 
-        SaveJson(_operationsPath, active);
-        SaveJson(_selectionPath, selection);
-        SaveJson(_logsPath, logs);
-        SaveJson(_policyPath, policy);
-        SaveJson(_cachePath, cache);
+        if (!File.Exists(_operationsPath)) SaveJson(_operationsPath, active);
+        if (!File.Exists(_selectionPath)) SaveJson(_selectionPath, selection);
+        if (!File.Exists(_logsPath)) SaveJson(_logsPath, logs);
+        if (!File.Exists(_policyPath)) SaveJson(_policyPath, policy);
+        if (!File.Exists(_cachePath)) SaveJson(_cachePath, cache);
         if (!File.Exists(_evolutionPath))
         {
             File.WriteAllText(_evolutionPath, string.Empty);

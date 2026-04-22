@@ -10,3 +10,4 @@ runtime/
 *.env
 rustops.env
 OldProjectfiles/
+RusticalandOPS.zip

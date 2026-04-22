@@ -67,10 +67,21 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 
         if (message.Contains("countdown") || message.Contains("in 3") || message.Contains("in three") || message.Contains("3 min"))
         {
-            await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command", new { command = "say Server restart in 3 minutes" }, cancellationToken);
-            await Task.Delay(TimeSpan.FromMinutes(3), cancellationToken);
-            await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, cancellationToken);
-            return new ToolExecutionResult(true, $"Restart countdown executed for {server} with minimum 3 minutes.", server, true);
+            // Fire-and-forget: do not block inbox processing for 3 minutes.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var _ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command", new { command = "say Server restart in 3 minutes" }, CancellationToken.None);
+                    await Task.Delay(TimeSpan.FromMinutes(3), CancellationToken.None);
+                    using var __ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, CancellationToken.None);
+                }
+                catch
+                {
+                    // Countdown failures are best-effort; the admin will observe the result.
+                }
+            });
+            return new ToolExecutionResult(true, $"Restart countdown started for {server}. Server will restart in ~3 minutes.", server, true);
         }
 
         var endpoint = ResolveEndpoint(message);
@@ -190,8 +201,15 @@ internal sealed class RustRconToolHandler : IToolHandler
 
             await using IRconClient client = new RustRconClient();
             _rconLogMonitor.Attach(client);
-            await client.ConnectAsync(uri, password, cancellationToken);
-            return await client.SendCommandAsync(command, cancellationToken);
+            try
+            {
+                await client.ConnectAsync(uri, password, cancellationToken);
+                return await client.SendCommandAsync(command, cancellationToken);
+            }
+            finally
+            {
+                _rconLogMonitor.Detach(client);
+            }
         }
         catch
         {

@@ -135,6 +135,13 @@ internal sealed class RustRconClient : IRconClient
 
     public async ValueTask DisposeAsync()
     {
+        // Cancel all in-flight commands immediately rather than waiting for their 10s timeouts.
+        foreach (var kv in _pending)
+        {
+            kv.Value.TrySetCanceled();
+        }
+        _pending.Clear();
+
         try
         {
             _receiveCts?.Cancel();

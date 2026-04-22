@@ -17,6 +17,11 @@ internal sealed class RconRollingLogMonitor
         client.UnsolicitedMessage += OnMessage;
     }
 
+    public void Detach(IRconClient client)
+    {
+        client.UnsolicitedMessage -= OnMessage;
+    }
+
     public IReadOnlyList<string> Snapshot()
     {
         return _lines.ToArray();

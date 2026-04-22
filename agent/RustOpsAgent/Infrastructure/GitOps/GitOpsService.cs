@@ -10,7 +10,7 @@ internal sealed class GitOpsService : IGitOpsService
     public GitOpsService(GitOpsSettings settings)
     {
         _settings = settings;
-        _settings.PushBranchPrefix = "agent/";
+        // PushBranchPrefix is validated upstream in ConfigLoader and Program.cs — do not mutate here.
     }
 
     public async Task<string> EnsureAgentBranchAsync(string slug, CancellationToken cancellationToken)
@@ -46,7 +46,36 @@ internal sealed class GitOpsService : IGitOpsService
         }
 
         var cmd = $"pr create --base {_settings.BaseBranch} --head {branchName} --title \"{Escape(title)}\" --body \"{Escape(body)}\"";
-        return await RunGitAsync(cmd, cancellationToken);
+        return await RunGhAsync(cmd, cancellationToken);
+    }
+
+    private async Task<string> RunGhAsync(string args, CancellationToken cancellationToken)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "gh",
+            Arguments = args,
+            WorkingDirectory = _settings.RepoPath,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch git process.");
+        var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        var stdErrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        await process.WaitForExitAsync(cancellationToken);
+
+        var stdOut = await stdOutTask;
+        var stdErr = await stdErrTask;
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"gh {args} failed: {stdErr}");
+        }
+
+        return string.IsNullOrWhiteSpace(stdOut) ? "ok" : stdOut.Trim();
     }
 
     private async Task<string> RunGitAsync(string args, CancellationToken cancellationToken)

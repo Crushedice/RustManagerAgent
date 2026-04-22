@@ -2,6 +2,7 @@ using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
 using RustOpsAgent.Infrastructure;
+using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
 
 namespace RustOpsAgent.Core;
@@ -14,6 +15,7 @@ internal sealed class AgentRuntime
     private readonly IResponseComposer _composer;
     private readonly NeoCortexStore _neoCortex;
     private readonly LegacyAgentStateStore _legacyState;
+    private readonly IGitOpsService _gitOps;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -22,7 +24,8 @@ internal sealed class AgentRuntime
         IActionExecutor executor,
         IResponseComposer composer,
         NeoCortexStore neoCortex,
-        LegacyAgentStateStore legacyState)
+        LegacyAgentStateStore legacyState,
+        IGitOpsService gitOps)
     {
         _config = config;
         _classifier = classifier;
@@ -30,6 +33,7 @@ internal sealed class AgentRuntime
         _composer = composer;
         _neoCortex = neoCortex;
         _legacyState = legacyState;
+        _gitOps = gitOps;
     }
 
     public void RequestStop() => _stop = true;
@@ -56,7 +60,8 @@ internal sealed class AgentRuntime
 
         foreach (var file in EnumerateInboxFiles(_config.Inbox.FeedbackInboxPath))
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (_stop || cancellationToken.IsCancellationRequested)
+                return;
             try
             {
                 var payload = JsonSerializer.Deserialize<FeedbackInboxItem>(File.ReadAllText(file), JsonDefaults.Default);
@@ -115,7 +120,8 @@ internal sealed class AgentRuntime
 
         foreach (var file in EnumerateInboxFiles(_config.Inbox.DecisionInboxPath))
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (_stop || cancellationToken.IsCancellationRequested)
+                return;
             try
             {
                 var payload = JsonSerializer.Deserialize<DecisionInboxItem>(File.ReadAllText(file), JsonDefaults.Default);
@@ -152,7 +158,8 @@ internal sealed class AgentRuntime
 
         foreach (var file in EnumerateInboxFiles(_config.Inbox.ChatInboxPath))
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            if (_stop || cancellationToken.IsCancellationRequested)
+                return;
 
             ChatInboxItem? item = null;
             try
@@ -208,7 +215,7 @@ internal sealed class AgentRuntime
 
                 if (!result.Success)
                 {
-                    await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
+                    var incident = new EvolutionIncidentRecord
                     {
                         Request = item.Message,
                         IntendedOutcome = route.Intent.ToString(),
@@ -218,9 +225,14 @@ internal sealed class AgentRuntime
                         Classification = result.ErrorCode ?? "execution_failure",
                         Timestamp = DateTime.UtcNow,
                         Resolved = false
-                    }, cancellationToken);
-
+                    };
+                    await _neoCortex.RecordIncidentAsync(incident, cancellationToken);
                     _legacyState.RecordIncident(result.SelectedServer ?? route.Slots.ServerName, result.ErrorCode ?? "execution_failure", result.Message);
+
+                    if (_config.GitOps.Enabled && _config.GitOps.AllowPush)
+                    {
+                        _ = TryProposeIncidentBranchAsync(incident, cancellationToken);
+                    }
                 }
 
                 WriteOutbox(item.AdminId, reply, actionId, result.SelectedServer ?? route.Slots.ServerName);
@@ -247,6 +259,24 @@ internal sealed class AgentRuntime
             {
                 TryDelete(file);
             }
+        }
+    }
+
+    private async Task TryProposeIncidentBranchAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var slug = $"incident-{incident.Classification}";
+            var branch = await _gitOps.EnsureAgentBranchAsync(slug, cancellationToken);
+            var title = $"[agent] Incident: {incident.Classification}";
+            var body = $"Request: {incident.Request}\nFailure: {incident.FailureReason}\nMissing: {incident.MissingCapability}\nPrevention: {incident.RecurrencePrevention}";
+            await _gitOps.CommitAsync($"incident: record {incident.Id}", cancellationToken);
+            await _gitOps.PushAsync(branch, cancellationToken);
+            await _gitOps.CreatePrAsync(branch, title, body, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _legacyState.RecordAgentError($"GitOps incident PR failed: {ex.Message}");
         }
     }
 

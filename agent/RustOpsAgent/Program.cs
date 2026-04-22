@@ -60,9 +60,9 @@ if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.Or
     throw new InvalidOperationException("gitOps.pushBranchPrefix must be agent/ to satisfy branch safety policy.");
 }
 
-_ = new GitOpsService(config.GitOps);
+var gitOps = new GitOpsService(config.GitOps);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps);
 
 Console.CancelKeyPress += (_, e) =>
 {

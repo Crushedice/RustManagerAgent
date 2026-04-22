@@ -138,7 +138,8 @@ Admin message:
     private static bool ShouldUseLastServer(string message)
     {
         var lowered = message.ToLowerInvariant();
-        return lowered.Contains("that one") || lowered.Contains("again") || lowered.Contains("it ") || lowered.Contains("same");
+        // "it " alone is too broad — matches almost any sentence. Use explicit operational references only.
+        return lowered.Contains("that one") || lowered.Contains("again") || lowered.Contains("same");
     }
 
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch
