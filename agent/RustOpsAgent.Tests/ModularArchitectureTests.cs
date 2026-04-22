@@ -41,6 +41,26 @@ public class ModularArchitectureTests
     }
 
     [Fact]
+    public void NeoCortex_Migration_Does_Not_Overwrite_Existing_Files_When_Marker_Is_Missing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
+        var neoRoot = Path.Combine(root, "NeoCortex");
+        var legacy = Path.Combine(root, "legacy-state.json");
+        var operationsDir = Path.Combine(neoRoot, "operations");
+        var operationsPath = Path.Combine(operationsDir, "active-state.json");
+        Directory.CreateDirectory(operationsDir);
+        File.WriteAllText(legacy, "{}");
+        File.WriteAllText(operationsPath, """{"runtimeStatus":{"llmEnabled":true,"llmProvider":"preserve"},"recentActions":[]}""");
+
+        var store = new NeoCortexStore(neoRoot, legacy);
+        store.EnsureMigrated();
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(operationsPath));
+        Assert.True(doc.RootElement.TryGetProperty("runtimeStatus", out var runtimeStatus));
+        Assert.Equal("preserve", runtimeStatus.GetProperty("llmProvider").GetString());
+    }
+
+    [Fact]
     public void ToolRegistry_Filters_By_Intent()
     {
         using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
@@ -67,6 +87,36 @@ public class ModularArchitectureTests
         var eligible = registry.ResolveEligible(route);
         Assert.Contains(eligible, h => h.Name == "rust.server.control");
         Assert.DoesNotContain(eligible, h => h.Name == "rust.status.check");
+    }
+
+    [Fact]
+    public void ToolRegistry_Uses_TargetRef_For_Diagnostics()
+    {
+        using var api = new RustOpsApiClient(new ApiSettings { BaseUrl = "http://localhost:2077", ApiKey = "x" });
+        var tempRoot = Path.Combine(Path.GetTempPath(), "neo-" + Guid.NewGuid().ToString("N"));
+        var neo = new NeoCortexStore(Path.Combine(tempRoot, "NeoCortex"), Path.Combine(tempRoot, "legacy.json"));
+        neo.EnsureMigrated();
+
+        var handlers = new IToolHandler[]
+        {
+            new RustStatusToolHandler(api),
+            new RustLogsToolHandler(api, neo),
+            new RustPluginToolHandler(api),
+            new RustNetworkToolHandler(api)
+        };
+
+        var registry = new ToolRegistry(handlers);
+        var route = new AdminIntentRoute(
+            AdminIntentType.Troubleshooting,
+            new AdminIntentSlots("alpha", null, null, null, null),
+            0.9,
+            false,
+            null,
+            "rust.network.inspect");
+
+        var selected = registry.ResolveSingle(new ToolExecutionContext("admin", "check alpha", route, new ConversationSelectionState(), DateTime.UtcNow));
+        Assert.NotNull(selected);
+        Assert.Equal("rust.network.inspect", selected!.Name);
     }
 
     [Fact]
@@ -112,5 +162,53 @@ public class ModularArchitectureTests
         Assert.Equal(1, actions.GetArrayLength());
         Assert.True(doc.RootElement.TryGetProperty("servers", out var servers));
         Assert.Equal(1, servers.GetArrayLength());
+    }
+
+    [Fact]
+    public void LegacyStateStore_Does_Not_Write_Deprecated_SelfRepair_Schema()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "legacy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var statePath = Path.Combine(root, "agent-state.json");
+        var store = new LegacyAgentStateStore(statePath);
+        store.RecordFeedback("42", "a-1", "good", "nice", "alpha");
+        store.Save();
+
+        using var doc = JsonDocument.Parse(File.ReadAllText(statePath));
+        Assert.False(doc.RootElement.TryGetProperty("llmInteractions", out _));
+        Assert.False(doc.RootElement.TryGetProperty("capabilityGaps", out _));
+        Assert.False(doc.RootElement.TryGetProperty("selfRepairHistory", out _));
+    }
+
+    [Fact]
+    public async Task ActionExecutor_Returns_Explicit_NotImplemented_For_FileEdit()
+    {
+        var registry = new ToolRegistry(new IToolHandler[] { new RustChatToolHandler() });
+        var executor = new ActionExecutor(registry);
+        var route = new AdminIntentRoute(
+            AdminIntentType.FileEdit,
+            new AdminIntentSlots(null, null, null, null, null),
+            0.9,
+            false,
+            null,
+            null);
+
+        var result = await executor.ExecuteAsync(
+            new ToolExecutionContext("admin", "edit server.cfg", route, new ConversationSelectionState(), DateTime.UtcNow),
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.Equal("not_implemented", result.ErrorCode);
+    }
+
+    [Fact]
+    public async Task Classifier_Does_Not_Recycle_Last_Server_For_Generic_It_Phrasing()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null);
+        var state = new ConversationSelectionState { AdminId = "admin", LastServerName = "alpha" };
+
+        var route = await classifier.ClassifyAsync("what is it doing now", state, CancellationToken.None);
+
+        Assert.Null(route.Slots.ServerName);
     }
 }

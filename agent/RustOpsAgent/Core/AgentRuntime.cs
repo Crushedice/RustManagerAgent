@@ -64,7 +64,7 @@ internal sealed class AgentRuntime
                 return;
             try
             {
-                var payload = JsonSerializer.Deserialize<FeedbackInboxItem>(File.ReadAllText(file), JsonDefaults.Default);
+                var payload = JsonSerializer.Deserialize<FeedbackInboxItem>(await File.ReadAllTextAsync(file, cancellationToken), JsonDefaults.Default);
                 if (payload is null)
                 {
                     continue;
@@ -124,7 +124,7 @@ internal sealed class AgentRuntime
                 return;
             try
             {
-                var payload = JsonSerializer.Deserialize<DecisionInboxItem>(File.ReadAllText(file), JsonDefaults.Default);
+                var payload = JsonSerializer.Deserialize<DecisionInboxItem>(await File.ReadAllTextAsync(file, cancellationToken), JsonDefaults.Default);
                 if (payload is null)
                 {
                     continue;

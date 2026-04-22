@@ -27,6 +27,9 @@ intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
 intent enum:
 chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification
 
+targetRef enum:
+rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply
+
 slots object keys:
 serverName, playerName, commandText, timeRange, severity
 
@@ -60,6 +63,7 @@ Admin message:
         {
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
+            var lowered = message.ToLowerInvariant();
             var intentText = root.TryGetProperty("intent", out var intentNode) ? intentNode.GetString() ?? "clarification" : "clarification";
             var intent = ParseIntent(intentText);
             var confidence = root.TryGetProperty("confidence", out var confidenceNode) && confidenceNode.ValueKind == JsonValueKind.Number
@@ -88,6 +92,8 @@ Admin message:
             {
                 serverName = state.LastServerName;
             }
+
+            targetRef = NormalizeTargetRef(targetRef) ?? InferTargetRef(intent, lowered);
 
             return new AdminIntentRoute(
                 intent,
@@ -125,6 +131,7 @@ Admin message:
             intent = AdminIntentType.Chat;
 
         var serverName = ShouldUseLastServer(message) ? state.LastServerName : null;
+        var targetRef = InferTargetRef(intent, lowered);
 
         return new AdminIntentRoute(
             intent,
@@ -132,14 +139,75 @@ Admin message:
             0.4,
             false,
             null,
-            null);
+            targetRef);
     }
 
     private static bool ShouldUseLastServer(string message)
     {
         var lowered = message.ToLowerInvariant();
-        // "it " alone is too broad — matches almost any sentence. Use explicit operational references only.
-        return lowered.Contains("that one") || lowered.Contains("again") || lowered.Contains("same");
+        // Only reuse the last server for explicit follow-up phrasing, not generic uses of "it" or "same".
+        return lowered.Contains("that one") ||
+               lowered.Contains("same server") ||
+               lowered.Contains("same one") ||
+               lowered.Contains("again") ||
+               lowered.Contains("restart it") ||
+               lowered.Contains("stop it") ||
+               lowered.Contains("start it") ||
+               lowered.Contains("kill it") ||
+               lowered.Contains("update it") ||
+               lowered.Contains("check it");
+    }
+
+    private static string? InferTargetRef(AdminIntentType intent, string loweredMessage) =>
+        intent switch
+        {
+            AdminIntentType.ServerControl => "rust.server.control",
+            AdminIntentType.PlayerLookup => "rust.player.lookup",
+            AdminIntentType.RconCommand => "rust.rcon.command",
+            AdminIntentType.Chat or AdminIntentType.Clarification => "rust.chat.reply",
+            AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
+            _ => null
+        };
+
+    private static string InferDiagnosticsTarget(string loweredMessage)
+    {
+        if (loweredMessage.Contains("network") || loweredMessage.Contains("latency") || loweredMessage.Contains("throughput") || loweredMessage.Contains("eth0") || loweredMessage.Contains("wg1") || loweredMessage.Contains("wt1"))
+        {
+            return "rust.network.inspect";
+        }
+
+        if (loweredMessage.Contains("plugin") || loweredMessage.Contains("umod") || loweredMessage.Contains("oxide"))
+        {
+            return "rust.plugins.verify";
+        }
+
+        if (loweredMessage.Contains("log") || loweredMessage.Contains("error") || loweredMessage.Contains("exception") || loweredMessage.Contains("fail"))
+        {
+            return "rust.logs.inspect";
+        }
+
+        return "rust.status.check";
+    }
+
+    private static string? NormalizeTargetRef(string? targetRef)
+    {
+        if (string.IsNullOrWhiteSpace(targetRef))
+        {
+            return null;
+        }
+
+        return targetRef.Trim().ToLowerInvariant() switch
+        {
+            "network" or "network.inspect" => "rust.network.inspect",
+            "plugins" or "plugins.verify" or "plugin" => "rust.plugins.verify",
+            "logs" or "logs.inspect" => "rust.logs.inspect",
+            "status" or "status.check" => "rust.status.check",
+            "server_control" => "rust.server.control",
+            "player_lookup" => "rust.player.lookup",
+            "rcon_command" => "rust.rcon.command",
+            "chat" or "clarification" => "rust.chat.reply",
+            _ => targetRef
+        };
     }
 
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch

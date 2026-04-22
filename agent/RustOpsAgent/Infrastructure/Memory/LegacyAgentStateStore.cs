@@ -126,9 +126,6 @@ internal sealed class LegacyAgentState
     public List<LegacyPendingActionEntry> PendingActions { get; set; } = new();
     public List<LegacyFeedbackEntry> FeedbackHistory { get; set; } = new();
     public List<string> AgentErrors { get; set; } = new();
-    public List<LegacyLlmInteractionEntry> LlmInteractions { get; set; } = new();
-    public List<LegacyCapabilityGapEntry> CapabilityGaps { get; set; } = new();
-    public List<LegacySelfRepairHistoryEntry> SelfRepairHistory { get; set; } = new();
 }
 
 internal sealed class LegacyRuntimeStatus
@@ -185,32 +182,4 @@ internal sealed class LegacyFeedbackEntry
     public string? ActionId { get; set; }
     public string? Verdict { get; set; }
     public string? Note { get; set; }
-}
-
-internal sealed class LegacyLlmInteractionEntry
-{
-    public DateTime AtUtc { get; set; } = DateTime.UtcNow;
-    public string? Type { get; set; }
-    public string? Model { get; set; }
-    public bool Success { get; set; }
-    public string? Context { get; set; }
-    public string? ResponsePreview { get; set; }
-}
-
-internal sealed class LegacyCapabilityGapEntry
-{
-    public string? Category { get; set; }
-    public string? Description { get; set; }
-    public int Count { get; set; } = 1;
-    public DateTime? FirstObservedAtUtc { get; set; }
-    public DateTime? LastObservedAtUtc { get; set; }
-}
-
-internal sealed class LegacySelfRepairHistoryEntry
-{
-    public DateTime AtUtc { get; set; } = DateTime.UtcNow;
-    public string? Summary { get; set; }
-    public int AppliedActions { get; set; }
-    public int RejectedActions { get; set; }
-    public string? RawModelReasoning { get; set; }
 }

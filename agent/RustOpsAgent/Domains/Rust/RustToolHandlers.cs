@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
@@ -102,7 +103,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 internal sealed class RustRconToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
-    private readonly RconRollingLogMonitor _rconLogMonitor = new();
+    private readonly ConcurrentDictionary<string, PersistentRconSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
 
     public RustRconToolHandler(RustOpsApiClient api)
     {
@@ -175,46 +176,73 @@ internal sealed class RustRconToolHandler : IToolHandler
     {
         try
         {
-            var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
-            var configPath = Path.Combine(configRoot, $"{server}.json");
-            if (!File.Exists(configPath))
+            var connection = LoadRconConnection(server);
+            if (connection is null)
             {
                 return null;
             }
 
-            using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
-            var root = cfg.RootElement;
-            var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
-                ? portNode.GetInt32()
-                : 0;
-            var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
-                ? passwordNode.GetString()
-                : null;
-
-            if (port <= 0 || string.IsNullOrWhiteSpace(password))
-            {
-                return null;
-            }
-
-            var encodedPassword = Uri.EscapeDataString(password);
-            var uri = new Uri($"ws://127.0.0.1:{port}/{encodedPassword}");
-
-            await using IRconClient client = new RustRconClient();
-            _rconLogMonitor.Attach(client);
-            try
-            {
-                await client.ConnectAsync(uri, password, cancellationToken);
-                return await client.SendCommandAsync(command, cancellationToken);
-            }
-            finally
-            {
-                _rconLogMonitor.Detach(client);
-            }
+            var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
+            return await session.SendCommandAsync(command, cancellationToken);
         }
         catch
         {
             return null;
         }
+    }
+
+    private PersistentRconSession GetOrCreateSession(string server, Uri uri, string password)
+    {
+        while (true)
+        {
+            if (_sessions.TryGetValue(server, out var existing))
+            {
+                if (existing.Matches(uri, password))
+                {
+                    return existing;
+                }
+
+                if (_sessions.TryRemove(server, out var stale))
+                {
+                    _ = stale.DisposeAsync().AsTask();
+                }
+            }
+
+            var created = new PersistentRconSession(uri, password);
+            if (_sessions.TryAdd(server, created))
+            {
+                return created;
+            }
+
+            _ = created.DisposeAsync().AsTask();
+        }
+    }
+
+    private static (Uri Uri, string Password)? LoadRconConnection(string server)
+    {
+        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
+        var configPath = Path.Combine(configRoot, $"{server}.json");
+        if (!File.Exists(configPath))
+        {
+            return null;
+        }
+
+        using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
+        var root = cfg.RootElement;
+        var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
+            ? portNode.GetInt32()
+            : 0;
+        var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
+            ? passwordNode.GetString()
+            : null;
+
+        if (port <= 0 || string.IsNullOrWhiteSpace(password))
+        {
+            return null;
+        }
+
+        var encodedPassword = Uri.EscapeDataString(password);
+        return (new Uri($"ws://127.0.0.1:{port}/{encodedPassword}"), password);
     }
 }
 
@@ -319,9 +347,10 @@ internal sealed class RustLogsToolHandler : IToolHandler
 
     private static int ScoreImportance(string line, IEnumerable<string> dynamicRules)
     {
-        if (line.Contains("exception") || line.Contains("failed") || line.Contains("error")) return 3;
-        if (line.Contains("warn") || line.Contains("disconnect")) return 2;
-        if (dynamicRules.Any(rule => line.Contains(rule, StringComparison.OrdinalIgnoreCase))) return 2;
+        var normalizedLine = line.ToLowerInvariant();
+        if (normalizedLine.Contains("exception") || normalizedLine.Contains("failed") || normalizedLine.Contains("error")) return 3;
+        if (normalizedLine.Contains("warn") || normalizedLine.Contains("disconnect")) return 2;
+        if (dynamicRules.Any(rule => normalizedLine.Contains(rule, StringComparison.OrdinalIgnoreCase))) return 2;
         return 1;
     }
 }
@@ -492,6 +521,15 @@ internal static class RustToolHelper
     private static bool ShouldUseLastServer(string message)
     {
         var lowered = message.ToLowerInvariant();
-        return lowered.Contains("that one") || lowered.Contains("same server") || lowered.Contains("again") || lowered.Contains("it ");
+        return lowered.Contains("that one") ||
+               lowered.Contains("same server") ||
+               lowered.Contains("same one") ||
+               lowered.Contains("again") ||
+               lowered.Contains("restart it") ||
+               lowered.Contains("stop it") ||
+               lowered.Contains("start it") ||
+               lowered.Contains("kill it") ||
+               lowered.Contains("update it") ||
+               lowered.Contains("check it");
     }
 }

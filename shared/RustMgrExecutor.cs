@@ -219,7 +219,7 @@ internal sealed class RustMgrExecutor
         };
     }
 
-    public async Task<bool?> WaitForExpectedServerStateAsync(string server, string operation, int attempts = 5, int delaySeconds = 2)
+    public async Task<bool?> WaitForExpectedServerStateAsync(string server, string operation)
     {
         var verification = await VerifyExpectedServerStateAsync(server, operation);
         return verification?.ReachedExpectedState;
