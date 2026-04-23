@@ -40,15 +40,26 @@ internal sealed class AgentRuntime
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
+        Console.WriteLine("[agent] Runtime started.");
+        var tick = 0;
         while (!_stop && !cancellationToken.IsCancellationRequested)
         {
             _legacyState.UpdateRuntimeStatus(_config.Llm);
             await ProcessFeedbackInboxAsync(cancellationToken);
             await ProcessDecisionInboxAsync(cancellationToken);
+
+            var chatFiles = Directory.Exists(_config.Inbox.ChatInboxPath)
+                ? Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").Length
+                : 0;
+            if (chatFiles > 0 || tick % 5 == 0)
+                Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
+
             await ProcessChatInboxAsync(cancellationToken);
             _legacyState.Save();
+            tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
         }
+        Console.WriteLine("[agent] Runtime stopped.");
     }
 
     private async Task ProcessFeedbackInboxAsync(CancellationToken cancellationToken)

@@ -27,6 +27,11 @@ Directory.CreateDirectory(config.Inbox.DecisionInboxPath);
 Directory.CreateDirectory(config.Inbox.FeedbackInboxPath);
 Directory.CreateDirectory(config.Outbox.MessageOutboxPath);
 
+Console.WriteLine($"[agent] Config loaded. API={config.Api.BaseUrl} LLM={config.Llm.Enabled}({config.Llm.Provider})");
+Console.WriteLine($"[agent] Paths: state={config.Memory.StatePath}");
+Console.WriteLine($"[agent] Paths: chat-inbox={config.Inbox.ChatInboxPath}");
+Console.WriteLine($"[agent] Paths: outbox={config.Outbox.MessageOutboxPath}");
+
 var neoCortex = new NeoCortexStore(config.Memory.NeoCortexRoot, config.Memory.StatePath);
 neoCortex.EnsureMigrated();
 var legacyState = new LegacyAgentStateStore(config.Memory.StatePath);
