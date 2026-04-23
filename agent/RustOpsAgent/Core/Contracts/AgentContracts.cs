@@ -27,7 +27,10 @@ internal sealed record AdminIntentRoute(
     double Confidence,
     bool NeedsClarification,
     string? ClarificationQuestion,
-    string? TargetRef);
+    string? TargetRef,
+    string ClassifierSource = "heuristic",
+    bool LlmAttempted = false,
+    bool LlmSucceeded = false);
 
 internal sealed record ToolExecutionContext(
     string AdminId,
@@ -43,6 +46,14 @@ internal sealed record ToolExecutionResult(
     bool MutatedState = false,
     string? ErrorCode = null,
     object? Payload = null);
+
+internal sealed record ComposedReply(
+    string Message,
+    string Type = "response-compose",
+    bool LlmAttempted = false,
+    bool LlmSucceeded = false,
+    string Source = "template",
+    string? ResponsePreview = null);
 
 internal sealed record ToolEligibilityRule(AdminIntentType Intent, string ToolName);
 
@@ -65,7 +76,7 @@ internal interface IActionExecutor
 
 internal interface IResponseComposer
 {
-    string Compose(ToolExecutionContext context, ToolExecutionResult result);
+    Task<ComposedReply> ComposeAsync(ToolExecutionContext context, ToolExecutionResult result, CancellationToken cancellationToken);
 }
 
 internal sealed class ConversationSelectionState

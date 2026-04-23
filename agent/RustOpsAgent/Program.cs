@@ -64,7 +64,7 @@ if (kernel is null)
 {
     config.Llm.Enabled = false;
 }
-var classifier = new AdminIntentClassifier(kernel);
+var classifier = new AdminIntentClassifier(kernel, config.Llm);
 using var apiClient = new RustOpsApiClient(config.Api);
 
 var handlers = new List<IToolHandler>
@@ -81,7 +81,7 @@ var handlers = new List<IToolHandler>
 
 var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry);
-var composer = new ResponseComposer();
+var composer = new ResponseComposer(kernel, config.Llm);
 
 if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
 {
@@ -90,7 +90,7 @@ if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.Or
 
 var gitOps = new GitOpsService(config.GitOps);
 
-var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps);
+var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, apiClient, kernel);
 
 Console.CancelKeyPress += (_, e) =>
 {

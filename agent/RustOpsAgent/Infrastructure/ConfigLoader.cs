@@ -47,23 +47,40 @@ internal static class ConfigLoader
         config.Outbox.MessageOutboxPath = RustOpsEnv.ResolvePlaceholders(config.Outbox.MessageOutboxPath);
 
         config.Llm.Provider =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_PROVIDER")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_PROVIDER", "RUSTOPS_OLLAMA_PROVIDER")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Provider);
+        config.Llm.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_ENABLED",
+                RustOpsEnv.GetBoolean("RUSTOPS_OLLAMA_ENABLED", config.Llm.Enabled));
         config.Llm.BaseUrl =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_BASE_URL")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_BASE_URL", "RUSTOPS_OLLAMA_BASE_URL")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.BaseUrl);
         config.Llm.Model =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_MODEL")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_MODEL", "RUSTOPS_OLLAMA_MODEL")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.Model);
         config.Llm.ApiKey =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_API_KEY")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_API_KEY", "RUSTOPS_OLLAMA_API_KEY")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ApiKey ?? string.Empty);
         config.Llm.HttpReferer =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_HTTP_REFERER")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_HTTP_REFERER", "RUSTOPS_OLLAMA_HTTP_REFERER")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.HttpReferer ?? string.Empty);
         config.Llm.AppTitle =
-            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_APP_TITLE")
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_APP_TITLE", "RUSTOPS_OLLAMA_APP_TITLE")
             ?? RustOpsEnv.ResolvePlaceholders(config.Llm.AppTitle ?? string.Empty);
+        config.Llm.UseForRecommendations =
+            RustOpsEnv.GetBoolean(
+                "RUSTOPS_LLM_USE_FOR_RECOMMENDATIONS",
+                RustOpsEnv.GetBoolean("RUSTOPS_OLLAMA_USE_FOR_RECOMMENDATIONS", config.Llm.UseForRecommendations));
+        config.Llm.RequestStrategy =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_REQUEST_STRATEGY", "RUSTOPS_OLLAMA_REQUEST_STRATEGY")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Llm.RequestStrategy ?? string.Empty);
+        config.Llm.UseChatSystemPrompt =
+            RustOpsEnv.GetBoolean(
+                "RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT",
+                RustOpsEnv.GetBoolean("RUSTOPS_OLLAMA_USE_CHAT_SYSTEM_PROMPT", config.Llm.UseChatSystemPrompt));
+        config.Llm.ChatSystemPrompt =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_CHAT_SYSTEM_PROMPT", "RUSTOPS_OLLAMA_CHAT_SYSTEM_PROMPT")
+            ?? RustOpsEnv.ResolvePlaceholders(config.Llm.ChatSystemPrompt ?? string.Empty);
 
         config.Memory.StatePath = ResolvePath(config.Memory.StatePath, root);
         config.Memory.NeoCortexRoot = ResolvePath(config.Memory.NeoCortexRoot, root);

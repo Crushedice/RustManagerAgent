@@ -1,6 +1,8 @@
+using Microsoft.SemanticKernel;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
+using RustOpsAgent.Domains.Rust;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.GitOps;
 using RustOpsAgent.Infrastructure.Memory;
@@ -16,6 +18,11 @@ internal sealed class AgentRuntime
     private readonly NeoCortexStore _neoCortex;
     private readonly LegacyAgentStateStore _legacyState;
     private readonly IGitOpsService _gitOps;
+    private readonly RustOpsApiClient _api;
+    private readonly Kernel? _kernel;
+    private readonly Dictionary<string, long> _logOffsets = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
+    private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -25,7 +32,9 @@ internal sealed class AgentRuntime
         IResponseComposer composer,
         NeoCortexStore neoCortex,
         LegacyAgentStateStore legacyState,
-        IGitOpsService gitOps)
+        IGitOpsService gitOps,
+        RustOpsApiClient api,
+        Kernel? kernel)
     {
         _config = config;
         _classifier = classifier;
@@ -34,6 +43,8 @@ internal sealed class AgentRuntime
         _neoCortex = neoCortex;
         _legacyState = legacyState;
         _gitOps = gitOps;
+        _api = api;
+        _kernel = kernel;
     }
 
     public void RequestStop() => _stop = true;
@@ -55,6 +66,7 @@ internal sealed class AgentRuntime
                 Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
 
             await ProcessChatInboxAsync(cancellationToken);
+            await ObserveServersAsync(cancellationToken);
             _legacyState.Save();
             tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
@@ -204,9 +216,18 @@ internal sealed class AgentRuntime
                 }
 
                 var route = await _classifier.ClassifyAsync(item.Message, state, cancellationToken);
+                RecordIntentRoutingInteraction(item.Message, route);
                 var context = new ToolExecutionContext(item.AdminId, item.Message, route, state, DateTime.UtcNow);
                 var result = await _executor.ExecuteAsync(context, cancellationToken);
-                var reply = _composer.Compose(context, result);
+                var composedReply = await _composer.ComposeAsync(context, result, cancellationToken);
+                RecordLlmInteraction(
+                    composedReply.Type,
+                    composedReply.LlmAttempted,
+                    composedReply.LlmSucceeded,
+                    item.Message,
+                    composedReply.ResponsePreview ?? composedReply.Message,
+                    composedReply.Source);
+                var reply = composedReply.Message;
 
                 UpdateSelectionState(state, route, result);
                 _neoCortex.SaveSelection(selection);
@@ -216,6 +237,7 @@ internal sealed class AgentRuntime
                 {
                     LlmEnabled = _config.Llm.Enabled,
                     LlmProvider = _config.Llm.Provider,
+                    LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
                     UpdatedAtUtc = DateTime.UtcNow
                 };
                 operations.RecentActions.Add(new ActionRecord
@@ -296,6 +318,343 @@ internal sealed class AgentRuntime
             }
         }
     }
+
+    private void RecordIntentRoutingInteraction(string message, AdminIntentRoute route)
+    {
+        RecordLlmInteraction(
+            route.LlmAttempted ? "intent-routing" : "intent-routing-fallback",
+            route.LlmAttempted,
+            route.LlmSucceeded,
+            message,
+            $"intent={route.Intent} target={route.TargetRef ?? "n/a"} source={route.ClassifierSource}",
+            route.ClassifierSource);
+    }
+
+    private async Task ObserveServersAsync(CancellationToken cancellationToken)
+    {
+        var interval = TimeSpan.FromSeconds(Math.Max(5, _config.Monitor.PollSeconds));
+        if (DateTime.UtcNow - _lastObservationAtUtc < interval)
+        {
+            return;
+        }
+
+        _lastObservationAtUtc = DateTime.UtcNow;
+
+        List<string> servers;
+        try
+        {
+            using var list = await _api.GetAsync("/servers", cancellationToken);
+            servers = list.RootElement.ValueKind == JsonValueKind.Array
+                ? list.RootElement.EnumerateArray()
+                    .Where(node => node.ValueKind == JsonValueKind.String)
+                    .Select(node => node.GetString())
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Select(name => name!)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList()
+                : new List<string>();
+        }
+        catch (Exception ex)
+        {
+            _legacyState.RecordAgentError($"server observation failed: {ex.Message}");
+            return;
+        }
+
+        foreach (var server in servers)
+        {
+            if (_stop || cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            try
+            {
+                await ObserveServerHealthAsync(server, cancellationToken);
+                await ObserveServerLogsAsync(server, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _legacyState.RecordAgentError($"observation failed for {server}: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task ObserveServerHealthAsync(string server, CancellationToken cancellationToken)
+    {
+        using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
+        var root = health.RootElement;
+        var state = ReadHealthState(root);
+        var recentErrors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
+            ? errorsNode.EnumerateArray().Select(item => item.ToString()).Where(item => !string.IsNullOrWhiteSpace(item)).Take(3).ToList()
+            : new List<string>();
+
+        if (recentErrors.Count == 0)
+        {
+            return;
+        }
+
+        var fingerprint = $"{state}|{string.Join("|", recentErrors)}";
+        if (_observationFingerprints.TryGetValue($"{server}:health", out var previous) &&
+            string.Equals(previous, fingerprint, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _observationFingerprints[$"{server}:health"] = fingerprint;
+        var analysis = await AnalyzeObservationWithLlmAsync(server, state, recentErrors, cancellationToken);
+        RecordLlmInteraction(
+            "observation-analysis",
+            analysis.LlmAttempted,
+            analysis.LlmSucceeded,
+            $"{server} health observation",
+            analysis.Summary,
+            analysis.Source);
+        var summary = analysis.Summary;
+        _legacyState.RecordIncident(server, "health_observation", summary);
+        await _neoCortex.RecordIncidentAsync(new EvolutionIncidentRecord
+        {
+            Request = $"observe health {server}",
+            IntendedOutcome = "continuous_observation",
+            FailureReason = summary,
+            MissingCapability = analysis.MissingCapability,
+            RecurrencePrevention = analysis.RecurrencePrevention,
+            Classification = analysis.Classification,
+            Timestamp = DateTime.UtcNow,
+            Resolved = false
+        }, cancellationToken);
+    }
+
+    private async Task ObserveServerLogsAsync(string server, CancellationToken cancellationToken)
+    {
+        _logOffsets.TryGetValue(server, out var offset);
+        var path = $"/servers/{Uri.EscapeDataString(server)}/logs/read?offset={offset}&maxBytes=65536";
+        using var logs = await _api.GetAsync(path, cancellationToken);
+        var root = logs.RootElement;
+
+        if (root.TryGetProperty("endOffset", out var endOffsetNode) && endOffsetNode.ValueKind == JsonValueKind.Number)
+        {
+            _logOffsets[server] = endOffsetNode.GetInt64();
+        }
+
+        var knowledge = _neoCortex.LoadLogs();
+        var changed = false;
+        if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in entriesNode.EnumerateArray())
+            {
+                var line = entry.TryGetProperty("message", out var messageNode) ? messageNode.GetString() ?? string.Empty : string.Empty;
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                var lowered = line.ToLowerInvariant();
+                if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
+                {
+                    continue;
+                }
+
+                var importance = ScoreImportance(lowered, knowledge.ImportanceRules);
+                knowledge.RecentEntries.Add(new LogObservation
+                {
+                    ServerName = server,
+                    Line = line,
+                    Importance = importance,
+                    CapturedAtUtc = DateTime.UtcNow
+                });
+                changed = true;
+            }
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
+        _neoCortex.SaveLogs(knowledge);
+    }
+
+    private static string ReadHealthState(JsonElement root)
+    {
+        if (root.TryGetProperty("status", out var statusNode) &&
+            statusNode.ValueKind == JsonValueKind.Object &&
+            statusNode.TryGetProperty("state", out var nestedState))
+        {
+            return nestedState.GetString() ?? "unknown";
+        }
+
+        return root.TryGetProperty("state", out var stateNode)
+            ? stateNode.GetString() ?? "unknown"
+            : "unknown";
+    }
+
+    private static int ScoreImportance(string line, IEnumerable<string> dynamicRules)
+    {
+        if (line.Contains("exception") || line.Contains("failed") || line.Contains("error"))
+        {
+            return 3;
+        }
+
+        if (line.Contains("warn") || line.Contains("disconnect"))
+        {
+            return 2;
+        }
+
+        return dynamicRules.Any(rule => line.Contains(rule, StringComparison.OrdinalIgnoreCase)) ? 2 : 1;
+    }
+
+    private static string TrimSingleLine(string input, int maxLength)
+    {
+        var singleLine = input.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return singleLine.Length <= maxLength
+            ? singleLine
+            : $"{singleLine[..Math.Max(0, maxLength - 3)]}...";
+    }
+
+    private void RecordLlmInteraction(string type, bool llmAttempted, bool llmSucceeded, string? context, string? responsePreview, string? source)
+    {
+        var operations = _neoCortex.LoadOperations();
+        operations.LlmInteractions.Add(new LlmInteractionRecord
+        {
+            AtUtc = DateTime.UtcNow,
+            Type = type,
+            Model = llmAttempted ? _config.Llm.Model : null,
+            Success = llmSucceeded,
+            Context = TrimSingleLine(context ?? string.Empty, 180),
+            ResponsePreview = TrimSingleLine($"{responsePreview ?? string.Empty} {(string.IsNullOrWhiteSpace(source) ? string.Empty : $"[{source}]")}".Trim(), 220)
+        });
+        operations.LlmInteractions = operations.LlmInteractions
+            .OrderByDescending(item => item.AtUtc)
+            .Take(80)
+            .ToList();
+        operations.RuntimeStatus ??= new RuntimeStatus();
+        operations.RuntimeStatus.LlmEnabled = _config.Llm.Enabled;
+        operations.RuntimeStatus.LlmProvider = _config.Llm.Provider;
+        operations.RuntimeStatus.LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc;
+        operations.RuntimeStatus.UpdatedAtUtc = DateTime.UtcNow;
+        _neoCortex.SaveOperations(operations);
+    }
+
+    private async Task<ObservationAnalysis> AnalyzeObservationWithLlmAsync(
+        string server,
+        string state,
+        IReadOnlyList<string> recentErrors,
+        CancellationToken cancellationToken)
+    {
+        var fallbackSummary = $"{server} is {state}. Recent errors: {string.Join(" | ", recentErrors)}";
+        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+        {
+            return new ObservationAnalysis(
+                fallbackSummary,
+                "health_observation",
+                "health_issue_detected",
+                "Review recent errors and server health details.",
+                false,
+                false,
+                _kernel is null ? "template_no_kernel" : "template_llm_disabled");
+        }
+
+        var prompt = $$"""
+You are analyzing Rust server health events for recurring operational issues.
+Return strict JSON only with keys:
+summary, classification, missingCapability, recurrencePrevention
+
+Constraints:
+- classification: short snake_case (2-5 words)
+- missingCapability: short snake_case (2-5 words)
+- summary: one sentence
+- recurrencePrevention: one sentence with concrete operator action
+- do not invent data
+
+Server: {{server}}
+State: {{state}}
+RecentErrors:
+{{string.Join("\n", recentErrors)}}
+""";
+
+        try
+        {
+            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var raw = response.GetValue<string>() ?? string.Empty;
+            var json = TryExtractJson(raw);
+            if (string.IsNullOrWhiteSpace(json))
+            {
+                return new ObservationAnalysis(
+                    fallbackSummary,
+                    "health_observation",
+                    "health_issue_detected",
+                    "Review recent errors and server health details.",
+                    true,
+                    false,
+                    "llm_parse_failure");
+            }
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            var summary = root.TryGetProperty("summary", out var summaryNode) ? summaryNode.GetString() : null;
+            var classification = root.TryGetProperty("classification", out var classNode) ? classNode.GetString() : null;
+            var missing = root.TryGetProperty("missingCapability", out var missingNode) ? missingNode.GetString() : null;
+            var prevention = root.TryGetProperty("recurrencePrevention", out var preventionNode) ? preventionNode.GetString() : null;
+
+            return new ObservationAnalysis(
+                string.IsNullOrWhiteSpace(summary) ? fallbackSummary : summary!,
+                SanitizeToken(classification, "health_observation"),
+                SanitizeToken(missing, "health_issue_detected"),
+                string.IsNullOrWhiteSpace(prevention) ? "Review recent errors and server health details." : prevention!,
+                true,
+                true,
+                "llm");
+        }
+        catch (Exception ex)
+        {
+            return new ObservationAnalysis(
+                fallbackSummary,
+                "health_observation",
+                "health_issue_detected",
+                "Review recent errors and server health details.",
+                true,
+                false,
+                $"llm_error:{ex.GetType().Name}");
+        }
+    }
+
+    private static string? TryExtractJson(string raw)
+    {
+        var start = raw.IndexOf('{');
+        var end = raw.LastIndexOf('}');
+        if (start < 0 || end <= start)
+        {
+            return null;
+        }
+
+        return raw[start..(end + 1)];
+    }
+
+    private static string SanitizeToken(string? value, string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        var token = new string(value.Trim().ToLowerInvariant().Where(ch => char.IsLetterOrDigit(ch) || ch == '_' || ch == '-').ToArray());
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return fallback;
+        }
+
+        return token;
+    }
+
+    private sealed record ObservationAnalysis(
+        string Summary,
+        string Classification,
+        string MissingCapability,
+        string RecurrencePrevention,
+        bool LlmAttempted,
+        bool LlmSucceeded,
+        string Source);
 
     private async Task TryProposeIncidentBranchAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
     {

@@ -33,7 +33,11 @@ internal sealed class RustStatusToolHandler : IToolHandler
 
         using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
         var root = health.RootElement;
-        var state = root.TryGetProperty("state", out var stateNode) ? stateNode.GetString() : "unknown";
+        var state = root.TryGetProperty("status", out var statusNode) &&
+                    statusNode.ValueKind == JsonValueKind.Object &&
+                    statusNode.TryGetProperty("state", out var nestedState)
+            ? nestedState.GetString()
+            : (root.TryGetProperty("state", out var stateNode) ? stateNode.GetString() : "unknown");
         var errors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
             ? errorsNode.EnumerateArray().Select(e => e.ToString()).Take(3).ToList()
             : new List<string>();
@@ -108,7 +112,6 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 internal sealed class RustRconToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
-    private readonly ConcurrentDictionary<string, PersistentRconSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
 
     public RustRconToolHandler(RustOpsApiClient api)
     {
@@ -137,7 +140,7 @@ internal sealed class RustRconToolHandler : IToolHandler
             return new ToolExecutionResult(false, "Command text is required.", server, false, "clarification_required");
         }
 
-        var directReply = await TryExecuteDirectRconAsync(server, command, cancellationToken);
+        var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
         if (!string.IsNullOrWhiteSpace(directReply))
         {
             return new ToolExecutionResult(true, $"RCON on {server}: {directReply}", server, true);
@@ -176,89 +179,6 @@ internal sealed class RustRconToolHandler : IToolHandler
 
         return string.Empty;
     }
-
-    private async Task<string?> TryExecuteDirectRconAsync(string server, string command, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var connection = LoadRconConnection(server);
-            if (connection is null)
-            {
-                return null;
-            }
-
-            var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
-            return await session.SendCommandAsync(command, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            RustOpsSentry.CaptureMessage(
-                $"Direct RCON failed for '{server}', falling back to API execution.",
-                "agent.rcon",
-                SentryLevel.Warning,
-                extras: new Dictionary<string, object?>
-                {
-                    ["server"] = server,
-                    ["command"] = command,
-                    ["exception"] = ex.Message
-                });
-            return null;
-        }
-    }
-
-    private PersistentRconSession GetOrCreateSession(string server, Uri uri, string password)
-    {
-        while (true)
-        {
-            if (_sessions.TryGetValue(server, out var existing))
-            {
-                if (existing.Matches(uri, password))
-                {
-                    return existing;
-                }
-
-                if (_sessions.TryRemove(server, out var stale))
-                {
-                    _ = stale.DisposeAsync().AsTask();
-                }
-            }
-
-            var created = new PersistentRconSession(uri, password);
-            if (_sessions.TryAdd(server, created))
-            {
-                return created;
-            }
-
-            _ = created.DisposeAsync().AsTask();
-        }
-    }
-
-    private static (Uri Uri, string Password)? LoadRconConnection(string server)
-    {
-        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
-        var configPath = Path.Combine(configRoot, $"{server}.json");
-        if (!File.Exists(configPath))
-        {
-            return null;
-        }
-
-        using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
-        var root = cfg.RootElement;
-        var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
-            ? portNode.GetInt32()
-            : 0;
-        var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
-            ? passwordNode.GetString()
-            : null;
-
-        if (port <= 0 || string.IsNullOrWhiteSpace(password))
-        {
-            return null;
-        }
-
-        var encodedPassword = Uri.EscapeDataString(password);
-        return (new Uri($"ws://127.0.0.1:{port}/{encodedPassword}"), password);
-    }
 }
 
 internal sealed class RustPlayerLookupToolHandler : IToolHandler
@@ -281,12 +201,41 @@ internal sealed class RustPlayerLookupToolHandler : IToolHandler
             return new ToolExecutionResult(false, "Server name is required for player lookup.", null, false, "clarification_required");
         }
 
+        var command = context.Message.Contains("ban", StringComparison.OrdinalIgnoreCase)
+            ? "bans"
+            : "playerlist";
+        var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(directReply))
+        {
+            var payload = TryExtractStructuredReply(directReply);
+            if (!string.IsNullOrWhiteSpace(payload))
+            {
+                return new ToolExecutionResult(true, payload, server, false, Payload: payload);
+            }
+        }
+
         var endpoint = context.Message.Contains("ban", StringComparison.OrdinalIgnoreCase)
             ? $"/servers/{Uri.EscapeDataString(server)}/bans"
             : $"/servers/{Uri.EscapeDataString(server)}/players";
 
         using var response = await _api.GetAsync(endpoint, cancellationToken);
         return new ToolExecutionResult(true, response.RootElement.ToString(), server, false, Payload: response.RootElement.ToString());
+    }
+
+    private static string? TryExtractStructuredReply(string reply)
+    {
+        var start = reply.IndexOf('{');
+        var end = reply.LastIndexOf('}');
+        if (start >= 0 && end > start)
+        {
+            return reply[start..(end + 1)];
+        }
+
+        start = reply.IndexOf('[');
+        end = reply.LastIndexOf(']');
+        return start >= 0 && end > start
+            ? reply[start..(end + 1)]
+            : null;
     }
 }
 
@@ -489,15 +438,18 @@ internal static class RustToolHelper
 {
     public static async Task<string?> ResolveServerAsync(RustOpsApiClient api, ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        if (!string.IsNullOrWhiteSpace(context.Route.Slots.ServerName))
-            return context.Route.Slots.ServerName;
-
-        if (ShouldUseLastServer(context.Message) && !string.IsNullOrWhiteSpace(context.SelectionState.LastServerName))
-            return context.SelectionState.LastServerName;
-
         var knownServers = await GetKnownServersAsync(api, cancellationToken);
+
+        var routeServer = MatchKnownServer(context.Route.Slots.ServerName, knownServers);
+        if (!string.IsNullOrWhiteSpace(routeServer))
+            return routeServer;
+
+        var rememberedServer = MatchKnownServer(context.SelectionState.LastServerName, knownServers);
+        if (ShouldUseLastServer(context.Message) && !string.IsNullOrWhiteSpace(rememberedServer))
+            return rememberedServer;
+
         if (knownServers.Count == 0)
-            return context.SelectionState.LastServerName;
+            return rememberedServer;
 
         var lowered = context.Message.ToLowerInvariant();
         foreach (var server in knownServers)
@@ -508,7 +460,7 @@ internal static class RustToolHelper
             }
         }
 
-        return knownServers.Count == 1 ? knownServers[0] : context.SelectionState.LastServerName;
+        return knownServers.Count == 1 ? knownServers[0] : null;
     }
 
     public static async Task<List<string>> GetKnownServersAsync(RustOpsApiClient api, CancellationToken cancellationToken)
@@ -550,5 +502,155 @@ internal static class RustToolHelper
                lowered.Contains("kill it") ||
                lowered.Contains("update it") ||
                lowered.Contains("check it");
+    }
+
+    private static string? MatchKnownServer(string? candidate, IReadOnlyCollection<string> knownServers)
+    {
+        if (string.IsNullOrWhiteSpace(candidate))
+        {
+            return null;
+        }
+
+        var trimmed = candidate.Trim();
+        var exact = knownServers.FirstOrDefault(server => string.Equals(server, trimmed, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(exact))
+        {
+            return exact;
+        }
+
+        var normalizedCandidate = NormalizeServerKey(trimmed);
+        var candidateTokens = SplitServerTokens(trimmed);
+
+        return knownServers
+            .Select(server => new
+            {
+                Server = server,
+                Score = ScoreServerMatch(server, trimmed, normalizedCandidate, candidateTokens)
+            })
+            .Where(item => item.Score > 0)
+            .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.Server.Length)
+            .Select(item => item.Server)
+            .FirstOrDefault();
+    }
+
+    private static int ScoreServerMatch(string server, string trimmedCandidate, string normalizedCandidate, IReadOnlyCollection<string> candidateTokens)
+    {
+        if (server.Contains(trimmedCandidate, StringComparison.OrdinalIgnoreCase) ||
+            trimmedCandidate.Contains(server, StringComparison.OrdinalIgnoreCase))
+        {
+            return 100;
+        }
+
+        var normalizedServer = NormalizeServerKey(server);
+        if (!string.IsNullOrWhiteSpace(normalizedCandidate) &&
+            (normalizedServer.Contains(normalizedCandidate, StringComparison.OrdinalIgnoreCase) ||
+             normalizedCandidate.Contains(normalizedServer, StringComparison.OrdinalIgnoreCase)))
+        {
+            return 80;
+        }
+
+        var serverTokens = SplitServerTokens(server);
+        var shared = serverTokens.Intersect(candidateTokens, StringComparer.OrdinalIgnoreCase).Count();
+        return shared;
+    }
+
+    private static string NormalizeServerKey(string value) =>
+        new string(value.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+
+    private static IReadOnlyCollection<string> SplitServerTokens(string value) =>
+        value
+            .Split(new[] { '-', '_', '.', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => token.Length >= 3)
+            .Select(token => token.ToLowerInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+}
+
+internal static class RustDirectRconHelper
+{
+    private static readonly ConcurrentDictionary<string, PersistentRconSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
+
+    public static async Task<string?> TryExecuteAsync(string server, string command, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var connection = LoadConnection(server);
+            if (connection is null)
+            {
+                return null;
+            }
+
+            var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
+            return await session.SendCommandAsync(command, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureMessage(
+                $"Direct RCON failed for '{server}'.",
+                "agent.rcon",
+                SentryLevel.Warning,
+                extras: new Dictionary<string, object?>
+                {
+                    ["server"] = server,
+                    ["command"] = command,
+                    ["exception"] = ex.Message
+                });
+            return null;
+        }
+    }
+
+    private static PersistentRconSession GetOrCreateSession(string server, Uri uri, string password)
+    {
+        while (true)
+        {
+            if (Sessions.TryGetValue(server, out var existing))
+            {
+                if (existing.Matches(uri, password))
+                {
+                    return existing;
+                }
+
+                if (Sessions.TryRemove(server, out var stale))
+                {
+                    _ = stale.DisposeAsync().AsTask();
+                }
+            }
+
+            var created = new PersistentRconSession(uri, password);
+            if (Sessions.TryAdd(server, created))
+            {
+                return created;
+            }
+
+            _ = created.DisposeAsync().AsTask();
+        }
+    }
+
+    private static (Uri Uri, string Password)? LoadConnection(string server)
+    {
+        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
+        var configPath = Path.Combine(configRoot, $"{server}.json");
+        if (!File.Exists(configPath))
+        {
+            return null;
+        }
+
+        using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
+        var root = cfg.RootElement;
+        var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
+            ? portNode.GetInt32()
+            : 0;
+        var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
+            ? passwordNode.GetString()
+            : null;
+
+        if (port <= 0 || string.IsNullOrWhiteSpace(password))
+        {
+            return null;
+        }
+
+        var encodedPassword = Uri.EscapeDataString(password);
+        return (new Uri($"ws://127.0.0.1:{port}/{encodedPassword}"), password);
     }
 }

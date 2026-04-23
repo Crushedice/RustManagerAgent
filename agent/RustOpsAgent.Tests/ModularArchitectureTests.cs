@@ -211,4 +211,17 @@ public class ModularArchitectureTests
 
         Assert.Null(route.Slots.ServerName);
     }
+
+    [Fact]
+    public async Task Classifier_Extracts_Server_Hint_From_From_Phrasing()
+    {
+        var classifier = new AdminIntentClassifier(kernel: null);
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var route = await classifier.ClassifyAsync("can you give me the current playerlist from monthly ?", state, CancellationToken.None);
+
+        Assert.Equal(AdminIntentType.PlayerLookup, route.Intent);
+        Assert.Equal("monthly", route.Slots.ServerName);
+        Assert.False(route.LlmAttempted);
+    }
 }

@@ -61,6 +61,10 @@ internal sealed class LlmSettings
     [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
     [JsonPropertyName("httpReferer")] public string? HttpReferer { get; set; }
     [JsonPropertyName("appTitle")] public string? AppTitle { get; set; }
+    [JsonPropertyName("useForRecommendations")] public bool UseForRecommendations { get; set; } = true;
+    [JsonPropertyName("requestStrategy")] public string? RequestStrategy { get; set; } = "fallback";
+    [JsonPropertyName("useChatSystemPrompt")] public bool UseChatSystemPrompt { get; set; } = true;
+    [JsonPropertyName("chatSystemPrompt")] public string? ChatSystemPrompt { get; set; }
 }
 
 internal sealed class ChatInboxItem

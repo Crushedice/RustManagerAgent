@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using System.Text.Json;
 using Microsoft.SemanticKernel;
 using RustOpsAgent.Core.Contracts;
@@ -7,20 +8,23 @@ namespace RustOpsAgent.Core.Interaction;
 internal sealed class AdminIntentClassifier : IIntentClassifier
 {
     private readonly Kernel? _kernel;
+    private readonly LlmSettings _settings;
 
-    public AdminIntentClassifier(Kernel? kernel)
+    public AdminIntentClassifier(Kernel? kernel, LlmSettings? settings = null)
     {
         _kernel = kernel;
+        _settings = settings ?? new LlmSettings();
     }
 
     public async Task<AdminIntentRoute> ClassifyAsync(string message, ConversationSelectionState state, CancellationToken cancellationToken)
     {
         if (_kernel is null)
         {
-            return HeuristicFallback(message, state);
+            return HeuristicFallback(message, state, "heuristic_no_kernel", false, false);
         }
 
         var prompt = $$"""
+{{BuildSystemPrefix()}}
 Return strict JSON only with keys:
 intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
 
@@ -50,13 +54,13 @@ Admin message:
         }
         catch
         {
-            return HeuristicFallback(message, state);
+            return HeuristicFallback(message, state, "heuristic_after_llm_error", true, false);
         }
 
         var json = TryExtractJson(raw);
         if (json is null)
         {
-            return HeuristicFallback(message, state);
+            return HeuristicFallback(message, state, "heuristic_after_llm_parse_failure", true, false);
         }
 
         try
@@ -92,6 +96,10 @@ Admin message:
             {
                 serverName = state.LastServerName;
             }
+            if (string.IsNullOrWhiteSpace(serverName))
+            {
+                serverName = ExtractServerHint(message);
+            }
 
             targetRef = NormalizeTargetRef(targetRef) ?? InferTargetRef(intent, lowered);
 
@@ -101,15 +109,18 @@ Admin message:
                 Math.Clamp(confidence, 0.0, 1.0),
                 needsClarification,
                 clarification,
-                targetRef);
+                targetRef,
+                "llm",
+                true,
+                true);
         }
         catch
         {
-            return HeuristicFallback(message, state);
+            return HeuristicFallback(message, state, "heuristic_after_llm_json_error", true, false);
         }
     }
 
-    private static AdminIntentRoute HeuristicFallback(string message, ConversationSelectionState state)
+    private static AdminIntentRoute HeuristicFallback(string message, ConversationSelectionState state, string source, bool llmAttempted, bool llmSucceeded)
     {
         var lowered = message.ToLowerInvariant();
         AdminIntentType intent;
@@ -130,7 +141,7 @@ Admin message:
         else
             intent = AdminIntentType.Chat;
 
-        var serverName = ShouldUseLastServer(message) ? state.LastServerName : null;
+        var serverName = ShouldUseLastServer(message) ? state.LastServerName : ExtractServerHint(message);
         var targetRef = InferTargetRef(intent, lowered);
 
         return new AdminIntentRoute(
@@ -139,7 +150,10 @@ Admin message:
             0.4,
             false,
             null,
-            targetRef);
+            targetRef,
+            source,
+            llmAttempted,
+            llmSucceeded);
     }
 
     private static bool ShouldUseLastServer(string message)
@@ -232,5 +246,29 @@ Admin message:
         }
 
         return raw[start..(end + 1)];
+    }
+
+    private static string? ExtractServerHint(string message)
+    {
+        var match = Regex.Match(
+            message,
+            @"\b(?:from|on|for|in)\s+(?<server>[a-zA-Z0-9][a-zA-Z0-9._-]{2,})\b",
+            RegexOptions.IgnoreCase);
+        if (match.Success)
+        {
+            return match.Groups["server"].Value.Trim();
+        }
+
+        return null;
+    }
+
+    private string BuildSystemPrefix()
+    {
+        if (!_settings.UseChatSystemPrompt || string.IsNullOrWhiteSpace(_settings.ChatSystemPrompt))
+        {
+            return string.Empty;
+        }
+
+        return $"System guidance:\n{_settings.ChatSystemPrompt!.Trim()}\n\n";
     }
 }

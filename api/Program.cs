@@ -176,7 +176,7 @@ app.MapGet("/dashboard/summary", async () =>
 
     var services = await GetManagedServicesSnapshotAsync();
 
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
 
     return Results.Ok(new
     {
@@ -191,6 +191,7 @@ app.MapGet("/dashboard/summary", async () =>
             agentSettingsPath = agentPaths.AgentSettingsPath,
             botSettingsPath = agentPaths.BotSettingsPath,
             agentStatePath = agentPaths.StatePath,
+            agentNeoCortexRoot = agentPaths.NeoCortexRoot,
             agentLogRulesPath = agentPaths.LogRulesPath
         },
         counts = new
@@ -277,7 +278,7 @@ app.MapPut("/agent/log-rules", async (HttpRequest request) =>
 IResult ReadLlmConfig()
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
 
     return Results.Ok(new
@@ -294,7 +295,7 @@ IResult ReadLlmConfig()
 IResult WriteLlmConfig(AgentLlmConfigUpdate request)
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var current = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
 
     var normalized = new AgentLlmConfigView
@@ -433,7 +434,7 @@ app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnap
 app.MapGet("/host/llm/summary", async () =>
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
     var summary = await ReadLmStudioSummaryAsync(values);
     return Results.Ok(summary);
@@ -442,7 +443,7 @@ app.MapGet("/host/llm/summary", async () =>
 app.MapGet("/host/ollama/summary", async () =>
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
     var summary = await ReadLmStudioSummaryAsync(values);
     return Results.Ok(summary);
@@ -914,7 +915,23 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     catch (Exception ex)
     {
         CaptureHandledApiException(ex, "RCON command endpoint failed.", server, request.Command?.Trim());
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        var fallback = await ExecRustMgrAsync("send", server, command);
+        if (!fallback.Ok)
+        {
+            return Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
+        }
+
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            transport = "rustmgr-send",
+            endpoint = new { host = endpoint.Host, port = endpoint.Port },
+            reply = (string?)null,
+            warning = $"WebRCON failed: {ex.Message}",
+            fallback = string.IsNullOrWhiteSpace(fallback.StdOut) ? "command accepted by rustmgr send" : fallback.StdOut.Trim()
+        });
     }
 });
 
@@ -958,7 +975,27 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "Command exec RCON endpoint failed.", server, command);
+        var fallback = await ExecRustMgrAsync("send", server, command);
+        if (!fallback.Ok)
+        {
+            return Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
+        }
+
+        var fallbackOutput = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            waitMs,
+            logPath,
+            transport = "rustmgr-send",
+            endpoint = new { host = endpoint.Host, port = endpoint.Port },
+            directReply = (string?)null,
+            warning = $"WebRCON failed: {ex.Message}",
+            output = fallbackOutput
+        });
     }
 
     var output = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
@@ -1112,7 +1149,11 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
     catch (Exception ex)
     {
         CaptureHandledApiException(ex, "Server info RCON endpoint failed.", server, "serverinfo");
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        var fallback = await ExecRustMgrAsync("query", server, "serverinfo");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Text(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1143,7 +1184,11 @@ app.MapGet("/servers/{server}/players", async (string server) =>
     catch (Exception ex)
     {
         CaptureHandledApiException(ex, "Player list RCON endpoint failed.", server, "playerlist");
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        var fallback = await ExecRustMgrAsync("query", server, "playerlist");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Text(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1174,7 +1219,11 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
     catch (Exception ex)
     {
         CaptureHandledApiException(ex, "Bans RCON endpoint failed.", server, "bans");
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        var fallback = await ExecRustMgrAsync("query", server, "bans");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Text(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1326,6 +1375,17 @@ static void CaptureHandledApiException(Exception ex, string context, string? ser
         extras["path"] = path;
 
     RustOpsSentry.CaptureException(ex, context, "api.handled", tags, extras);
+}
+
+static string BuildRustMgrError(CommandExecutionResult result)
+{
+    if (!string.IsNullOrWhiteSpace(result.Message))
+        return result.Message!;
+    if (!string.IsNullOrWhiteSpace(result.StdErr))
+        return result.StdErr!;
+    if (!string.IsNullOrWhiteSpace(result.StdOut))
+        return result.StdOut!;
+    return $"exit code {result.ExitCode}";
 }
 
 static async Task<bool> IsValidServerAsync(string server)
@@ -1732,7 +1792,14 @@ static object DescribeMailbox(string name, string path)
     };
 }
 
-static AgentDashboardSnapshot LoadAgentMemorySnapshot(string path)
+static AgentDashboardSnapshot LoadAgentMemorySnapshot(AgentRuntimePaths paths)
+{
+    var snapshot = LoadLegacyAgentMemorySnapshot(paths.StatePath);
+    MergeNeoCortexSnapshot(snapshot, paths.NeoCortexRoot);
+    return snapshot;
+}
+
+static AgentDashboardSnapshot LoadLegacyAgentMemorySnapshot(string path)
 {
     var stateFile = BuildStateFileStatus(path);
     if (!File.Exists(path))
@@ -1814,6 +1881,10 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_STATE_PATH") ?? agentSettings?.Memory?.StatePath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "agent-state.json")),
+        NeoCortexRoot = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_NEOCORTEX_ROOT") ?? agentSettings?.Memory?.NeoCortexRoot,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "NeoCortex")),
         FeedbackInboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_FEEDBACK_INBOX_PATH") ?? agentSettings?.Inbox?.FeedbackInboxPath,
             agentBaseDir,
@@ -2025,6 +2096,156 @@ static AgentSettingsFileView? TryLoadAgentSettingsFile(string path)
     {
         CaptureHandledApiException(ex, "Failed to load agent settings file.", path: path);
         return null;
+    }
+}
+
+static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCortexRoot)
+{
+    if (string.IsNullOrWhiteSpace(neoCortexRoot) || !Directory.Exists(neoCortexRoot))
+    {
+        return;
+    }
+
+    var operationsPath = Path.Combine(neoCortexRoot, "operations", "active-state.json");
+    if (File.Exists(operationsPath))
+    {
+        try
+        {
+            using var operations = JsonDocument.Parse(File.ReadAllText(operationsPath));
+            var root = operations.RootElement;
+
+            if (root.TryGetProperty("runtimeStatus", out var runtimeStatus) && runtimeStatus.ValueKind == JsonValueKind.Object)
+            {
+                if (runtimeStatus.TryGetProperty("llmEnabled", out var llmEnabledNode) &&
+                    (llmEnabledNode.ValueKind == JsonValueKind.True || llmEnabledNode.ValueKind == JsonValueKind.False))
+                {
+                    snapshot.RuntimeStatus.LlmEnabled = llmEnabledNode.GetBoolean();
+                }
+                snapshot.RuntimeStatus.LlmProvider = ReadString(runtimeStatus, "llmProvider") ?? snapshot.RuntimeStatus.LlmProvider;
+                snapshot.RuntimeStatus.UpdatedAtUtc = ReadDateTime(runtimeStatus, "updatedAtUtc") ?? snapshot.RuntimeStatus.UpdatedAtUtc;
+                snapshot.RuntimeStatus.LastLlmInteractionAtUtc = ReadDateTime(runtimeStatus, "lastLlmInteractionAtUtc") ?? snapshot.RuntimeStatus.LastLlmInteractionAtUtc;
+            }
+
+            if (root.TryGetProperty("recentActions", out var actions) && actions.ValueKind == JsonValueKind.Array)
+            {
+                snapshot.RecentActions = snapshot.RecentActions
+                    .Concat(actions.EnumerateArray().Select(item => new DashboardAction
+                    {
+                        ActionId = null,
+                        ServerName = ReadString(item, "serverName"),
+                        ActionType = ReadString(item, "intent"),
+                        ExecutedAtUtc = ReadDateTime(item, "timestampUtc"),
+                        Success = string.Equals(ReadString(item, "result"), "success", StringComparison.OrdinalIgnoreCase),
+                        Trigger = "neocortex",
+                        Summary = ReadString(item, "result")
+                    }))
+                    .OrderByDescending(item => item.ExecutedAtUtc)
+                    .Take(20)
+                    .ToList();
+            }
+
+            if (root.TryGetProperty("llmInteractions", out var interactions) && interactions.ValueKind == JsonValueKind.Array)
+            {
+                snapshot.LlmInteractions = interactions.EnumerateArray()
+                    .Select(item => new DashboardLlmInteraction
+                    {
+                        AtUtc = ReadDateTime(item, "atUtc"),
+                        Type = ReadString(item, "type"),
+                        Model = ReadString(item, "model"),
+                        Success = ReadBool(item, "success"),
+                        Context = ReadString(item, "context"),
+                        ResponsePreview = ReadString(item, "responsePreview")
+                    })
+                    .OrderByDescending(item => item.AtUtc)
+                    .Take(20)
+                    .ToList();
+            }
+        }
+        catch (Exception ex)
+        {
+            CaptureHandledApiException(ex, "Failed to parse NeoCortex operations state.", path: operationsPath);
+            snapshot.AgentErrors = snapshot.AgentErrors
+                .Concat(new[] { "Failed to parse NeoCortex operations state." })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .ToList();
+        }
+    }
+
+    var evolutionPath = Path.Combine(neoCortexRoot, "evolution", "incidents.jsonl");
+    if (!File.Exists(evolutionPath))
+    {
+        return;
+    }
+
+    try
+    {
+        var records = File.ReadLines(evolutionPath)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .Select(line =>
+            {
+                try
+                {
+                    return JsonDocument.Parse(line).RootElement.Clone();
+                }
+                catch
+                {
+                    return default;
+                }
+            })
+            .Where(item => item.ValueKind == JsonValueKind.Object)
+            .ToList();
+
+        snapshot.RecentIncidents = snapshot.RecentIncidents
+            .Concat(records.Select(item => new DashboardIncident
+            {
+                ServerName = "general",
+                CreatedAtUtc = ReadDateTime(item, "timestamp"),
+                Title = ReadString(item, "classification"),
+                Category = ReadString(item, "missingCapability"),
+                Summary = ReadString(item, "failureReason")
+            }))
+            .OrderByDescending(item => item.CreatedAtUtc)
+            .Take(20)
+            .ToList();
+
+        var groupedGaps = records
+            .GroupBy(item => $"{ReadString(item, "classification")}|{ReadString(item, "missingCapability")}", StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var first = group
+                    .Select(item => ReadDateTime(item, "timestamp"))
+                    .Where(value => value.HasValue)
+                    .Select(value => value!.Value)
+                    .OrderBy(value => value)
+                    .ToList();
+                return new DashboardCapabilityGap
+                {
+                    Category = group.Select(item => ReadString(item, "classification")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)),
+                    Description = group.Select(item => ReadString(item, "recurrencePrevention")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
+                        ?? group.Select(item => ReadString(item, "failureReason")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)),
+                    Count = group.Count(),
+                    FirstObservedAtUtc = first.FirstOrDefault(),
+                    LastObservedAtUtc = first.LastOrDefault()
+                };
+            })
+            .OrderByDescending(item => item.LastObservedAtUtc)
+            .Take(20)
+            .ToList();
+
+        if (groupedGaps.Count > 0)
+        {
+            snapshot.CapabilityGaps = groupedGaps;
+        }
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Failed to parse NeoCortex evolution state.", path: evolutionPath);
+        snapshot.AgentErrors = snapshot.AgentErrors
+            .Concat(new[] { "Failed to parse NeoCortex evolution state." })
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToList();
     }
 }
 
@@ -3739,6 +3960,7 @@ public sealed class AgentRuntimePaths
     public string AgentSettingsPath { get; set; } = string.Empty;
     public string BotSettingsPath { get; set; } = string.Empty;
     public string StatePath { get; set; } = string.Empty;
+    public string NeoCortexRoot { get; set; } = string.Empty;
     public string FeedbackInboxPath { get; set; } = string.Empty;
     public string DecisionInboxPath { get; set; } = string.Empty;
     public string ChatInboxPath { get; set; } = string.Empty;
@@ -3866,6 +4088,7 @@ public sealed class AgentSettingsFileView
 public sealed class AgentSettingsMemoryView
 {
     [JsonPropertyName("statePath")] public string? StatePath { get; set; }
+    [JsonPropertyName("neoCortexRoot")] public string? NeoCortexRoot { get; set; }
 }
 
 public sealed class AgentSettingsInboxView

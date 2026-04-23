@@ -6,12 +6,14 @@ internal sealed class ActiveOperationalState
 {
     [JsonPropertyName("runtimeStatus")] public RuntimeStatus RuntimeStatus { get; set; } = new();
     [JsonPropertyName("recentActions")] public List<ActionRecord> RecentActions { get; set; } = new();
+    [JsonPropertyName("llmInteractions")] public List<LlmInteractionRecord> LlmInteractions { get; set; } = new();
 }
 
 internal sealed class RuntimeStatus
 {
     [JsonPropertyName("llmEnabled")] public bool LlmEnabled { get; set; }
     [JsonPropertyName("llmProvider")] public string? LlmProvider { get; set; }
+    [JsonPropertyName("lastLlmInteractionAtUtc")] public DateTime? LastLlmInteractionAtUtc { get; set; }
     [JsonPropertyName("updatedAtUtc")] public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
 }
 
@@ -21,6 +23,16 @@ internal sealed class ActionRecord
     [JsonPropertyName("intent")] public string Intent { get; set; } = string.Empty;
     [JsonPropertyName("result")] public string Result { get; set; } = string.Empty;
     [JsonPropertyName("serverName")] public string? ServerName { get; set; }
+}
+
+internal sealed class LlmInteractionRecord
+{
+    [JsonPropertyName("atUtc")] public DateTime AtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("type")] public string Type { get; set; } = "intent-routing";
+    [JsonPropertyName("model")] public string? Model { get; set; }
+    [JsonPropertyName("success")] public bool Success { get; set; }
+    [JsonPropertyName("context")] public string? Context { get; set; }
+    [JsonPropertyName("responsePreview")] public string? ResponsePreview { get; set; }
 }
 
 internal sealed class SelectionSessionState
