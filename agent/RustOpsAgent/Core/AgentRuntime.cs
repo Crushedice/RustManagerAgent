@@ -103,6 +103,12 @@ internal sealed class AgentRuntime
             catch (Exception ex)
             {
                 _legacyState.RecordAgentError($"feedback inbox processing failed: {ex.Message}");
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Feedback inbox processing failed.",
+                    "agent.inbox",
+                    tags: new Dictionary<string, string?> { ["inbox.kind"] = "feedback" },
+                    extras: new Dictionary<string, object?> { ["file"] = file });
             }
             finally
             {
@@ -141,6 +147,12 @@ internal sealed class AgentRuntime
             catch (Exception ex)
             {
                 _legacyState.RecordAgentError($"decision inbox processing failed: {ex.Message}");
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Decision inbox processing failed.",
+                    "agent.inbox",
+                    tags: new Dictionary<string, string?> { ["inbox.kind"] = "decision" },
+                    extras: new Dictionary<string, object?> { ["file"] = file });
             }
             finally
             {
@@ -253,6 +265,18 @@ internal sealed class AgentRuntime
 
                 _legacyState.RecordAgentError(ex.Message);
                 _legacyState.RecordIncident(null, "processing_error", ex.Message);
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Chat inbox processing failed.",
+                    "agent.inbox",
+                    tags: new Dictionary<string, string?> { ["inbox.kind"] = "chat" },
+                    extras: new Dictionary<string, object?>
+                    {
+                        ["file"] = file,
+                        ["adminId"] = item?.AdminId,
+                        ["requestId"] = item?.RequestId,
+                        ["message"] = item?.Message
+                    });
                 WriteOutbox(item?.AdminId ?? "admin", $"Failed to process request: {ex.Message}", item?.RequestId ?? item?.Id, null);
             }
             finally
@@ -277,6 +301,16 @@ internal sealed class AgentRuntime
         catch (Exception ex)
         {
             _legacyState.RecordAgentError($"GitOps incident PR failed: {ex.Message}");
+            RustOpsSentry.CaptureException(
+                ex,
+                "GitOps incident PR creation failed.",
+                "agent.gitops",
+                extras: new Dictionary<string, object?>
+                {
+                    ["incidentId"] = incident.Id,
+                    ["classification"] = incident.Classification,
+                    ["request"] = incident.Request
+                });
         }
     }
 
@@ -319,6 +353,14 @@ internal sealed class AgentRuntime
 
     private static void TryDelete(string path)
     {
-        try { File.Delete(path); } catch { }
+        try { File.Delete(path); }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureException(
+                ex,
+                "Failed to delete processed inbox/outbox file.",
+                "agent.files",
+                extras: new Dictionary<string, object?> { ["path"] = path });
+        }
     }
 }

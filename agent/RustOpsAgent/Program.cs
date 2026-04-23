@@ -1,5 +1,6 @@
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using Sentry;
 using RustOpsAgent.Core;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Core.Interaction;
@@ -13,14 +14,36 @@ using var sentry = RustOpsSentry.Initialize("rustopsagent");
 
 var startup = ParseStartupOptions(args);
 var configPath = startup.ConfigPath ?? Path.Combine(AppContext.BaseDirectory, "agentsettings.json");
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetExtra("configPath", Path.GetFullPath(configPath));
+    scope.SetExtra("appBaseDirectory", AppContext.BaseDirectory);
+});
+RustOpsSentry.AddBreadcrumb($"Agent starting with config path {Path.GetFullPath(configPath)}.", "startup");
 
 if (!File.Exists(configPath))
 {
     Console.Error.WriteLine($"Config file not found: {configPath}");
+    RustOpsSentry.CaptureMessage(
+        $"RustOps agent config file not found: {configPath}",
+        "startup",
+        SentryLevel.Error,
+        extras: new Dictionary<string, object?> { ["configPath"] = Path.GetFullPath(configPath) });
     return 1;
 }
 
 var config = ConfigLoader.Load(configPath);
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetTag("llm.enabled", config.Llm.Enabled ? "true" : "false");
+    scope.SetTag("gitops.enabled", config.GitOps.Enabled ? "true" : "false");
+    scope.SetExtra("neoCortexRoot", config.Memory.NeoCortexRoot);
+    scope.SetExtra("chatInboxPath", config.Inbox.ChatInboxPath);
+    scope.SetExtra("decisionInboxPath", config.Inbox.DecisionInboxPath);
+    scope.SetExtra("feedbackInboxPath", config.Inbox.FeedbackInboxPath);
+    scope.SetExtra("messageOutboxPath", config.Outbox.MessageOutboxPath);
+});
+RustOpsSentry.AddBreadcrumb("Agent configuration loaded.", "startup");
 Directory.CreateDirectory(config.Memory.NeoCortexRoot);
 Directory.CreateDirectory(config.Inbox.ChatInboxPath);
 Directory.CreateDirectory(config.Inbox.DecisionInboxPath);
@@ -77,7 +100,21 @@ try
 }
 catch (OperationCanceledException)
 {
+    RustOpsSentry.AddBreadcrumb("Agent shutdown requested via cancellation.", "runtime");
     return 0;
+}
+catch (Exception ex)
+{
+    RustOpsSentry.CaptureException(
+        ex,
+        "RustOps agent terminated unexpectedly.",
+        "runtime",
+        extras: new Dictionary<string, object?> { ["configPath"] = Path.GetFullPath(configPath) });
+    return 1;
+}
+finally
+{
+    await RustOpsSentry.FlushAsync();
 }
 
 static Kernel? BuildKernel(LlmSettings settings)

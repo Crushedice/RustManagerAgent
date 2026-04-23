@@ -39,6 +39,20 @@ var botRootDir = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_ROOT") ?? 
 var agentSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_SETTINGS_PATH") ?? Path.Combine(agentRootDir, "agentsettings.json");
 var botSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_SETTINGS_PATH") ?? Path.Combine(botRootDir, "botsettings.json");
 var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE") ?? Path.Combine(configDir, "rustops.env");
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetExtra("bindUrl", bindUrl);
+    scope.SetExtra("rustMgrPath", rustMgrPath);
+    scope.SetExtra("runtimeDir", runtimeDir);
+    scope.SetExtra("configDir", configDir);
+    scope.SetExtra("tasksDir", tasksDir);
+    scope.SetExtra("agentRootDir", agentRootDir);
+    scope.SetExtra("botRootDir", botRootDir);
+    scope.SetExtra("agentSettingsPath", agentSettingsPath);
+    scope.SetExtra("botSettingsPath", botSettingsPath);
+    scope.SetExtra("sharedEnvPath", sharedEnvPath);
+});
+RustOpsSentry.AddBreadcrumb($"API starting on {bindUrl}.", "startup");
 
 const int defaultConsoleLines = 120;
 const int defaultEventLines   = 100;
@@ -58,13 +72,20 @@ app.Use(async (ctx, next) =>
     }
     catch (Exception ex)
     {
-        SentrySdk.ConfigureScope(scope =>
-        {
-            scope.SetTag("http.method", ctx.Request.Method);
-            scope.SetTag("http.path", ctx.Request.Path.Value ?? "/");
-            scope.SetExtra("queryString", ctx.Request.QueryString.Value ?? string.Empty);
-        });
-        SentrySdk.CaptureException(ex);
+        RustOpsSentry.CaptureException(
+            ex,
+            $"Unhandled HTTP pipeline exception for {ctx.Request.Method} {ctx.Request.Path}.",
+            "http.request",
+            tags: new Dictionary<string, string?>
+            {
+                ["http.method"] = ctx.Request.Method,
+                ["http.path"] = ctx.Request.Path.Value ?? "/"
+            },
+            extras: new Dictionary<string, object?>
+            {
+                ["queryString"] = ctx.Request.QueryString.Value ?? string.Empty,
+                ["traceIdentifier"] = ctx.TraceIdentifier
+            });
         throw;
     }
 });
@@ -82,6 +103,7 @@ app.Use(async (ctx, next) =>
     var supplied = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
     if (!string.Equals(supplied, apiKey, StringComparison.Ordinal))
     {
+        RustOpsSentry.AddBreadcrumb($"Rejected unauthorized request for {ctx.Request.Path}.", "http.auth");
         ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
         await ctx.Response.WriteAsJsonAsync(new ApiError("unauthorized", "Invalid API key."));
         return;
@@ -891,6 +913,7 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "RCON command endpoint failed.", server, request.Command?.Trim());
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1088,6 +1111,7 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Server info RCON endpoint failed.", server, "serverinfo");
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1118,6 +1142,7 @@ app.MapGet("/servers/{server}/players", async (string server) =>
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Player list RCON endpoint failed.", server, "playerlist");
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1148,6 +1173,7 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Bans RCON endpoint failed.", server, "bans");
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1187,6 +1213,7 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Kick RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1226,6 +1253,7 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Ban RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1264,6 +1292,7 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Unban RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1272,7 +1301,7 @@ app.Run();
 }
 catch (Exception ex)
 {
-    SentrySdk.CaptureException(ex);
+    RustOpsSentry.CaptureException(ex, "rustmgrapi terminated unexpectedly.", "runtime");
     throw;
 }
 finally
@@ -1283,6 +1312,21 @@ finally
 // -----------------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------------
+
+static void CaptureHandledApiException(Exception ex, string context, string? server = null, string? command = null, string? path = null)
+{
+    var tags = new Dictionary<string, string?> { ["handled"] = "true" };
+    if (!string.IsNullOrWhiteSpace(server))
+        tags["server"] = server;
+
+    var extras = new Dictionary<string, object?>();
+    if (!string.IsNullOrWhiteSpace(command))
+        extras["command"] = command;
+    if (!string.IsNullOrWhiteSpace(path))
+        extras["path"] = path;
+
+    RustOpsSentry.CaptureException(ex, context, "api.handled", tags, extras);
+}
 
 static async Task<bool> IsValidServerAsync(string server)
 {
@@ -1559,7 +1603,11 @@ static string? TryExtractJson(string? text)
         using var _ = JsonDocument.Parse(candidate);
         return candidate;
     }
-    catch { return null; }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Failed to extract JSON payload from RCON response.");
+        return null;
+    }
 }
 
 static string Escape(string value) => value.Replace("\"", "\\\"");
@@ -1617,8 +1665,9 @@ static string? ReadRawServerConfigValue(string server, string key)
             _ => node.ToString()
         };
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to read raw server config value.", path: path);
         return null;
     }
 }
@@ -1643,8 +1692,9 @@ static ServerConfig? LoadServerConfig(string server)
     {
         return JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path), JsonDefaults.Options);
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to deserialize server config.", server, path: path);
         return null;
     }
 }
@@ -1720,6 +1770,7 @@ static AgentDashboardSnapshot LoadAgentMemorySnapshot(string path)
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to parse agent dashboard state file.", path: path);
         return new AgentDashboardSnapshot
         {
             AgentErrors = new List<string> { "Failed to parse agent-state.json." },
@@ -1970,8 +2021,9 @@ static AgentSettingsFileView? TryLoadAgentSettingsFile(string path)
 
         return settings;
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to load agent settings file.", path: path);
         return null;
     }
 }
@@ -1985,8 +2037,9 @@ static BotSettingsFileView? TryLoadBotSettingsFile(string path)
     {
         return JsonSerializer.Deserialize<BotSettingsFileView>(File.ReadAllText(path), JsonDefaults.Options);
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to load Steam bot settings file.", path: path);
         return null;
     }
 }
@@ -2464,6 +2517,7 @@ static async Task<LlmSummaryView> ReadLmStudioSummaryAsync(AgentLlmConfigView co
     catch (Exception ex)
     {
         summary.Error = ex.Message;
+        CaptureHandledApiException(ex, "Failed to read LM Studio summary.");
     }
 
     return summary;
@@ -3409,7 +3463,14 @@ static async Task<CommandExecutionResult> ExecProcessAsync(string fileName, para
     {
         using var process = new Process { StartInfo = psi };
         if (!process.Start())
+        {
+            RustOpsSentry.CaptureMessage(
+                $"Failed to start external process '{fileName}'.",
+                "api.process",
+                SentryLevel.Error,
+                extras: new Dictionary<string, object?> { ["arguments"] = args });
             return new CommandExecutionResult { Ok = false, ExitCode = -1, Arguments = args, StdErr = $"Failed to start '{fileName}'." };
+        }
 
         var stdOutTask = process.StandardOutput.ReadToEndAsync();
         var stdErrTask = process.StandardError.ReadToEndAsync();
@@ -3426,6 +3487,11 @@ static async Task<CommandExecutionResult> ExecProcessAsync(string fileName, para
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(
+            ex,
+            $"External process '{fileName}' execution failed.",
+            command: string.Join(' ', args),
+            path: fileName);
         return new CommandExecutionResult
             { Ok = false, ExitCode = -1, Arguments = new[] { fileName }.Concat(args), StdErr = ex.Message };
     }

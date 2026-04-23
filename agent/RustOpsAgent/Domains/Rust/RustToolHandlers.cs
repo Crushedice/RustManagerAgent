@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
+using Sentry;
 using RustOpsAgent.Core.Contracts;
 using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
@@ -77,9 +78,13 @@ internal sealed class RustServerControlToolHandler : IToolHandler
                     await Task.Delay(TimeSpan.FromMinutes(3), CancellationToken.None);
                     using var __ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, CancellationToken.None);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Countdown failures are best-effort; the admin will observe the result.
+                    RustOpsSentry.CaptureException(
+                        ex,
+                        $"Scheduled restart countdown failed for server '{server}'.",
+                        "agent.server-control",
+                        extras: new Dictionary<string, object?> { ["server"] = server });
                 }
             });
             return new ToolExecutionResult(true, $"Restart countdown started for {server}. Server will restart in ~3 minutes.", server, true);
@@ -185,8 +190,18 @@ internal sealed class RustRconToolHandler : IToolHandler
             var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
             return await session.SendCommandAsync(command, cancellationToken);
         }
-        catch
+        catch (Exception ex)
         {
+            RustOpsSentry.CaptureMessage(
+                $"Direct RCON failed for '{server}', falling back to API execution.",
+                "agent.rcon",
+                SentryLevel.Warning,
+                extras: new Dictionary<string, object?>
+                {
+                    ["server"] = server,
+                    ["command"] = command,
+                    ["exception"] = ex.Message
+                });
             return null;
         }
     }
@@ -512,8 +527,12 @@ internal static class RustToolHelper
                     .ToList()
                 : new List<string>();
         }
-        catch
+        catch (Exception ex)
         {
+            RustOpsSentry.CaptureException(
+                ex,
+                "Failed to retrieve known server list from API.",
+                "agent.api");
             return new List<string>();
         }
     }

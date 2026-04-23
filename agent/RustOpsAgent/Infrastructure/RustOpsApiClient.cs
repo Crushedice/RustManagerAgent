@@ -24,10 +24,12 @@ internal sealed class RustOpsApiClient : IDisposable
 
     public async Task<JsonDocument> GetAsync(string path, CancellationToken cancellationToken)
     {
+        RustOpsSentry.AddBreadcrumb($"GET {path}", "agent.api");
         using var response = await _http.GetAsync(path.TrimStart('/'), cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
+            RustOpsSentry.AddBreadcrumb($"GET {path} failed with {(int)response.StatusCode}.", "agent.api");
             throw new InvalidOperationException($"API GET {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {body}");
         }
 
@@ -36,12 +38,14 @@ internal sealed class RustOpsApiClient : IDisposable
 
     public async Task<JsonDocument> PostAsync(string path, object? payload, CancellationToken cancellationToken)
     {
+        RustOpsSentry.AddBreadcrumb($"POST {path}", "agent.api");
         var json = payload is null ? "{}" : JsonSerializer.Serialize(payload, JsonDefaults.Default);
         using var content = new StringContent(json, Encoding.UTF8, "application/json");
         using var response = await _http.PostAsync(path.TrimStart('/'), content, cancellationToken);
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
         if (!response.IsSuccessStatusCode)
         {
+            RustOpsSentry.AddBreadcrumb($"POST {path} failed with {(int)response.StatusCode}.", "agent.api");
             throw new InvalidOperationException($"API POST {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {body}");
         }
 

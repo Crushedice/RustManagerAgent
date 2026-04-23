@@ -1,3 +1,5 @@
+using Sentry;
+
 namespace RustOpsAgent.Domains.Rust.Rcon;
 
 internal sealed class PersistentRconSession : IAsyncDisposable
@@ -31,8 +33,18 @@ internal sealed class PersistentRconSession : IAsyncDisposable
             {
                 return await _client!.SendCommandAsync(command, cancellationToken);
             }
-            catch
+            catch (Exception ex)
             {
+                RustOpsSentry.CaptureMessage(
+                    "Persistent RCON session command failed. Resetting connection and retrying once.",
+                    "agent.rcon",
+                    SentryLevel.Warning,
+                    extras: new Dictionary<string, object?>
+                    {
+                        ["uri"] = _uri.ToString(),
+                        ["command"] = command,
+                        ["exception"] = ex.Message
+                    });
                 await ResetClientAsync();
                 await EnsureConnectedAsync(cancellationToken);
                 return await _client!.SendCommandAsync(command, cancellationToken);
@@ -73,10 +85,15 @@ internal sealed class PersistentRconSession : IAsyncDisposable
             await client.ConnectAsync(_uri, _password, cancellationToken);
             _client = client;
         }
-        catch
+        catch (Exception ex)
         {
             _monitor.Detach(client);
             await client.DisposeAsync();
+            RustOpsSentry.CaptureException(
+                ex,
+                "Failed to establish persistent RCON session.",
+                "agent.rcon",
+                extras: new Dictionary<string, object?> { ["uri"] = _uri.ToString() });
             throw;
         }
     }

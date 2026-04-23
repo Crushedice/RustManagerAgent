@@ -19,8 +19,13 @@ internal sealed class LegacyAgentStateStore
             {
                 _state = JsonSerializer.Deserialize<LegacyAgentState>(File.ReadAllText(_path), JsonDefaults.Default) ?? new LegacyAgentState();
             }
-            catch
+            catch (Exception ex)
             {
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Failed to parse legacy agent state file. Falling back to a new empty state.",
+                    "agent.memory",
+                    extras: new Dictionary<string, object?> { ["path"] = _path });
                 _state = new LegacyAgentState();
             }
         }

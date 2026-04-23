@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using Sentry;
 
 namespace RustOpsAgent.Domains.Rust.Rcon;
 
@@ -126,8 +127,17 @@ internal sealed class RustRconClient : IRconClient
                     UnsolicitedMessage?.Invoke(message);
                 }
             }
-            catch
+            catch (Exception ex)
             {
+                RustOpsSentry.CaptureMessage(
+                    "Failed to parse RCON payload as JSON. Forwarding raw message as unsolicited output.",
+                    "agent.rcon",
+                    SentryLevel.Warning,
+                    extras: new Dictionary<string, object?>
+                    {
+                        ["payloadPreview"] = payload.Length > 500 ? payload[..500] : payload,
+                        ["exception"] = ex.Message
+                    });
                 UnsolicitedMessage?.Invoke(payload);
             }
         }
@@ -146,13 +156,22 @@ internal sealed class RustRconClient : IRconClient
         {
             _receiveCts?.Cancel();
         }
-        catch
+        catch (Exception ex)
         {
+            RustOpsSentry.CaptureException(ex, "Failed to cancel RCON receive loop.", "agent.rcon");
         }
 
         if (_receiveTask is not null)
         {
-            try { await _receiveTask; } catch { }
+            try { await _receiveTask; }
+            catch (Exception ex)
+            {
+                RustOpsSentry.CaptureMessage(
+                    "RCON receive loop ended with an exception during dispose.",
+                    "agent.rcon",
+                    SentryLevel.Warning,
+                    extras: new Dictionary<string, object?> { ["exception"] = ex.Message });
+            }
         }
 
         _sendLock.Dispose();
@@ -160,7 +179,15 @@ internal sealed class RustRconClient : IRconClient
 
         if (_socket.State == WebSocketState.Open)
         {
-            try { await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); } catch { }
+            try { await _socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "closing", CancellationToken.None); }
+            catch (Exception ex)
+            {
+                RustOpsSentry.CaptureMessage(
+                    "RCON websocket close failed during dispose.",
+                    "agent.rcon",
+                    SentryLevel.Warning,
+                    extras: new Dictionary<string, object?> { ["exception"] = ex.Message });
+            }
         }
 
         _socket.Dispose();

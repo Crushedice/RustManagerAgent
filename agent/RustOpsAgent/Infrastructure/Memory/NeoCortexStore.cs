@@ -167,8 +167,13 @@ internal sealed class NeoCortexStore : IEvolutionStore
             {
                 record = JsonSerializer.Deserialize<EvolutionIncidentRecord>(line, JsonDefaults.Default);
             }
-            catch
+            catch (Exception ex)
             {
+                RustOpsSentry.CaptureException(
+                    ex,
+                    "Failed to deserialize NeoCortex incident record.",
+                    "agent.memory",
+                    extras: new Dictionary<string, object?> { ["linePreview"] = line.Length > 500 ? line[..500] : line });
                 continue;
             }
 
