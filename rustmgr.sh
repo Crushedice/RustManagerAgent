@@ -311,10 +311,21 @@ EOF
 write_runner_script() {
     local server="$1"
     local runner_path control_path trace_path command_path
+    local identity server_port rcon_port app_port
     runner_path="$(runner_script_path "$server")"
     control_path="$(restart_flag_path "$server")"
     trace_path="$(command_trace_path "$server")"
     command_path="$(generated_cmd_path "$server")"
+    load_config "$server"
+
+    identity="$CFG_SERVER_IDENTITY"
+    server_port="$CFG_SERVER_PORT"
+    rcon_port="$CFG_RCON_PORT"
+    app_port="$CFG_APP_PORT"
+
+    if [[ -z "$identity" ]]; then
+        identity="$server"
+    fi
 
     cat > "$runner_path" <<EOF
 #!/usr/bin/env bash
@@ -324,9 +335,99 @@ CONTROL_PATH=$(quote_arg "$control_path")
 TRACE_PATH=$(quote_arg "$trace_path")
 COMMAND_PATH=$(quote_arg "$command_path")
 RESTART_DELAY=$(quote_arg "$RESTART_LOOP_DELAY_SECONDS")
+IDENTITY=$(quote_arg "$identity")
+SERVER_PORT=$(quote_arg "$server_port")
+RCON_PORT=$(quote_arg "$rcon_port")
+APP_PORT=$(quote_arg "$app_port")
 
 trace() {
     printf '[%s] %s\n' "\$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "\$1" >> "\$TRACE_PATH"
+}
+
+find_rust_pids() {
+    python3 - "\$IDENTITY" "\$SERVER_PORT" "\$RCON_PORT" "\$APP_PORT" <<'PY'
+import os
+import sys
+
+identity, server_port, rcon_port, app_port = sys.argv[1:5]
+
+def arg_value(parts: list[str], flag: str) -> str | None:
+    for index, part in enumerate(parts[:-1]):
+        if part == flag:
+            return parts[index + 1]
+    for part in parts:
+        if part.startswith(flag + "="):
+            return part[len(flag) + 1 :]
+    return None
+
+def rss_kb(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1])
+    except OSError:
+        pass
+    return 0
+
+candidates: list[tuple[int, int, int]] = []
+
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        continue
+    if not raw:
+        continue
+    parts = [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+    if not parts:
+        continue
+    executable = os.path.basename(parts[0])
+    if "RustDedicated" not in executable:
+        continue
+
+    score = 0
+    if arg_value(parts, "+server.identity") == identity:
+        score += 10
+    if server_port and arg_value(parts, "+server.port") == server_port:
+        score += 5
+    if rcon_port and arg_value(parts, "+rcon.port") == rcon_port:
+        score += 3
+    if app_port and arg_value(parts, "+app.port") == app_port:
+        score += 3
+
+    if score > 0:
+        candidates.append((score, rss_kb(pid), pid))
+
+candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+for _, _, pid in candidates:
+    print(pid)
+PY
+}
+
+wait_for_pids_exit() {
+    local pids_raw="\$1"
+    [[ -n "\$pids_raw" ]] || return 0
+
+    while true; do
+        local any_alive=0
+        local pid
+        for pid in \$pids_raw; do
+            if kill -0 "\$pid" 2>/dev/null; then
+                any_alive=1
+                break
+            fi
+        done
+        if (( any_alive == 0 )); then
+            return 0
+        fi
+        sleep 1
+    done
 }
 
 while [[ -f "\$CONTROL_PATH" ]]; do
@@ -341,6 +442,17 @@ while [[ -f "\$CONTROL_PATH" ]]; do
     bash -lc "\$cmd"
     exit_code=\$?
     trace "process exit: code=\$exit_code"
+
+    # Rust Dedicated can spawn a Unity bootstrapper process that exits quickly while
+    # a child RustDedicated continues running. If that happens and we immediately loop,
+    # we end up in a noisy "fake restart" loop while the real server stays alive.
+    # Detect and wait for remaining matching RustDedicated pids to exit before restarting.
+    leftover_pids="\$(find_rust_pids | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //; s/ \$//')"
+    if [[ -n "\$leftover_pids" ]]; then
+        trace "supervisor: bootstrapper exited but RustDedicated still running (pids: \$leftover_pids)"
+        wait_for_pids_exit "\$leftover_pids"
+        trace "supervisor: RustDedicated pid(s) exited"
+    fi
 
     if [[ ! -f "\$CONTROL_PATH" ]]; then
         break
@@ -393,6 +505,28 @@ import sys
 identity, server_port, rcon_port, app_port = sys.argv[1:5]
 candidates = []
 
+def arg_value(parts: list[str], flag: str) -> str | None:
+    # Supports both: "+flag value" and "+flag=value"
+    for index, part in enumerate(parts[:-1]):
+        if part == flag:
+            return parts[index + 1]
+    for part in parts:
+        if part.startswith(flag + "="):
+            return part[len(flag) + 1 :]
+    return None
+
+def rss_kb(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1])
+    except OSError:
+        pass
+    return 0
+
 for name in os.listdir("/proc"):
     if not name.isdigit():
         continue
@@ -414,28 +548,168 @@ for name in os.listdir("/proc"):
     if "RustDedicated" not in executable:
         continue
 
-    def arg_value(flag: str) -> str | None:
-        for index, part in enumerate(parts[:-1]):
-            if part == flag:
-                return parts[index + 1]
-        return None
-
     score = 0
-    if arg_value("+server.identity") == identity:
+    if arg_value(parts, "+server.identity") == identity:
         score += 10
-    if server_port and arg_value("+server.port") == server_port:
+    if server_port and arg_value(parts, "+server.port") == server_port:
         score += 5
-    if rcon_port and arg_value("+rcon.port") == rcon_port:
+    if rcon_port and arg_value(parts, "+rcon.port") == rcon_port:
         score += 3
-    if app_port and arg_value("+app.port") == app_port:
+    if app_port and arg_value(parts, "+app.port") == app_port:
         score += 3
 
     if score > 0:
-        candidates.append((score, int(name)))
+        pid = int(name)
+        candidates.append((score, rss_kb(pid), pid))
 
 if candidates:
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    print(candidates[0][1])
+    candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    print(candidates[0][2])
+PY
+}
+
+server_related_pids() {
+    local server="$1"
+    local cfg identity server_port rcon_port app_port
+    cfg="$(server_config_path "$server")"
+    identity="$(json_get_or_empty "$cfg" '.["server.identity"]')"
+    server_port="$(json_get_or_empty "$cfg" '.["server.port"]')"
+    rcon_port="$(json_get_or_empty "$cfg" '.["rcon.port"]')"
+    app_port="$(json_get_or_empty "$cfg" '.["app.port"]')"
+
+    if [[ -z "$identity" ]]; then
+        identity="$server"
+    fi
+
+    python3 - "$identity" "$server_port" "$rcon_port" "$app_port" <<'PY'
+import os
+import sys
+
+identity, server_port, rcon_port, app_port = sys.argv[1:5]
+
+def read_cmdline(pid: int) -> list[str]:
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read()
+    except OSError:
+        return []
+    if not raw:
+        return []
+    return [part.decode("utf-8", errors="ignore") for part in raw.split(b"\0") if part]
+
+def is_rustdedicated_pid(pid: int) -> bool:
+    parts = read_cmdline(pid)
+    if not parts:
+        return False
+    return "RustDedicated" in os.path.basename(parts[0])
+
+def arg_value(parts: list[str], flag: str) -> str | None:
+    # Supports both: "+flag value" and "+flag=value"
+    for index, part in enumerate(parts[:-1]):
+        if part == flag:
+            return parts[index + 1]
+    for part in parts:
+        if part.startswith(flag + "="):
+            return part[len(flag) + 1 :]
+    return None
+
+def rss_kb(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1])
+    except OSError:
+        pass
+    return 0
+
+def ppid(pid: int) -> int | None:
+    try:
+        # /proc/<pid>/stat: pid (comm) state ppid ...
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read().strip().split()
+            if len(data) >= 4 and data[3].isdigit():
+                return int(data[3])
+    except OSError:
+        pass
+    return None
+
+def children(pid: int) -> list[int]:
+    try:
+        raw = open(f"/proc/{pid}/task/{pid}/children", "r", encoding="utf-8", errors="ignore").read().strip()
+    except OSError:
+        return []
+    if not raw:
+        return []
+    result: list[int] = []
+    for part in raw.split():
+        if part.isdigit():
+            result.append(int(part))
+    return result
+
+matches: list[tuple[int, int, int]] = []
+
+for name in os.listdir("/proc"):
+    if not name.isdigit():
+        continue
+    pid = int(name)
+    parts = read_cmdline(pid)
+    if not parts:
+        continue
+    executable = os.path.basename(parts[0])
+    if "RustDedicated" not in executable:
+        continue
+
+    score = 0
+    if arg_value(parts, "+server.identity") == identity:
+        score += 10
+    if server_port and arg_value(parts, "+server.port") == server_port:
+        score += 5
+    if rcon_port and arg_value(parts, "+rcon.port") == rcon_port:
+        score += 3
+    if app_port and arg_value(parts, "+app.port") == app_port:
+        score += 3
+
+    if score > 0:
+        matches.append((score, rss_kb(pid), pid))
+
+matches.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+
+kill_set: set[int] = set()
+
+def add_pid(pid: int) -> None:
+    if pid <= 1:
+        return
+    kill_set.add(pid)
+
+for _, _, pid in matches:
+    add_pid(pid)
+
+    # Include RustDedicated parents (Unity bootstrapper scenarios) up to a few levels.
+    cur = pid
+    for _ in range(6):
+        parent = ppid(cur)
+        if parent is None or parent <= 1 or parent == cur:
+            break
+        if is_rustdedicated_pid(parent):
+            add_pid(parent)
+            cur = parent
+        else:
+            break
+
+    # Include RustDedicated children (Unity child server scenarios).
+    queue = [pid]
+    while queue:
+        cur = queue.pop(0)
+        for child in children(cur):
+            if is_rustdedicated_pid(child):
+                if child not in kill_set:
+                    add_pid(child)
+                    queue.append(child)
+
+for pid in sorted(kill_set):
+    print(pid)
 PY
 }
 
@@ -463,7 +737,7 @@ status_one() {
     pid="$(server_pid "$server" || true)"
     if [[ -n "$pid" ]]; then
         state="running"
-    elif [[ "$autorestart" == "yes" ]]; then
+    elif [[ "$autorestart" == "yes" && "$sess" == "yes" ]]; then
         state="starting"
     elif [[ "$sess" == "yes" ]]; then
         state="session-only"
@@ -544,15 +818,18 @@ start_one() {
 
 stop_one() {
     local server="$1"
-    local pid control_path
+    local control_path
+    local -a pids
 
     control_path="$(restart_flag_path "$server")"
     rm -f "$control_path"
 
     if ! tmux_has_session "$server"; then
-        pid="$(server_pid "$server" || true)"
-        if [[ -n "$pid" ]]; then
-            kill -TERM "$pid" 2>/dev/null || true
+        mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
+        if (( ${#pids[@]} > 0 )); then
+            for pid in "${pids[@]}"; do
+                kill -TERM "$pid" 2>/dev/null || true
+            done
             echo "stopped $server"
             return 0
         fi
@@ -561,19 +838,42 @@ stop_one() {
         return 0
     fi
 
-    pid="$(server_pid "$server" || true)"
-    if [[ -n "$pid" ]]; then
-        kill -TERM "$pid" 2>/dev/null || true
+    mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
+    if (( ${#pids[@]} > 0 )); then
+        for pid in "${pids[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+
         local waited=0
-        while kill -0 "$pid" 2>/dev/null; do
+        while (( waited < STOP_TIMEOUT_SECONDS )); do
+            local any_alive=0
+            for pid in "${pids[@]}"; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    any_alive=1
+                    break
+                fi
+            done
+            if (( any_alive == 0 )); then
+                break
+            fi
+
             sleep 1
             waited=$((waited + 1))
-            if (( waited >= STOP_TIMEOUT_SECONDS )); then
-                echo "graceful stop timed out for $server, killing process"
-                kill -9 "$pid" 2>/dev/null || true
+        done
+
+        local any_left=0
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                any_left=1
                 break
             fi
         done
+        if (( any_left == 1 )); then
+            echo "graceful stop timed out for $server, killing process"
+            for pid in "${pids[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+        fi
     fi
 
     if tmux_has_session "$server"; then
@@ -585,11 +885,18 @@ stop_one() {
 
 kill_one() {
     local server="$1"
+    local control_path
+    local -a pids
 
-    local pid
-    pid="$(server_pid "$server" || true)"
-    if [[ -n "$pid" ]]; then
-        kill -9 "$pid" 2>/dev/null || true
+    # kill is a hard stop: ensure autorestart is disabled so status doesn't get stuck in "starting"
+    control_path="$(restart_flag_path "$server")"
+    rm -f "$control_path"
+
+    mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
+    if (( ${#pids[@]} > 0 )); then
+        for pid in "${pids[@]}"; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
     fi
 
     if tmux_has_session "$server"; then
@@ -602,22 +909,34 @@ kill_one() {
 restart_one() {
     local server="$1"
     local old_pid new_pid waited control_path
+    local -a pids
 
     server_exists "$server" || die "Unknown server: $server"
     sync_config_one "$server" >/dev/null
 
     if ! tmux_has_session "$server"; then
-        old_pid="$(server_pid "$server" || true)"
-        if [[ -n "$old_pid" ]]; then
-            kill -TERM "$old_pid" 2>/dev/null || true
+        mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
+        if (( ${#pids[@]} > 0 )); then
+            for pid in "${pids[@]}"; do
+                kill -TERM "$pid" 2>/dev/null || true
+            done
             waited=0
-            while kill -0 "$old_pid" 2>/dev/null; do
-                sleep 1
-                waited=$((waited + 1))
-                if (( waited >= STOP_TIMEOUT_SECONDS )); then
-                    kill -9 "$old_pid" 2>/dev/null || true
+            while (( waited < STOP_TIMEOUT_SECONDS )); do
+                local any_alive=0
+                for pid in "${pids[@]}"; do
+                    if kill -0 "$pid" 2>/dev/null; then
+                        any_alive=1
+                        break
+                    fi
+                done
+                if (( any_alive == 0 )); then
                     break
                 fi
+                sleep 1
+                waited=$((waited + 1))
+            done
+            for pid in "${pids[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
             done
         fi
 
@@ -636,7 +955,14 @@ restart_one() {
     fi
 
     trace_server_command "$server" "restart requested"
-    kill -TERM "$old_pid" 2>/dev/null || true
+    mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
+    if (( ${#pids[@]} > 0 )); then
+        for pid in "${pids[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+    else
+        kill -TERM "$old_pid" 2>/dev/null || true
+    fi
 
     waited=0
     while (( waited < STOP_TIMEOUT_SECONDS + 30 )); do

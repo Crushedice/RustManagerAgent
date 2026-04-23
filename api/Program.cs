@@ -1398,7 +1398,7 @@ static async Task<bool> IsValidServerAsync(string server)
 
 // Parses the structured output rustmgr status actually emits:
 //   name: <server>
-//   state: running|offline|restarting|session-only
+//   state: running|offline|starting|session-only
 //   session: yes|no
 //   autorestart: yes|no
 //   pid: <number>           ? only present when running
@@ -3768,7 +3768,7 @@ public sealed class ManagedTaskRequest
 public sealed class ServerStatusResponse
 {
     public string  Name        { get; set; } = string.Empty;
-    /// <summary>running | offline | restarting | session-only | unknown</summary>
+    /// <summary>running | offline | starting | session-only | unknown</summary>
     public string  State       { get; set; } = "unknown";
     /// <summary>true only when State == "running"</summary>
     public bool    Online      { get; set; }

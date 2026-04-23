@@ -6,6 +6,11 @@ A three-service, event-driven AI operations stack for managing Rust game servers
 
 **Layer 1 — `rustmgr.sh`:** The bash authority for server lifecycle (start/stop/restart/kill/update/wipe/umod).
 
+Lifecycle notes (important for Rust Dedicated’s Unity bootstrapper + child process):
+- `stop`: disables autorestart and terminates all matching RustDedicated processes.
+- `restart`: keeps the supervisor alive and restarts by terminating the matching processes.
+- `kill`: hard stop (SIGKILL) and disables autorestart (so status won’t stick in “starting” after killing the tmux session).
+
 **Layer 2 — `api/` (ASP.NET, ~3,866 lines):** The deterministic control plane. Wraps rustmgr.sh and exposes ~40 REST endpoints covering lifecycle, RCON, console logs (with rolling offset), config read/write/validate, Oxide plugin validation, managed cron tasks, host network inspection, and a built-in `/ui` HTML dashboard. Auth via `X-Api-Key`.
 
 **Layer 3 — `agent/RustOpsAgent/` (~321KB):** The reasoning engine. It continuously polls the API, maintains a JSON memory store (incidents, action history, feedback, LLM interaction log), runs an LLM tool-calling loop (LM Studio / OpenRouter, supports fallback and race strategy with a secondary endpoint), enforces a policy layer (auto-allowed vs. approval-required actions), runs a self-repair loop (writes corrective artifacts, can trigger source builds and service restarts within a scoped root path), handles GitOps (auto-pull, push branches), monitors plugin updates via the uMod search API, and reads/writes log rules and reply-style guidance.
