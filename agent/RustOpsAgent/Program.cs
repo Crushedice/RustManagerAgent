@@ -71,12 +71,14 @@ if (kernel is null)
 var classifier = new AdminIntentClassifier(kernel, config.Llm);
 using var autotask = new AutotaskConnector(config.Integrations.Autotask);
 using var dattoRmm = new DattoRmmConnector(config.Integrations.DattoRmm);
-var connectors = new IConnectorLogSource[] { autotask, dattoRmm };
+using var itGlue = new ITGlueConnector(config.Integrations.ItGlue);
+var connectors = new IConnectorLogSource[] { autotask, dattoRmm, itGlue };
 
 var handlers = new List<IToolHandler>
 {
     new ConnectorStatusToolHandler(connectors),
     new ConnectorLogsToolHandler(connectors, neoCortex),
+    new MaintenanceTrackerToolHandler(connectors, neoCortex),
     new AgentChatToolHandler()
 };
 

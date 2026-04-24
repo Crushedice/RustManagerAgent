@@ -11,6 +11,8 @@ internal sealed class AgentConfig
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
     [JsonPropertyName("integrations")] public IntegrationSettings Integrations { get; set; } = new();
+    [JsonPropertyName("maintenance")] public MaintenanceSettings Maintenance { get; set; } = new();
+    [JsonPropertyName("research")] public ResearchSettings Research { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
 }
 
@@ -62,6 +64,13 @@ internal sealed class IntegrationSettings
         LogsEndpointPath = "/api/v2/audit/logs",
         StatusEndpointPath = "/api/v2/account"
     };
+    [JsonPropertyName("itGlue")] public ApiConnectorSettings ItGlue { get; set; } = new()
+    {
+        Enabled = false,
+        Name = "itglue",
+        LogsEndpointPath = "/api/v2/logs",
+        StatusEndpointPath = "/api/v2/account"
+    };
 }
 
 internal sealed class ApiConnectorSettings
@@ -87,6 +96,21 @@ internal sealed class GitOpsSettings
     [JsonPropertyName("baseBranch")] public string BaseBranch { get; set; } = "main";
     [JsonPropertyName("pushBranchPrefix")] public string PushBranchPrefix { get; set; } = "agent/";
     [JsonPropertyName("allowPush")] public bool AllowPush { get; set; }
+}
+
+internal sealed class MaintenanceSettings
+{
+    [JsonPropertyName("pollIntervalMultiplier")] public int PollIntervalMultiplier { get; set; } = 5; // Invoke every 5 agent polls
+    [JsonPropertyName("dryRunDefault")] public bool DryRunDefault { get; set; } = true;
+    [JsonPropertyName("autoCompleteThreshold")] public double AutoCompleteThreshold { get; set; } = 1.0; // 1.0 = require 100% devices completed
+}
+
+internal sealed class ResearchSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("stateFile")] public string StateFile { get; set; } = "data/NeoCortex/logs/warnings-knowledge.json";
+    [JsonPropertyName("pollIntervalSeconds")] public int PollIntervalSeconds { get; set; } = 3600; // 1 hour
+    [JsonPropertyName("scriptPath")] public string? ScriptPath { get; set; } // Path to research_agent.py if subprocess mode
 }
 
 internal sealed class LlmSettings
