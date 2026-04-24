@@ -346,7 +346,8 @@ IResult WriteLlmConfig(AgentLlmConfigUpdate request)
         ["RUSTOPS_LLM_SECONDARY_HTTP_REFERER"] = normalized.Secondary.HttpReferer?.Trim() ?? string.Empty,
         ["RUSTOPS_LLM_SECONDARY_APP_TITLE"] = normalized.Secondary.AppTitle?.Trim() ?? string.Empty,
         ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = normalized.UseChatSystemPrompt ? "true" : "false",
-        ["RUSTOPS_LLM_CHAT_SYSTEM_PROMPT"] = normalized.ChatSystemPrompt ?? string.Empty
+        // Newlines are escaped as literal \n so the env file stays single-line.
+        ["RUSTOPS_LLM_CHAT_SYSTEM_PROMPT"] = (normalized.ChatSystemPrompt ?? string.Empty).Replace("\r", "").Replace("\n", "\\n")
     });
     UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, normalized);
 
@@ -428,6 +429,105 @@ IResult WriteCommandConfig(AgentCommandConfigUpdate request)
 
 app.MapGet("/agent/commands/config", ReadCommandConfig);
 app.MapPut("/agent/commands/config", WriteCommandConfig);
+
+app.MapGet("/agent/incidents/list", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var incidentsPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents.jsonl");
+    var feedbackPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents-feedback.json");
+
+    var feedbacks = new Dictionary<string, IncidentFeedbackEntry>(StringComparer.OrdinalIgnoreCase);
+    if (File.Exists(feedbackPath))
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(File.ReadAllText(feedbackPath));
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                feedbacks[prop.Name] = new IncidentFeedbackEntry(
+                    prop.Value.TryGetProperty("verdict", out var v) ? v.GetString() : null,
+                    prop.Value.TryGetProperty("note", out var n) ? n.GetString() : null,
+                    prop.Value.TryGetProperty("answeredAtUtc", out var a) && a.TryGetDateTime(out var dt) ? dt : null);
+            }
+        }
+        catch { /* ignore parse errors */ }
+    }
+
+    if (!File.Exists(incidentsPath))
+        return Results.Ok(Array.Empty<object>());
+
+    var incidents = File.ReadLines(incidentsPath)
+        .Where(line => !string.IsNullOrWhiteSpace(line))
+        .Select(line =>
+        {
+            try
+            {
+                var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                var id = root.TryGetProperty("id", out var idNode) ? idNode.GetString() ?? string.Empty : string.Empty;
+                feedbacks.TryGetValue(id, out var fb);
+                return (object)new
+                {
+                    id,
+                    classification = root.TryGetProperty("classification", out var c) ? c.GetString() : null,
+                    request = root.TryGetProperty("request", out var r) ? r.GetString() : null,
+                    failureReason = root.TryGetProperty("failureReason", out var f) ? f.GetString() : null,
+                    missingCapability = root.TryGetProperty("missingCapability", out var m) ? m.GetString() : null,
+                    recurrencePrevention = root.TryGetProperty("recurrencePrevention", out var rp) ? rp.GetString() : null,
+                    timestamp = root.TryGetProperty("timestamp", out var ts) && ts.TryGetDateTime(out var tdt) ? tdt : (DateTime?)null,
+                    resolved = root.TryGetProperty("resolved", out var res) && res.GetBoolean(),
+                    adminVerdict = fb?.Verdict,
+                    adminNote = fb?.Note,
+                    answeredAtUtc = fb?.AnsweredAtUtc
+                };
+            }
+            catch { return null; }
+        })
+        .Where(item => item is not null)
+        .Reverse()
+        .Take(50)
+        .ToList();
+
+    return Results.Ok(incidents);
+});
+
+app.MapPost("/agent/incidents/{id}/feedback", async (string id, HttpRequest request) =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var feedbackPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents-feedback.json");
+
+    string body;
+    using (var reader = new StreamReader(request.Body))
+        body = await reader.ReadToEndAsync();
+
+    string? verdict = null;
+    string? note = null;
+    try
+    {
+        var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.TryGetProperty("verdict", out var v)) verdict = v.GetString();
+        if (doc.RootElement.TryGetProperty("note", out var n)) note = n.GetString();
+    }
+    catch { return Results.BadRequest(new ApiError("invalid_json", "Could not parse request body.")); }
+
+    var feedbacks = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+    if (File.Exists(feedbackPath))
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(File.ReadAllText(feedbackPath));
+            foreach (var prop in doc.RootElement.EnumerateObject())
+                feedbacks[prop.Name] = JsonSerializer.Deserialize<object>(prop.Value.GetRawText())!;
+        }
+        catch { /* start fresh */ }
+    }
+
+    feedbacks[id] = new { verdict, note, answeredAtUtc = DateTime.UtcNow };
+    Directory.CreateDirectory(Path.GetDirectoryName(feedbackPath)!);
+    File.WriteAllText(feedbackPath, JsonSerializer.Serialize(feedbacks, new JsonSerializerOptions { WriteIndented = true }));
+
+    return Results.Ok(new { id, verdict, note, savedAtUtc = DateTime.UtcNow });
+});
 
 app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnapshotAsync()));
 
@@ -1986,7 +2086,10 @@ static AgentLlmConfigView ReadAgentLlmConfig(string envPath, string agentSetting
         UseChatSystemPrompt = TryParseBooleanValue(
             GetEnvValue(env, "RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"),
             llm?.UseChatSystemPrompt ?? false),
-        ChatSystemPrompt = GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
+        // Unescape \n sequences stored by WriteLlmConfig to keep env file single-line.
+        ChatSystemPrompt = (GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT") is { } envPrompt
+            ? envPrompt.Replace("\\n", "\n")
+            : null)
             ?? llm?.ChatSystemPrompt
             ?? "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild."
     };
@@ -3076,7 +3179,6 @@ static string BuildDashboardHtml() => """
     .unknown,.pending,.degraded,.starting { background:rgba(244,185,92,.14); color:var(--warn); }
     table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(39,64,87,.7); vertical-align:top; font-size:14px; }
-    .list { display:grid; gap:10px; }
     .item { padding:12px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:rgba(21,36,52,.55); }
     .mailbox-grid,.kv { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     pre { white-space:pre-wrap; font-size:12px; color:var(--muted); margin:0; }
@@ -3090,7 +3192,8 @@ static string BuildDashboardHtml() => """
     .tiny { font-size:12px; }
     .chip-list { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
     .chip { display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(102,200,255,.10); border:1px solid rgba(102,200,255,.22); color:var(--text); font-size:12px; }
-    .codebox { padding:14px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:#08131d; min-height:200px; }
+    .codebox { padding:14px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:#08131d; min-height:200px; max-height:420px; overflow-y:auto; }
+    .list { display:grid; gap:10px; max-height:420px; overflow-y:auto; padding-right:4px; }
     .toolbar { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-top:12px; flex-wrap:wrap; }
     @media (max-width:1080px) { .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } .grid,.topbar,.mailbox-grid,.kv,.row,.micro-grid { grid-template-columns:1fr; display:grid; } }
   </style>
@@ -3127,6 +3230,7 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
         <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
         <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
+        <div class="card wide"><h2>Incident Feedback <span class="legend" data-tip="Each row is an incident the agent recorded when it failed to fulfill a request. Use the verdict buttons and note field to give the agent real feedback — it reads this to improve future handling.">?</span></h2><div id="incidentFeedbackStatus" class="muted" style="margin-bottom:10px;">Loading incidents…</div><div id="incidentFeedbackList" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
         <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
       </div>
@@ -3324,14 +3428,63 @@ static string BuildDashboardHtml() => """
       } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
     }
 
-    tabs.forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.target)));
-    $('refresh').addEventListener('click', load);
+    async function loadIncidentFeedback() {
+      try {
+        const incidents = await fetchJson('/agent/incidents/list');
+        $('incidentFeedbackStatus').textContent = `${incidents.length} incident(s) recorded.`;
+        if (!incidents.length) { $('incidentFeedbackList').innerHTML = '<div class="muted">No incidents recorded yet.</div>'; return; }
+        $('incidentFeedbackList').innerHTML = incidents.map(inc => {
+          const verdictBadge = inc.adminVerdict ? `<span class="pill ${inc.adminVerdict === 'resolved' ? 'ok' : inc.adminVerdict === 'wontfix' ? 'offline' : 'unknown'}" style="margin-left:8px;">${esc(inc.adminVerdict)}</span>` : '';
+          return `<div class="item" data-incident-id="${esc(inc.id)}">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong>${esc(inc.classification || 'unknown')}</strong>${verdictBadge}
+              <span class="muted tiny">${esc(fmt(inc.timestamp))}</span>
+            </div>
+            <div class="muted" style="margin-top:6px;">${esc(inc.request || '')}</div>
+            <div class="tiny muted" style="margin-top:6px;">Failure: ${esc(inc.failureReason || 'n/a')}</div>
+            <div class="tiny muted">Missing: ${esc(inc.missingCapability || 'n/a')}</div>
+            <div class="tiny muted">Prevention: ${esc(inc.recurrencePrevention || 'n/a')}</div>
+            ${inc.adminNote ? `<div class="tiny" style="margin-top:6px;color:var(--accent);">Admin note: ${esc(inc.adminNote)}</div>` : ''}
+            <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="resolved" style="padding:6px 10px;font-size:12px;">Resolved</button>
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="wontfix" style="padding:6px 10px;font-size:12px;">Won&apos;t fix</button>
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="needs-work" style="padding:6px 10px;font-size:12px;">Needs work</button>
+              <input type="text" class="incident-note" data-id="${esc(inc.id)}" placeholder="Admin note (optional)" value="${esc(inc.adminNote || '')}" style="flex:1;min-width:140px;padding:6px 10px;font-size:12px;">
+            </div>
+          </div>`;
+        }).join('');
+      } catch (error) { $('incidentFeedbackStatus').textContent = `Failed to load: ${error.message}`; }
+    }
+
+    async function submitIncidentFeedback(id, verdict, note) {
+      try {
+        await fetchJson(`/agent/incidents/${encodeURIComponent(id)}/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ verdict, note }) });
+        await loadIncidentFeedback();
+      } catch (error) { alert(`Failed to save feedback: ${error.message}`); }
+    }
+
+    tabs.forEach(tab => tab.addEventListener('click', () => {
+      activateTab(tab.dataset.target);
+      if (tab.dataset.target === 'agentGroup') loadIncidentFeedback();
+    }));
+    $('refresh').addEventListener('click', () => { load(); loadIncidentFeedback(); });
     $('saveRules').addEventListener('click', saveRules);
     $('saveOllamaConfig').addEventListener('click', saveOllamaConfig);
     $('saveCommandConfig').addEventListener('click', saveCommandConfig);
     $('commandFreeMode').addEventListener('change', () => { $('commandAllowList').disabled = $('commandFreeMode').checked; });
-    document.addEventListener('click', event => { const target = event.target; if (target instanceof HTMLElement && target.classList.contains('use-model')) $('ollamaModel').value = target.dataset.model || ''; });
-    if (keyInput.value) load();
+    document.addEventListener('click', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.classList.contains('use-model')) { $('ollamaModel').value = target.dataset.model || ''; return; }
+      if (target.classList.contains('incident-verdict')) {
+        const id = target.dataset.id || '';
+        const verdict = target.dataset.verdict || '';
+        const noteEl = document.querySelector(`.incident-note[data-id="${CSS.escape(id)}"]`);
+        const note = noteEl instanceof HTMLInputElement ? noteEl.value.trim() : '';
+        submitIncidentFeedback(id, verdict, note);
+      }
+    });
+    if (keyInput.value) { load(); loadIncidentFeedback(); }
   </script>
 </body>
 </html>
@@ -4264,6 +4417,8 @@ public sealed class ServerConfig
 }
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
+
+internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 
 /// <summary>
 /// Lightweight RCON wrapper for Rust server console interaction.

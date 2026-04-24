@@ -93,9 +93,30 @@ if (config.PluginUpdates.DownloadEnabled)
     Directory.CreateDirectory(config.PluginUpdates.StagingPath);
 }
 
+var serverControlOutboxPath = config.Outbox.MessageOutboxPath;
+Action<string, string, string?> serverStatusNotifier = (adminId, message, serverName) =>
+{
+    var id = Guid.NewGuid().ToString("N");
+    var payload = new AdapterMessage
+    {
+        Id = id,
+        AdminId = adminId,
+        Kind = "chat-reply",
+        Audience = "admins",
+        TargetAdminId = adminId,
+        ServerName = serverName ?? string.Empty,
+        Message = message,
+        CreatedAtUtc = DateTime.UtcNow
+    };
+    Directory.CreateDirectory(serverControlOutboxPath);
+    File.WriteAllText(
+        Path.Combine(serverControlOutboxPath, $"{payload.CreatedAtUtc:yyyyMMddHHmmssfff}-chat-reply-{id}.json"),
+        System.Text.Json.JsonSerializer.Serialize(payload, JsonDefaults.Default));
+};
+
 var handlers = new List<IToolHandler>
 {
-    new RustServerControlToolHandler(apiClient),
+    new RustServerControlToolHandler(apiClient, serverStatusNotifier),
     new RustStatusToolHandler(apiClient),
     new RustPlayerLookupToolHandler(apiClient),
     new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution),

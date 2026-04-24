@@ -167,10 +167,12 @@ internal sealed class RustStatusToolHandler : IToolHandler
 internal sealed class RustServerControlToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
 
-    public RustServerControlToolHandler(RustOpsApiClient api)
+    public RustServerControlToolHandler(RustOpsApiClient api, Action<string, string, string?>? notifyAdmin = null)
     {
         _api = api;
+        _notifyAdmin = notifyAdmin;
     }
 
     public string Name => "rust.server.control";
@@ -193,27 +195,9 @@ internal sealed class RustServerControlToolHandler : IToolHandler
                 ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        if (message.Contains("countdown") || message.Contains("in 3") || message.Contains("in three") || message.Contains("3 min"))
+        if (message.Contains("restart"))
         {
-            // Fire-and-forget: do not block inbox processing for 3 minutes.
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    using var _ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command", new { command = "say Server restart in 3 minutes" }, CancellationToken.None);
-                    await Task.Delay(TimeSpan.FromMinutes(3), CancellationToken.None);
-                    using var __ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, CancellationToken.None);
-                }
-                catch (Exception ex)
-                {
-                    RustOpsSentry.CaptureException(
-                        ex,
-                        $"Scheduled restart countdown failed for server '{server}'.",
-                        "agent.server-control",
-                        extras: new Dictionary<string, object?> { ["server"] = server });
-                }
-            });
-            return new ToolExecutionResult(true, $"Restart countdown started for {server}. Server will restart in ~3 minutes.", server, true);
+            return await HandleRestartAsync(context, server, cancellationToken);
         }
 
         var endpoint = ResolveEndpoint(message);
@@ -221,11 +205,170 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         return new ToolExecutionResult(true, $"Executed {endpoint.Split('/').Last()} for {server}.", server, true, Payload: response.RootElement.ToString());
     }
 
+    private async Task<ToolExecutionResult> HandleRestartAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
+    {
+        var seconds = ParseRestartSeconds(context.Message);
+        if (seconds is null)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"How many seconds should the countdown be before {server} restarts? (e.g., say 'restart {server} in 300 seconds')",
+                server, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Single);
+        }
+
+        // Send RCON restart command (Rust's graceful countdown shutdown).
+        // If RCON is unavailable, fall back to the API restart endpoint which triggers rustmgr immediately.
+        var rconSent = false;
+        try
+        {
+            var rconResult = await RustDirectRconHelper.TryExecuteAsync(server, $"restart {seconds}", cancellationToken);
+            rconSent = !string.IsNullOrWhiteSpace(rconResult);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureMessage(
+                $"RCON restart command failed for '{server}', falling back to API.",
+                "agent.server-control", Sentry.SentryLevel.Warning,
+                extras: new Dictionary<string, object?> { ["server"] = server, ["exception"] = ex.Message });
+        }
+
+        if (!rconSent)
+        {
+            using var _ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, cancellationToken);
+        }
+
+        var method = rconSent ? $"RCON restart {seconds}s countdown" : "API restart (immediate)";
+        var adminId = context.AdminId;
+        var notifyAdmin = _notifyAdmin;
+        var api = _api;
+        var countdownSeconds = seconds.Value;
+
+        // Background task: monitor offline → online transition and notify the admin.
+        _ = Task.Run(async () =>
+        {
+            await MonitorRestartAsync(server, countdownSeconds, adminId, notifyAdmin, api);
+        });
+
+        return new ToolExecutionResult(
+            true,
+            $"Restart initiated for {server} ({method}). I'll notify you when the server goes offline and again when it's back.",
+            server, true,
+            SelectedServers: new[] { server },
+            ScopeKind: ServerScopeKind.Single);
+    }
+
+    private static async Task MonitorRestartAsync(
+        string server, int countdownSeconds,
+        string adminId, Action<string, string, string?>? notifyAdmin, RustOpsApiClient api)
+    {
+        // Wait until close to when the server should shut down, then start polling.
+        var preWait = Math.Max(10, countdownSeconds - 15);
+        await Task.Delay(TimeSpan.FromSeconds(preWait));
+
+        // Phase 1: wait for the server to go offline (up to 5 min after the countdown expires).
+        var offlineDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(5);
+        var wentOffline = false;
+        while (DateTime.UtcNow < offlineDeadline)
+        {
+            if (!await IsServerOnlineAsync(server, api))
+            {
+                wentOffline = true;
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server is now offline — waiting for the process to restart.", server);
+                break;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(12));
+        }
+
+        if (!wentOffline)
+        {
+            notifyAdmin?.Invoke(adminId, $"[{server}] Server did not appear to go offline within the expected window — please check manually.", server);
+            return;
+        }
+
+        // Phase 2: wait for the server process to come back (rustmgr.sh handles the actual restart).
+        // Rust servers have a bootstrapper phase followed by the long-lived server process; the
+        // health endpoint going to "running" means the server is fully up and accepting connections.
+        var onlineDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(15);
+        var processUpNotified = false;
+        while (DateTime.UtcNow < onlineDeadline)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            var online = await IsServerOnlineAsync(server, api);
+
+            // Detect the moment the process first comes up (may still be loading).
+            if (!processUpNotified && await IsProcessUpAsync(server, api))
+            {
+                processUpNotified = true;
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server process is up — loading world, please wait.", server);
+            }
+
+            if (online)
+            {
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server is back online and accepting connections. Restart complete.", server);
+                return;
+            }
+        }
+
+        notifyAdmin?.Invoke(adminId, $"[{server}] Server has been offline for 15 minutes and has not finished starting. Please investigate manually.", server);
+    }
+
+    private static async Task<bool> IsServerOnlineAsync(string server, RustOpsApiClient api)
+    {
+        try
+        {
+            using var health = await api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", CancellationToken.None);
+            var root = health.RootElement;
+            var state = ExtractState(root);
+            return state.Equals("running", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("online", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("healthy", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static async Task<bool> IsProcessUpAsync(string server, RustOpsApiClient api)
+    {
+        try
+        {
+            using var health = await api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", CancellationToken.None);
+            var root = health.RootElement;
+            var state = ExtractState(root);
+            return !string.Equals(state, "offline", StringComparison.OrdinalIgnoreCase) &&
+                   !string.Equals(state, "unknown", StringComparison.OrdinalIgnoreCase) &&
+                   !string.IsNullOrWhiteSpace(state);
+        }
+        catch { return false; }
+    }
+
+    private static string ExtractState(JsonElement root)
+    {
+        if (root.TryGetProperty("status", out var statusNode) &&
+            statusNode.ValueKind == JsonValueKind.Object &&
+            statusNode.TryGetProperty("state", out var nested))
+            return nested.GetString() ?? string.Empty;
+        return root.TryGetProperty("state", out var s) ? s.GetString() ?? string.Empty : string.Empty;
+    }
+
+    private static int? ParseRestartSeconds(string message)
+    {
+        // Patterns: "restart in 300 seconds", "restart 300s", "restart in 5 minutes", "restart 5min"
+        var minuteMatch = Regex.Match(message, @"restart\s+(?:in\s+)?(\d+)\s*(?:minute|min|m)\b", RegexOptions.IgnoreCase);
+        if (minuteMatch.Success && int.TryParse(minuteMatch.Groups[1].Value, out var mins))
+            return mins * 60;
+
+        var secondMatch = Regex.Match(message, @"restart\s+(?:in\s+)?(\d+)\s*(?:second|sec|s)?\b", RegexOptions.IgnoreCase);
+        if (secondMatch.Success && int.TryParse(secondMatch.Groups[1].Value, out var secs) && secs > 0)
+            return secs;
+
+        return null;
+    }
+
     private static string ResolveEndpoint(string message)
     {
         if (message.Contains("kill")) return "/servers/{server}/kill";
         if (message.Contains("stop")) return "/servers/{server}/stop";
-        if (message.Contains("restart")) return "/servers/{server}/restart";
         if (message.Contains("update")) return "/servers/{server}/update";
         return "/servers/{server}/start";
     }
@@ -259,6 +402,17 @@ internal sealed class RustRconToolHandler : IToolHandler
                 null, false, "clarification_required",
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Unspecified);
+        }
+
+        // If the admin asks for the live console/rolling log, return the RCON snapshot.
+        var msgLower = context.Message.ToLowerInvariant();
+        if (msgLower.Contains("console") || msgLower.Contains("rolling log") || msgLower.Contains("show log"))
+        {
+            var log = RustDirectRconHelper.GetRollingLog(server);
+            if (log.Count == 0)
+                return new ToolExecutionResult(true, $"No RCON console lines captured yet for {server}. The rolling log populates once the first RCON command is sent to that server.", server, false);
+            var preview = string.Join('\n', log.TakeLast(40));
+            return new ToolExecutionResult(true, $"RCON console ({log.Count} lines, last 40):\n{TruncateOutput(preview, 1200)}", server, false);
         }
 
         var command = context.Route.Slots.CommandText;
@@ -859,6 +1013,13 @@ internal static class RustToolHelper
 internal static class RustDirectRconHelper
 {
     private static readonly ConcurrentDictionary<string, PersistentRconSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
+
+    public static IReadOnlyList<string> GetRollingLog(string server)
+    {
+        if (Sessions.TryGetValue(server, out var session))
+            return session.Snapshot();
+        return Array.Empty<string>();
+    }
 
     public static async Task<string?> TryExecuteAsync(string server, string command, CancellationToken cancellationToken)
     {
