@@ -24,9 +24,11 @@ internal sealed class AgentRuntime
     private readonly Kernel? _kernel;
     private readonly Dictionary<string, long> _logOffsets = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _observationFingerprints = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _appliedAffinityPids = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
+    private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
     private volatile bool _stop;
 
     public AgentRuntime(
@@ -79,6 +81,7 @@ internal sealed class AgentRuntime
             await ProcessChatInboxAsync(cancellationToken);
             await ObserveServersAsync(cancellationToken);
             await ReviewIncidentsAsync(cancellationToken);
+            await AnalyzePlayerSentimentAsync(cancellationToken);
             _legacyState.Save();
             tick++;
             await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
@@ -250,8 +253,9 @@ internal sealed class AgentRuntime
             if (item is null || string.IsNullOrWhiteSpace(item.Message))
                 return;
 
-            // Detect inline importance rule directives before routing.
-            var quickReply = TryHandleLearnDirective(item.Message);
+            // Detect inline learn directives and agent self-control before routing.
+            var quickReply = TryHandleLearnDirective(item.Message)
+                ?? await TryHandleAgentControlAsync(item.Message, cancellationToken);
             if (quickReply is not null)
             {
                 WriteOutbox(item.AdminId, quickReply, item.RequestId ?? item.Id, null);
@@ -280,7 +284,10 @@ internal sealed class AgentRuntime
                 pendingIntent != AdminIntentType.Clarification)
             {
                 var serverName = route.Slots.ServerName ?? state.LastServerName;
-                var overriddenSlots = route.Slots with { ServerName = serverName };
+                // Carry forward the last known command so a server-clarification answer
+                // doesn't lose the command context (e.g. "modded" after "which server?").
+                var commandText = route.Slots.CommandText ?? state.LastCommandText;
+                var overriddenSlots = route.Slots with { ServerName = serverName, CommandText = commandText };
                 route = route with
                 {
                     Intent = pendingIntent,
@@ -289,6 +296,27 @@ internal sealed class AgentRuntime
                     ClassifierSource = route.ClassifierSource + "+pending-clarification-override"
                 };
                 Console.WriteLine($"[chat] Overriding intent to {pendingIntent} (pending clarification answer)");
+            }
+
+            // Inject previous command when user says "repeat" / "execute previous" / etc.
+            if (IsRepeatPreviousCommand(item.Message) &&
+                route.Intent == AdminIntentType.RconCommand &&
+                string.IsNullOrWhiteSpace(route.Slots.CommandText) &&
+                !string.IsNullOrWhiteSpace(state.LastCommandText))
+            {
+                var server = route.Slots.ServerName ?? state.LastServerName;
+                route = route with
+                {
+                    Slots = route.Slots with
+                    {
+                        CommandText = state.LastCommandText,
+                        ServerName = server,
+                        ScopeKind = server is not null ? ServerScopeKind.Single : ServerScopeKind.Unspecified
+                    },
+                    NeedsClarification = string.IsNullOrWhiteSpace(server),
+                    ClassifierSource = route.ClassifierSource + "+repeat-previous"
+                };
+                Console.WriteLine($"[chat] Injecting previous command '{state.LastCommandText}' (repeat-previous)");
             }
 
             Console.WriteLine($"[chat] {item.AdminId}: intent={route.Intent} target={route.TargetRef ?? "?"} llm={route.ClassifierSource}");
@@ -399,6 +427,45 @@ internal sealed class AgentRuntime
     private string? TryHandleLearnDirective(string message)
     {
         var lowered = message.Trim().ToLowerInvariant();
+
+        // "allow <command>" — add command to RCON allowlist
+        if (lowered.StartsWith("allow ", StringComparison.Ordinal))
+        {
+            var commandRoot = message["allow ".Length..].Trim().ToLowerInvariant().Split(' ')[0].Trim('\'', '"', '`');
+            if (!string.IsNullOrWhiteSpace(commandRoot) && !commandRoot.Contains(' '))
+            {
+                var policy = _neoCortex.LoadCommandPolicy();
+                if (!policy.Commands.TryGetValue(commandRoot, out var record))
+                {
+                    record = new CommandRecord { Command = commandRoot };
+                    policy.Commands[commandRoot] = record;
+                }
+                record.AutoAllowed = true;
+                record.RequiresApproval = false;
+                _neoCortex.SaveCommandPolicy(policy);
+                return $"Got it — '{commandRoot}' is now allowed. Try your command again.";
+            }
+        }
+
+        // "deny <command>" / "block <command>" — flag as requiring approval
+        if (lowered.StartsWith("deny ", StringComparison.Ordinal) || lowered.StartsWith("block ", StringComparison.Ordinal))
+        {
+            var prefix = lowered.StartsWith("deny ") ? "deny " : "block ";
+            var commandRoot = message[prefix.Length..].Trim().ToLowerInvariant().Split(' ')[0].Trim('\'', '"', '`');
+            if (!string.IsNullOrWhiteSpace(commandRoot) && !commandRoot.Contains(' '))
+            {
+                var policy = _neoCortex.LoadCommandPolicy();
+                if (!policy.Commands.TryGetValue(commandRoot, out var record))
+                {
+                    record = new CommandRecord { Command = commandRoot };
+                    policy.Commands[commandRoot] = record;
+                }
+                record.RequiresApproval = true;
+                record.AutoAllowed = false;
+                _neoCortex.SaveCommandPolicy(policy);
+                return $"Got it — '{commandRoot}' now requires explicit approval before running.";
+            }
+        }
 
         // "importance +pattern" — add importance rule
         if (lowered.StartsWith("importance +", StringComparison.Ordinal))
@@ -513,6 +580,21 @@ internal sealed class AgentRuntime
         using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
         var root = health.RootElement;
         var state = ReadHealthState(root);
+
+        // Apply CPU affinity when configured and server is running with a fresh PID.
+        if (_config.CpuAffinity.Enabled &&
+            _config.CpuAffinity.Servers.TryGetValue(server, out var cpuList) &&
+            root.TryGetProperty("status", out var statusNode) &&
+            statusNode.TryGetProperty("pid", out var pidNode) &&
+            pidNode.ValueKind == JsonValueKind.Number)
+        {
+            var pid = pidNode.GetInt32();
+            if (pid > 0 && (!_appliedAffinityPids.TryGetValue(server, out var lastPid) || lastPid != pid))
+            {
+                await TryApplyAffinityAsync(server, pid, cpuList, cancellationToken);
+                _appliedAffinityPids[server] = pid;
+            }
+        }
         var recentErrors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
             ? errorsNode.EnumerateArray().Select(item => item.ToString()).Where(item => !string.IsNullOrWhiteSpace(item)).Take(3).ToList()
             : new List<string>();
@@ -556,6 +638,40 @@ internal sealed class AgentRuntime
         }, cancellationToken);
     }
 
+    private static readonly System.Text.RegularExpressions.Regex ChatLineRegex = new(
+        @"\[Chat\]|\bCHAT\b",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // Extracts (playerName, chatMessage) from a Rust chat log line, or returns null if not a chat line.
+    private static (string Player, string Message)? TryParseChatLine(string line)
+    {
+        if (!ChatLineRegex.IsMatch(line))
+            return null;
+
+        // Format: ... [Chat] PlayerName[steamId]: message
+        var chatIdx = line.IndexOf("[Chat]", StringComparison.OrdinalIgnoreCase);
+        if (chatIdx < 0)
+            chatIdx = line.IndexOf("CHAT", StringComparison.OrdinalIgnoreCase);
+        if (chatIdx < 0)
+            return null;
+
+        var after = line[(chatIdx + 6)..].TrimStart();
+        // PlayerName[steamId64]: message  OR  PlayerName: message
+        var colonIdx = after.IndexOf(':');
+        if (colonIdx <= 0)
+            return null;
+
+        var nameRaw = after[..colonIdx];
+        var bracketIdx = nameRaw.IndexOf('[');
+        var playerName = (bracketIdx > 0 ? nameRaw[..bracketIdx] : nameRaw).Trim();
+        var chatMessage = after[(colonIdx + 1)..].Trim();
+
+        if (string.IsNullOrWhiteSpace(playerName) || string.IsNullOrWhiteSpace(chatMessage))
+            return null;
+
+        return (playerName, chatMessage);
+    }
+
     private async Task ObserveServerLogsAsync(string server, CancellationToken cancellationToken)
     {
         _logOffsets.TryGetValue(server, out var offset);
@@ -569,22 +685,90 @@ internal sealed class AgentRuntime
         }
 
         var knowledge = _neoCortex.LoadLogs();
-        var changed = false;
+        var consoleMonitor = _config.ConsoleMonitor.Enabled ? _neoCortex.LoadConsoleMonitor() : null;
+        var playerChat = _config.ConsoleMonitor.Enabled ? _neoCortex.LoadPlayerChat() : null;
+
+        if (!consoleMonitor!.Servers.TryGetValue(server, out var serverConsole))
+        {
+            serverConsole = new ServerConsoleState();
+            consoleMonitor.Servers[server] = serverConsole;
+        }
+
+        var logChanged = false;
+        var consoleChanged = false;
+        var chatChanged = false;
+
         if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
         {
             foreach (var entry in entriesNode.EnumerateArray())
             {
                 var line = entry.TryGetProperty("message", out var messageNode) ? messageNode.GetString() ?? string.Empty : string.Empty;
                 if (string.IsNullOrWhiteSpace(line))
-                {
                     continue;
-                }
 
                 var lowered = line.ToLowerInvariant();
-                if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
+
+                // --- Player chat stream ---
+                var parsed = TryParseChatLine(line);
+                if (parsed.HasValue && playerChat is not null)
                 {
-                    continue;
+                    playerChat.RecentMessages.Add(new PlayerChatEntry
+                    {
+                        ServerName = server,
+                        PlayerName = parsed.Value.Player,
+                        Message = parsed.Value.Message,
+                        CapturedAtUtc = DateTime.UtcNow
+                    });
+                    chatChanged = true;
+                    continue; // chat lines don't also go to the error console
                 }
+
+                // --- Console error/warning stream ---
+                if (consoleMonitor is not null)
+                {
+                    var category = ClassifyConsoleLine(lowered);
+                    if (category is "error" or "warning")
+                    {
+                        var key = NormalizeErrorKey(line);
+                        var existing = serverConsole.RecentErrors
+                            .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
+                        if (existing is not null)
+                        {
+                            existing.Count++;
+                            existing.LastSeenAtUtc = DateTime.UtcNow;
+                        }
+                        else
+                        {
+                            serverConsole.RecentErrors.Add(new ConsoleErrorEntry
+                            {
+                                Message = key,
+                                Category = category,
+                                FirstSeenAtUtc = DateTime.UtcNow,
+                                LastSeenAtUtc = DateTime.UtcNow
+                            });
+                        }
+                        serverConsole.TotalErrorsIngested++;
+                        serverConsole.ErrorCountSinceLastAlert++;
+                        consoleChanged = true;
+                    }
+
+                    // Track repeating info/debug messages
+                    if (category is "info" or "debug")
+                    {
+                        var key = NormalizeErrorKey(line);
+                        serverConsole.RepeatingMessages.TryGetValue(key, out var cnt);
+                        serverConsole.RepeatingMessages[key] = cnt + 1;
+                        if (cnt + 1 == _config.ConsoleMonitor.RepeatThreshold)
+                        {
+                            Console.WriteLine($"[console] {server}: repeating message ({cnt + 1}x): {(key.Length > 80 ? key[..80] + "..." : key)}");
+                            consoleChanged = true;
+                        }
+                    }
+                }
+
+                // --- Legacy log knowledge stream ---
+                if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
+                    continue;
 
                 var importance = ScoreImportance(lowered, knowledge.ImportanceRules);
                 knowledge.RecentEntries.Add(new LogObservation
@@ -594,14 +778,51 @@ internal sealed class AgentRuntime
                     Importance = importance,
                     CapturedAtUtc = DateTime.UtcNow
                 });
-                changed = true;
+                logChanged = true;
             }
         }
 
-        if (!changed)
+        // Trim and persist console monitor
+        if (consoleChanged && consoleMonitor is not null)
         {
-            return;
+            serverConsole.RecentErrors = serverConsole.RecentErrors
+                .OrderByDescending(e => e.LastSeenAtUtc)
+                .Take(100)
+                .ToList();
+
+            // Keep repeating map bounded
+            if (serverConsole.RepeatingMessages.Count > 200)
+            {
+                var top = serverConsole.RepeatingMessages
+                    .OrderByDescending(kv => kv.Value)
+                    .Take(100)
+                    .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                serverConsole.RepeatingMessages = top;
+            }
+
+            // Escalate if error count exceeds threshold
+            if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
+            {
+                Console.WriteLine($"[console] ESCALATE {server}: {serverConsole.ErrorCountSinceLastAlert} errors since last alert.");
+                serverConsole.LastAlertAtUtc = DateTime.UtcNow;
+                serverConsole.ErrorCountSinceLastAlert = 0;
+            }
+
+            consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
+            _neoCortex.SaveConsoleMonitor(consoleMonitor);
         }
+
+        // Trim and persist player chat
+        if (chatChanged && playerChat is not null)
+        {
+            playerChat.RecentMessages = playerChat.RecentMessages
+                .TakeLast(_config.ConsoleMonitor.MaxChatMessages)
+                .ToList();
+            _neoCortex.SavePlayerChat(playerChat);
+        }
+
+        if (!logChanged)
+            return;
 
         var newHighImportance = knowledge.RecentEntries
             .Where(e => e.ServerName.Equals(server, StringComparison.OrdinalIgnoreCase) && e.Importance >= 3)
@@ -615,6 +836,99 @@ internal sealed class AgentRuntime
 
         knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
         _neoCortex.SaveLogs(knowledge);
+    }
+
+    private static string ClassifyConsoleLine(string lowered)
+    {
+        if (lowered.Contains("exception") || lowered.Contains("fatal") || lowered.Contains("crash") ||
+            (lowered.Contains("error") && !lowered.Contains("errorcorrection")))
+            return "error";
+        if (lowered.Contains("warn"))
+            return "warning";
+        if (lowered.Contains("debug") || lowered.Contains("[d]"))
+            return "debug";
+        return "info";
+    }
+
+    private static string NormalizeErrorKey(string line)
+    {
+        // Strip timestamps and volatile parts to group repeated messages.
+        var normalized = System.Text.RegularExpressions.Regex.Replace(line, @"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", "<ts>");
+        normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\d{2}:\d{2}:\d{2}", "<time>");
+        normalized = System.Text.RegularExpressions.Regex.Replace(normalized, @"\b\d+\b", "<n>");
+        return normalized.Length > 200 ? normalized[..200] : normalized;
+    }
+
+    private async Task AnalyzePlayerSentimentAsync(CancellationToken cancellationToken)
+    {
+        if (!_config.ConsoleMonitor.Enabled)
+            return;
+
+        var interval = TimeSpan.FromMinutes(Math.Max(10, _config.ConsoleMonitor.SentimentAnalysisIntervalMinutes));
+        if (DateTime.UtcNow - _lastSentimentAnalysisAtUtc < interval)
+            return;
+
+        _lastSentimentAnalysisAtUtc = DateTime.UtcNow;
+
+        var chat = _neoCortex.LoadPlayerChat();
+        if (chat.RecentMessages.Count < 5)
+            return;
+
+        if (_kernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
+            return;
+
+        var recent = chat.RecentMessages.TakeLast(50).ToList();
+        var chatText = string.Join("\n", recent.Select(m => $"[{m.ServerName}] {m.PlayerName}: {m.Message}"));
+
+        var prompt = $"""
+You are analysing player chat from a Rust game server community.
+Return strict JSON only with keys:
+sentimentScore, sentimentLabel, sentimentSummary, keyThemes, constructiveFeedback
+
+Constraints:
+- sentimentScore: number 0.0–10.0 (0=very negative, 5=neutral, 10=very positive)
+- sentimentLabel: "positive" | "neutral" | "negative" | "mixed"
+- sentimentSummary: 1-2 sentences describing overall player mood
+- keyThemes: array of up to 5 short strings (topics players talk about)
+- constructiveFeedback: array of up to 5 short strings (actionable feedback from players)
+
+Recent player chat (newest last):
+{chatText}
+""";
+
+        try
+        {
+            var response = await _kernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            var raw = response.GetValue<string>() ?? string.Empty;
+            var json = TryExtractJson(raw);
+            if (json is null) return;
+
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            chat.SentimentScore = root.TryGetProperty("sentimentScore", out var sc) && sc.ValueKind == JsonValueKind.Number
+                ? sc.GetDouble() : null;
+            chat.SentimentLabel = root.TryGetProperty("sentimentLabel", out var sl) ? sl.GetString() : null;
+            chat.SentimentSummary = root.TryGetProperty("sentimentSummary", out var ss) ? ss.GetString() : null;
+
+            chat.KeyThemes = root.TryGetProperty("keyThemes", out var kt) && kt.ValueKind == JsonValueKind.Array
+                ? kt.EnumerateArray().Select(t => t.GetString() ?? string.Empty).Where(t => !string.IsNullOrWhiteSpace(t)).ToList()
+                : new List<string>();
+
+            chat.ConstructiveFeedback = root.TryGetProperty("constructiveFeedback", out var cf) && cf.ValueKind == JsonValueKind.Array
+                ? cf.EnumerateArray().Select(t => t.GetString() ?? string.Empty).Where(t => !string.IsNullOrWhiteSpace(t)).ToList()
+                : new List<string>();
+
+            chat.AnalysedAtUtc = DateTime.UtcNow;
+            _neoCortex.SavePlayerChat(chat);
+
+            Console.WriteLine($"[sentiment] Score={chat.SentimentScore:F1} Label={chat.SentimentLabel} — {chat.SentimentSummary}");
+            RecordLlmInteraction("player-sentiment", true, true, $"{recent.Count} chat messages", chat.SentimentSummary, "llm");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[sentiment] Analysis failed: {ex.Message}");
+        }
     }
 
     private static string ReadHealthState(JsonElement root)
@@ -1072,6 +1386,32 @@ Open incidents (newest first):
         File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Default));
     }
 
+    private static async Task TryApplyAffinityAsync(string server, int pid, string cpuList, CancellationToken ct)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "taskset",
+                Arguments = $"-cp {cpuList} {pid}",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc is not null)
+            {
+                await proc.WaitForExitAsync(ct);
+                Console.WriteLine($"[affinity] {server} pid={pid} cores={cpuList} exit={proc.ExitCode}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[affinity] Could not set affinity for {server} pid={pid}: {ex.Message}");
+        }
+    }
+
     private static void TryDelete(string path)
     {
         try { File.Delete(path); }
@@ -1083,5 +1423,41 @@ Open incidents (newest first):
                 "agent.files",
                 extras: new Dictionary<string, object?> { ["path"] = path });
         }
+    }
+
+    // Detects messages where the user wants to repeat the last RCON command.
+    private static bool IsRepeatPreviousCommand(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        return lowered.Contains("previous") ||
+               lowered.Contains("repeat") ||
+               lowered.Contains("same command") ||
+               (lowered.Contains("run") && lowered.Contains("again")) ||
+               (lowered.Contains("execute") && (lowered.Contains("that") || lowered.Contains("it")));
+    }
+
+    // Detects messages directed at the agent itself rather than a Rust server.
+    private static readonly string[] AgentSelfPatterns =
+    {
+        "restart yourself", "restart the agent", "restart rustops", "restart the bot",
+        "pull and restart", "pull from source", "autopull", "pull yourself",
+        "update yourself", "update the agent", "update rustops"
+    };
+
+    private async Task<string?> TryHandleAgentControlAsync(string message, CancellationToken ct)
+    {
+        var lowered = message.ToLowerInvariant();
+        if (!AgentSelfPatterns.Any(p => lowered.Contains(p, StringComparison.Ordinal)))
+            return null;
+
+        Console.WriteLine($"[agent-ctrl] Detected self-control directive: {message}");
+        var status = await _autoPull.TriggerAsync(ct);
+        return status.Phase switch
+        {
+            "updated" => "Pull complete — agent is restarting now.",
+            "up-to-date" => "Already up to date. No restart needed.",
+            "error" => $"Pull failed: {status.Error}",
+            _ => "Pull cycle started."
+        };
     }
 }

@@ -15,6 +15,8 @@ internal sealed class AgentConfig
     [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();
     [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
     [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
+    [JsonPropertyName("cpuAffinity")] public CpuAffinitySettings CpuAffinity { get; set; } = new();
+    [JsonPropertyName("consoleMonitor")] public ConsoleMonitorSettings ConsoleMonitor { get; set; } = new();
 }
 
 internal sealed class ApiSettings
@@ -93,6 +95,22 @@ internal sealed class PluginUpdateSettings
     [JsonPropertyName("searchFilter")] public string SearchFilter { get; set; } = "rust";
     [JsonPropertyName("downloadEnabled")] public bool DownloadEnabled { get; set; }
     [JsonPropertyName("stagingPath")] public string StagingPath { get; set; } = "data/plugin-staging";
+}
+
+internal sealed class CpuAffinitySettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    // Maps server name to CPU list for taskset, e.g. "0-3" or "0,1,2,3"
+    [JsonPropertyName("servers")] public Dictionary<string, string> Servers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+internal sealed class ConsoleMonitorSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("errorEscalationThreshold")] public int ErrorEscalationThreshold { get; set; } = 10;
+    [JsonPropertyName("repeatThreshold")] public int RepeatThreshold { get; set; } = 5;
+    [JsonPropertyName("sentimentAnalysisIntervalMinutes")] public int SentimentAnalysisIntervalMinutes { get; set; } = 30;
+    [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 200;
 }
 
 internal sealed class LlmSettings

@@ -16,6 +16,9 @@ internal sealed class NeoCortexStore : IEvolutionStore
     private readonly string _commandPolicyPath;
     private readonly string _cachePath;
     private readonly string _migrationMarkerPath;
+    private readonly string _consolePath;
+    private readonly string _playerChatPath;
+    private readonly SemaphoreSlim _incidentWriteLock = new(1, 1);
 
     public NeoCortexStore(string root, string legacyStatePath)
     {
@@ -29,6 +32,8 @@ internal sealed class NeoCortexStore : IEvolutionStore
         _commandPolicyPath = Path.Combine(root, "policy", "command-policy.json");
         _cachePath = Path.Combine(root, "cache", "domain-cache.json");
         _migrationMarkerPath = Path.Combine(root, ".migration-complete");
+        _consolePath = Path.Combine(root, "console", "monitor.json");
+        _playerChatPath = Path.Combine(root, "chat", "knowledge.json");
 
         Directory.CreateDirectory(Path.GetDirectoryName(_operationsPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_selectionPath)!);
@@ -36,6 +41,8 @@ internal sealed class NeoCortexStore : IEvolutionStore
         Directory.CreateDirectory(Path.GetDirectoryName(_evolutionPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_policyPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_cachePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_consolePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
     }
 
     public void EnsureMigrated()
@@ -149,6 +156,12 @@ internal sealed class NeoCortexStore : IEvolutionStore
     public void SaveCommandPolicy(CommandPolicyState state) => SaveJson(_commandPolicyPath, state);
     public void SaveCache(DomainCacheState state) => SaveJson(_cachePath, state);
 
+    public ConsoleMonitorState LoadConsoleMonitor() => LoadJson(_consolePath, new ConsoleMonitorState());
+    public void SaveConsoleMonitor(ConsoleMonitorState state) => SaveJson(_consolePath, state);
+
+    public PlayerChatKnowledge LoadPlayerChat() => LoadJson(_playerChatPath, new PlayerChatKnowledge());
+    public void SavePlayerChat(PlayerChatKnowledge knowledge) => SaveJson(_playerChatPath, knowledge);
+
     // Compact (non-indented) options for JSONL — one object per line is required.
     private static readonly JsonSerializerOptions JsonlOptions = new()
     {
@@ -159,8 +172,16 @@ internal sealed class NeoCortexStore : IEvolutionStore
 
     public async Task RecordIncidentAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
     {
-        var line = JsonSerializer.Serialize(incident, JsonlOptions) + Environment.NewLine;
-        await File.AppendAllTextAsync(_evolutionPath, line, Encoding.UTF8, cancellationToken);
+        var line = JsonSerializer.Serialize(incident, JsonlOptions) + "\n";
+        await _incidentWriteLock.WaitAsync(cancellationToken);
+        try
+        {
+            await File.AppendAllTextAsync(_evolutionPath, line, Encoding.UTF8, cancellationToken);
+        }
+        finally
+        {
+            _incidentWriteLock.Release();
+        }
     }
 
     public async Task<EvolutionReviewResult> ReviewAsync(CancellationToken cancellationToken)
@@ -174,18 +195,19 @@ internal sealed class NeoCortexStore : IEvolutionStore
         var lines = await File.ReadAllLinesAsync(_evolutionPath, cancellationToken);
         foreach (var line in lines.Where(static l => !string.IsNullOrWhiteSpace(l)))
         {
+            // Skip obviously malformed JSONL lines — partial writes, leftover braces, etc.
+            var trimmed = line.TrimStart();
+            if (trimmed.Length == 0 || trimmed[0] != '{')
+                continue;
+
             EvolutionIncidentRecord? record;
             try
             {
-                record = JsonSerializer.Deserialize<EvolutionIncidentRecord>(line, JsonDefaults.Default);
+                record = JsonSerializer.Deserialize<EvolutionIncidentRecord>(trimmed, JsonDefaults.Default);
             }
-            catch (Exception ex)
+            catch
             {
-                RustOpsSentry.CaptureException(
-                    ex,
-                    "Failed to deserialize NeoCortex incident record.",
-                    "agent.memory",
-                    extras: new Dictionary<string, object?> { ["linePreview"] = line.Length > 500 ? line[..500] : line });
+                // Silently skip malformed lines — corrupt entries are non-recoverable.
                 continue;
             }
 
@@ -224,6 +246,8 @@ internal sealed class NeoCortexStore : IEvolutionStore
         if (!File.Exists(_policyPath)) SaveJson(_policyPath, new IgnoreFeedbackState());
         if (!File.Exists(_cachePath)) SaveJson(_cachePath, new DomainCacheState());
         if (!File.Exists(_evolutionPath)) File.WriteAllText(_evolutionPath, string.Empty);
+        Directory.CreateDirectory(Path.GetDirectoryName(_consolePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
     }
 
     private static T LoadJson<T>(string path, T fallback)

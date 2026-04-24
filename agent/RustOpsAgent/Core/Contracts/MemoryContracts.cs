@@ -104,3 +104,48 @@ internal interface IEvolutionStore
     Task RecordIncidentAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken);
     Task<EvolutionReviewResult> ReviewAsync(CancellationToken cancellationToken);
 }
+
+// Console monitor types — track errors, warnings, repeating messages per server.
+internal sealed class ConsoleMonitorState
+{
+    [JsonPropertyName("servers")] public Dictionary<string, ServerConsoleState> Servers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonPropertyName("updatedAtUtc")] public DateTime UpdatedAtUtc { get; set; } = DateTime.UtcNow;
+}
+
+internal sealed class ServerConsoleState
+{
+    [JsonPropertyName("recentErrors")] public List<ConsoleErrorEntry> RecentErrors { get; set; } = new();
+    [JsonPropertyName("repeatingMessages")] public Dictionary<string, int> RepeatingMessages { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    [JsonPropertyName("lastAlertAtUtc")] public DateTime? LastAlertAtUtc { get; set; }
+    [JsonPropertyName("errorCountSinceLastAlert")] public int ErrorCountSinceLastAlert { get; set; }
+    [JsonPropertyName("totalErrorsIngested")] public int TotalErrorsIngested { get; set; }
+}
+
+internal sealed class ConsoleErrorEntry
+{
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
+    [JsonPropertyName("count")] public int Count { get; set; } = 1;
+    [JsonPropertyName("firstSeenAtUtc")] public DateTime FirstSeenAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("lastSeenAtUtc")] public DateTime LastSeenAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("category")] public string Category { get; set; } = "error";
+}
+
+// Player chat knowledge — store player messages and derived sentiment.
+internal sealed class PlayerChatKnowledge
+{
+    [JsonPropertyName("recentMessages")] public List<PlayerChatEntry> RecentMessages { get; set; } = new();
+    [JsonPropertyName("sentimentScore")] public double? SentimentScore { get; set; }
+    [JsonPropertyName("sentimentLabel")] public string? SentimentLabel { get; set; }
+    [JsonPropertyName("sentimentSummary")] public string? SentimentSummary { get; set; }
+    [JsonPropertyName("keyThemes")] public List<string> KeyThemes { get; set; } = new();
+    [JsonPropertyName("constructiveFeedback")] public List<string> ConstructiveFeedback { get; set; } = new();
+    [JsonPropertyName("analysedAtUtc")] public DateTime? AnalysedAtUtc { get; set; }
+}
+
+internal sealed class PlayerChatEntry
+{
+    [JsonPropertyName("serverName")] public string ServerName { get; set; } = string.Empty;
+    [JsonPropertyName("playerName")] public string PlayerName { get; set; } = string.Empty;
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
+    [JsonPropertyName("capturedAtUtc")] public DateTime CapturedAtUtc { get; set; } = DateTime.UtcNow;
+}

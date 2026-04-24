@@ -529,6 +529,42 @@ app.MapPost("/agent/incidents/{id}/feedback", async (string id, HttpRequest requ
     return Results.Ok(new { id, verdict, note, savedAtUtc = DateTime.UtcNow });
 });
 
+// -- Console monitor ----------------------------------------------------------
+app.MapGet("/agent/console-monitor", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var consolePath = Path.Combine(agentPaths.NeoCortexRoot, "console", "monitor.json");
+    if (!File.Exists(consolePath))
+        return Results.Ok(new { servers = new Dictionary<string, object>(), updatedAtUtc = (DateTime?)null });
+    try
+    {
+        var content = File.ReadAllText(consolePath);
+        return Results.Content(content, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
+// -- Player chat / sentiment --------------------------------------------------
+app.MapGet("/agent/player-chat/recent", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var chatPath = Path.Combine(agentPaths.NeoCortexRoot, "chat", "knowledge.json");
+    if (!File.Exists(chatPath))
+        return Results.Ok(new { recentMessages = Array.Empty<object>(), sentimentScore = (double?)null, sentimentLabel = (string?)null, sentimentSummary = (string?)null, keyThemes = Array.Empty<string>(), constructiveFeedback = Array.Empty<string>(), analysedAtUtc = (DateTime?)null });
+    try
+    {
+        var content = File.ReadAllText(chatPath);
+        return Results.Content(content, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
 app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnapshotAsync()));
 
 app.MapGet("/host/llm/summary", async () =>
