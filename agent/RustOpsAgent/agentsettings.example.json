@@ -128,6 +128,17 @@
       "statusEndpointPath": "/api/v2/account"
     }
   },
+  "maintenance": {
+    "pollIntervalMultiplier": 5,
+    "dryRunDefault": true,
+    "autoCompleteThreshold": 1.0
+  },
+  "research": {
+    "enabled": true,
+    "stateFile": "data/NeoCortex/logs/warnings-knowledge.json",
+    "pollIntervalSeconds": 3600,
+    "scriptPath": null
+  },
   "llm": {
     "enabled": true,
     "provider": "${RUSTOPS_LLM_PROVIDER}",
