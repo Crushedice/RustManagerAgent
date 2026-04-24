@@ -78,6 +78,7 @@ var handlers = new List<IToolHandler>
 {
     new ConnectorStatusToolHandler(connectors),
     new ConnectorLogsToolHandler(connectors, neoCortex),
+    new MaintenanceTrackerToolHandler(connectors, neoCortex),
     new AgentChatToolHandler()
 };
 
