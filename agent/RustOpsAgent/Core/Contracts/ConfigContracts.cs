@@ -11,6 +11,7 @@ internal sealed class AgentConfig
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
+    [JsonPropertyName("llmCompose")] public LlmSettings LlmCompose { get; set; } = new();
     [JsonPropertyName("llmDeep")] public LlmSettings LlmDeep { get; set; } = new();
     [JsonPropertyName("autoPull")] public AutoPullSettings AutoPull { get; set; } = new();
     [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();

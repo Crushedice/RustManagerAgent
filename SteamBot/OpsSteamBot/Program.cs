@@ -83,6 +83,8 @@ internal sealed class OpsSteamBot
     private bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
     private int _pendingChats;
+    private EPersonaState _currentPersonaState = EPersonaState.Offline;
+    private DateTime _lastSetOnlineUtc = DateTime.MinValue;
 
     public OpsSteamBot(AppConfig config, RustMgrApiClient api)
     {
@@ -134,6 +136,7 @@ internal sealed class OpsSteamBot
             try
             {
                 await PollOutboxAsync();
+                ApplyIdlePresenceIfNeeded();
             }
             catch (Exception ex)
             {
@@ -142,6 +145,22 @@ internal sealed class OpsSteamBot
             }
 
             await Task.Delay(250);
+        }
+    }
+
+    private void ApplyIdlePresenceIfNeeded()
+    {
+        if (_currentPersonaState != EPersonaState.Online)
+            return;
+
+        if (Interlocked.CompareExchange(ref _pendingChats, 0, 0) > 0)
+            return;
+
+        // Safety net: still Online but nothing pending for >60 s → force Away.
+        if (DateTime.UtcNow - _lastSetOnlineUtc > TimeSpan.FromSeconds(60))
+        {
+            Console.WriteLine("[Presence] Idle timeout — forcing Away.");
+            SetPresence(EPersonaState.Away);
         }
     }
 
@@ -207,7 +226,7 @@ internal sealed class OpsSteamBot
 
         Console.WriteLine("Logged on.");
         RustOpsSentry.AddBreadcrumb("Logged on to Steam.", "steam.connection");
-        _friends.SetPersonaState(EPersonaState.Away);
+        SetPresence(EPersonaState.Away);
         if (!string.IsNullOrWhiteSpace(_config.Steam.PersonaName))
             _friends.SetPersonaName(_config.Steam.PersonaName);
     }
@@ -219,7 +238,7 @@ internal sealed class OpsSteamBot
 
     private void OnAccountInfo(SteamUser.AccountInfoCallback callback)
     {
-        _friends.SetPersonaState(EPersonaState.Away);
+        SetPresence(EPersonaState.Away);
     }
 
     private async void OnFriendMessage(SteamFriends.FriendMsgCallback callback)
@@ -313,13 +332,14 @@ internal sealed class OpsSteamBot
                 ArchiveOutboxFile(path);
                 _outboxFailureCounts.Remove(path);
 
-                if (IsChatReplyOutboxFile(path))
+                if (IsChatReplyOutboxFile(path) && !string.IsNullOrWhiteSpace(json.TargetAdminId))
                 {
                     var remaining = Interlocked.Decrement(ref _pendingChats);
+                    Console.WriteLine($"[Presence] Reply sent — pending={remaining}");
                     if (remaining <= 0)
                     {
                         _pendingChats = 0;
-                        _friends.SetPersonaState(EPersonaState.Away);
+                        SetPresence(EPersonaState.Away);
                     }
                 }
             }
@@ -501,6 +521,16 @@ internal sealed class OpsSteamBot
         File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonOptions.Default));
     }
 
+    private void SetPresence(EPersonaState state)
+    {
+        if (_currentPersonaState == state)
+            return;
+
+        _currentPersonaState = state;
+        Console.WriteLine($"[Presence] {state}");
+        _friends.SetPersonaState(state);
+    }
+
     private string QueueChatRequest(ulong senderId, string input)
     {
         var item = new ChatInboxItem
@@ -512,8 +542,10 @@ internal sealed class OpsSteamBot
         };
 
         WriteInboxFile(_config.Agent.ChatInboxPath, "chat", item);
-        Interlocked.Increment(ref _pendingChats);
-        _friends.SetPersonaState(EPersonaState.Online);
+        var pending = Interlocked.Increment(ref _pendingChats);
+        _lastSetOnlineUtc = DateTime.UtcNow;
+        Console.WriteLine($"[Presence] Chat queued — pending={pending}");
+        SetPresence(EPersonaState.Online);
         return string.Empty;
     }
 

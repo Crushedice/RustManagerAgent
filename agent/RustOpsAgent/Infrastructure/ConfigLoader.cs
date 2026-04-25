@@ -107,6 +107,36 @@ internal static class ConfigLoader
         config.LlmDeep.UseForRecommendations =
             RustOpsEnv.GetBoolean("RUSTOPS_LLM_DEEP_USE_FOR_RECOMMENDATIONS", config.LlmDeep.UseForRecommendations);
 
+        // Compose LLM — dedicated model for response generation (natural language, not JSON routing).
+        // Falls back to the fast LLM if not configured.
+        config.LlmCompose.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_COMPOSE_ENABLED", config.LlmCompose.Enabled);
+        config.LlmCompose.Provider =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_PROVIDER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.Provider);
+        config.LlmCompose.BaseUrl =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_BASE_URL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.BaseUrl);
+        config.LlmCompose.Model =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_MODEL")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.Model);
+        config.LlmCompose.ApiKey =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_API_KEY")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.ApiKey ?? string.Empty);
+        config.LlmCompose.HttpReferer =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_HTTP_REFERER")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.HttpReferer ?? string.Empty);
+        config.LlmCompose.AppTitle =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_APP_TITLE")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.AppTitle ?? string.Empty);
+        config.LlmCompose.UseForRecommendations =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_COMPOSE_USE_FOR_RECOMMENDATIONS", config.LlmCompose.UseForRecommendations);
+        config.LlmCompose.UseChatSystemPrompt =
+            RustOpsEnv.GetBoolean("RUSTOPS_LLM_COMPOSE_USE_CHAT_SYSTEM_PROMPT", config.LlmCompose.UseChatSystemPrompt);
+        config.LlmCompose.ChatSystemPrompt =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_CHAT_SYSTEM_PROMPT")
+            ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.ChatSystemPrompt ?? string.Empty);
+
         config.Memory.StatePath = ResolvePath(config.Memory.StatePath, root);
         config.Memory.NeoCortexRoot = ResolvePath(config.Memory.NeoCortexRoot, root);
         config.Inbox.ChatInboxPath = ResolvePath(config.Inbox.ChatInboxPath, root);

@@ -90,6 +90,19 @@ else
     Console.WriteLine("[agent] Deep LLM not configured — background tasks will share the fast kernel.");
 deepKernel ??= kernel;
 
+// Compose kernel: used for response generation (natural language, personality).
+// Falls back to the fast kernel if llmCompose is not configured.
+var composeKernelConfigured = !string.IsNullOrWhiteSpace(config.LlmCompose.BaseUrl)
+    && !RustOpsEnv.HasUnresolvedPlaceholder(config.LlmCompose.BaseUrl)
+    && config.LlmCompose.Enabled;
+var composeKernel = composeKernelConfigured ? BuildKernel(config.LlmCompose) : null;
+if (composeKernel is not null)
+    Console.WriteLine($"[agent] Compose LLM kernel ready. provider={config.LlmCompose.Provider} model={config.LlmCompose.Model}");
+else
+    Console.WriteLine("[agent] Compose LLM not configured — response composition will use the fast kernel.");
+composeKernel ??= kernel;
+var effectiveComposeSettings = composeKernelConfigured ? config.LlmCompose : config.Llm;
+
 var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex);
 using var apiClient = new RustOpsApiClient(config.Api);
 
@@ -142,7 +155,7 @@ var handlers = new List<IToolHandler>
 
 var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry);
-var composer = new ResponseComposer(kernel, config.Llm);
+var composer = new ResponseComposer(composeKernel, effectiveComposeSettings);
 
 var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, gitOps, autoPull, apiClient, deepKernel);
 

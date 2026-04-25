@@ -66,31 +66,71 @@ internal sealed class AgentRuntime
         var tick = 0;
         while (!_stop && !cancellationToken.IsCancellationRequested)
         {
-            _legacyState.UpdateRuntimeStatus(_config.Llm);
+            try
+            {
+                _legacyState.UpdateRuntimeStatus(_config.Llm);
 
-            // Feedback and decision are independent — run them concurrently.
-            await Task.WhenAll(
-                ProcessFeedbackInboxAsync(cancellationToken),
-                ProcessDecisionInboxAsync(cancellationToken));
+                // Feedback and decision are independent — run them concurrently.
+                await SafeExecuteAsync(() => Task.WhenAll(
+                    ProcessFeedbackInboxAsync(cancellationToken),
+                    ProcessDecisionInboxAsync(cancellationToken)), "inbox-processing", cancellationToken);
 
-            await _autoPull.TickAsync(cancellationToken);
+                await SafeExecuteAsync(() => _autoPull.TickAsync(cancellationToken), "auto-pull", cancellationToken);
 
-            var chatFiles = Directory.Exists(_config.Inbox.ChatInboxPath)
-                ? Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").Length
-                : 0;
-            if (chatFiles > 0 || tick % 5 == 0)
-                Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
+                var chatFiles = Directory.Exists(_config.Inbox.ChatInboxPath)
+                    ? Directory.GetFiles(_config.Inbox.ChatInboxPath, "*.json").Length
+                    : 0;
+                if (chatFiles > 0 || tick % 5 == 0)
+                    Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
 
-            await ProcessChatInboxAsync(cancellationToken);
-            await ObserveServersAsync(cancellationToken);
-            await ReviewIncidentsAsync(cancellationToken);
-            await AnalyzePlayerSentimentAsync(cancellationToken);
-            await EvolveClassifierAsync(cancellationToken);
-            _legacyState.Save();
-            tick++;
-            await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
+                await SafeExecuteAsync(() => ProcessChatInboxAsync(cancellationToken), "chat-processing", cancellationToken);
+                await SafeExecuteAsync(() => ObserveServersAsync(cancellationToken), "server-observation", cancellationToken);
+                await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
+                await SafeExecuteAsync(() => AnalyzePlayerSentimentAsync(cancellationToken), "sentiment-analysis", cancellationToken);
+                await SafeExecuteAsync(() => EvolveClassifierAsync(cancellationToken), "classifier-evolution", cancellationToken);
+
+                _legacyState.Save();
+                tick++;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[agent] Unexpected error in main loop tick {tick}: {ex.Message}");
+                RustOpsSentry.CaptureException(ex, "Agent main loop exception.", "agent.runtime",
+                    extras: new Dictionary<string, object?> { ["tick"] = tick });
+            }
+
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, _config.Monitor.PollSeconds)), cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
         }
         Console.WriteLine("[agent] Runtime stopped.");
+    }
+
+    private async Task SafeExecuteAsync(Func<Task> taskFactory, string taskName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await taskFactory();
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[agent] Task '{taskName}' failed: {ex.Message}");
+            RustOpsSentry.CaptureException(ex, $"Agent task failed: {taskName}", "agent.task",
+                extras: new Dictionary<string, object?> { ["taskName"] = taskName });
+        }
     }
 
     private async Task ProcessFeedbackInboxAsync(CancellationToken cancellationToken)
@@ -719,15 +759,16 @@ internal sealed class AgentRuntime
         var consoleMonitor = _config.ConsoleMonitor.Enabled ? _neoCortex.LoadConsoleMonitor() : null;
         var playerChat = _config.ConsoleMonitor.Enabled ? _neoCortex.LoadPlayerChat() : null;
 
+        var logChanged = false;
+        var consoleChanged = false;
+        var chatChanged = false;
+
         if (!consoleMonitor!.Servers.TryGetValue(server, out var serverConsole))
         {
             serverConsole = new ServerConsoleState();
             consoleMonitor.Servers[server] = serverConsole;
+            consoleChanged = true; // new server entry — persist so dashboard sees it immediately
         }
-
-        var logChanged = false;
-        var consoleChanged = false;
-        var chatChanged = false;
 
         if (root.TryGetProperty("entries", out var entriesNode) && entriesNode.ValueKind == JsonValueKind.Array)
         {
@@ -958,7 +999,10 @@ Recent player chat (newest last):
 
         try
         {
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(180));
+
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null) return;
@@ -996,6 +1040,10 @@ Recent player chat (newest last):
             }
             _lastKnownSentimentScore = score;
             RecordLlmInteraction("player-sentiment", true, true, $"{recent.Count} chat messages", chat.SentimentSummary, "llm");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[sentiment] Analysis timed out (180s limit).");
         }
         catch (Exception ex)
         {
@@ -1241,7 +1289,10 @@ Admin corrections:
 
         try
         {
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(180));
+
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null)
@@ -1290,6 +1341,10 @@ Admin corrections:
                 $"{pending.Count} correction(s)",
                 $"{newRules.Count} rule(s) synthesized",
                 "deep-llm");
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[evolution] Classifier evolution timed out (180s limit).");
         }
         catch (Exception ex)
         {
@@ -1363,7 +1418,10 @@ Open incidents (newest first):
 
         try
         {
-            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cancellationToken);
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            cts.CancelAfter(TimeSpan.FromSeconds(180));
+
+            var response = await _deepKernel.InvokePromptAsync(prompt, cancellationToken: cts.Token);
             var raw = response.GetValue<string>() ?? string.Empty;
             var json = TryExtractJson(raw);
             if (json is null)
@@ -1394,6 +1452,11 @@ Open incidents (newest first):
             {
                 _ = TryProposeReviewBranchAsync(pattern!, summary, mitigation, config, cancellationToken);
             }
+        }
+        catch (OperationCanceledException)
+        {
+            Console.WriteLine("[review] LLM trend analysis timed out (180s limit).");
+            RustOpsSentry.CaptureMessage("Incident review LLM timeout", "agent.review", SentryLevel.Warning);
         }
         catch (Exception ex)
         {

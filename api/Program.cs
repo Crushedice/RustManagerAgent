@@ -4332,6 +4332,8 @@ public sealed class AgentSettingsFileView
     [JsonPropertyName("monitor")] public AgentSettingsMonitorView? Monitor { get; set; }
     [JsonPropertyName("commandExecution")] public AgentSettingsCommandExecutionView? CommandExecution { get; set; }
     [JsonPropertyName("llm")] public AgentSettingsLlmView? Llm { get; set; }
+    [JsonPropertyName("llmCompose")] public AgentSettingsLlmView? LlmCompose { get; set; }
+    [JsonPropertyName("llmDeep")] public AgentSettingsLlmView? LlmDeep { get; set; }
     [JsonPropertyName("ollama")] public AgentSettingsLlmView? LegacyOllama { get; set; }
 }
 
