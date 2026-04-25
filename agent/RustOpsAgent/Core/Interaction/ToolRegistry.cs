@@ -22,6 +22,16 @@ internal sealed class ToolRegistry
     public IToolHandler? ResolveSingle(ToolExecutionContext context)
     {
         var route = context.Route;
+
+        // When the LLM provides a targetRef, look it up across ALL handlers first.
+        // This handles the case where the LLM classifies intent as server_control but
+        // targetRef as rust.rcon.command — the targetRef wins as the stronger signal.
+        if (!string.IsNullOrWhiteSpace(route.TargetRef) &&
+            _handlers.TryGetValue(route.TargetRef, out var targeted))
+        {
+            return targeted;
+        }
+
         var eligible = ResolveEligible(route);
         if (eligible.Count == 0)
         {
@@ -31,15 +41,6 @@ internal sealed class ToolRegistry
         if (eligible.Count == 1)
         {
             return eligible[0];
-        }
-
-        if (!string.IsNullOrWhiteSpace(route.TargetRef))
-        {
-            var hinted = eligible.FirstOrDefault(h => string.Equals(h.Name, route.TargetRef, StringComparison.OrdinalIgnoreCase));
-            if (hinted is not null)
-            {
-                return hinted;
-            }
         }
 
         return route.Intent switch

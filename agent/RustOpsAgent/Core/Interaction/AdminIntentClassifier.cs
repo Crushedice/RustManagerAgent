@@ -54,6 +54,8 @@ Rules:
 - For plural status/health questions with no explicit server names, default to all configured servers.
 - "compile errors", "compile", "compilation", "plugin errors", "cs errors", "plugin issues", "oxide issues", "umod issues" → intent=troubleshooting, targetRef=rust.plugins.verify. NEVER treat "compile" as a server name.
 - Words like "issue", "issues", "problem", "problems" when paired with "plugin", "oxide", or "umod" → intent=troubleshooting, targetRef=rust.plugins.verify.
+- When the request is to execute/run/send an RCON command or any raw server command (e.g. "run say Hello", "execute status", "rcon say X") → intent=rcon_command, targetRef=rust.rcon.command, put the command text in slots.commandText. NEVER use server_control for this.
+- server_control is ONLY for lifecycle actions: start, stop, restart, kill, update, wipe.
 
 Conversation context:
 lastServer={{state.LastServerName ?? ""}}

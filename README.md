@@ -144,6 +144,18 @@ Each RCON command is tracked. A command auto-allows after `autoAllowAfterSuccess
 
 The last 12 messages per admin are kept in `ConversationSelectionState.RecentMessages`. The 6 most recent are injected into every LLM compose prompt so the agent maintains context across turns.
 
+### LLM architecture
+
+Three Semantic Kernel instances are maintained:
+
+| Kernel | Role |
+|--------|------|
+| Fast kernel | Intent classification — cheap, low-latency |
+| Deep kernel | Incident analysis, log summarisation — higher context budget |
+| Compose kernel | Response generation — balances quality and speed |
+
+Providers are pluggable: OpenAI-compatible endpoints (LM Studio, Ollama, or hosted).
+
 ---
 
 ## Layer 4 — `SteamBot/OpsSteamBot/` (SteamKit2)
@@ -159,6 +171,20 @@ Pure transport adapter. Whitelist-gated; direct commands are handled locally.
 | Anything else | Forward to `chat-inbox` |
 
 Replies from `message-outbox` are chunked to ≤ 350 characters before sending.
+
+---
+
+## Dashboard — built-in Web UI
+
+The API hosts a full ops dashboard at `/ui` — no separate frontend deployment needed.
+
+- Dark-theme responsive grid layout
+- Live status cards with colour-coded indicators (running, offline, pending)
+- Tabbed views: Servers, Agent, Host, Admin Console
+- Server control buttons (start/stop/restart/update/wipe)
+- Live player lists, incident browser, RCON console
+- LLM configuration panel
+- All data fetched from the API via polling — no external JS framework
 
 ---
 
@@ -186,7 +212,7 @@ Key sections:
 
 ### Environment — `rustops.env`
 
-Secrets and overrides loaded at startup from `/etc/rustops.env` (or `rustops.env` next to the binary):
+Secrets and overrides loaded at startup from `./config/rustops.env` (or `rustops.env` next to the binary):
 
 ```
 RUSTOPS_API_KEY=...
@@ -209,10 +235,72 @@ GitHub Actions (`ci.yml`) runs on every push to `main` and `agent/**` branches:
 
 ---
 
-## Known limitations
+## Current Capabilities
 
-- **LLM is required for rich responses.** When disabled, the agent falls back to template messages. All core operations (start/stop/RCON/logs) still work without LLM.
-- **GitOps branch push requires `pushBranchPrefix = "agent/"`** — enforced at startup.
-- **Plugin download is disabled by default** (`pluginUpdates.downloadEnabled = false`). Enable and set `stagingPath` to allow automatic `.cs` staging.
-- **RCON commands outside the allow-list require admin approval** via Steam `approve` command before execution.
-- **Log pagination** uses the `offset` parameter on `/servers/{s}/logs/tail`; the underlying `rustmgr.sh logs` command always fetches the most recent N lines, so very old entries are not addressable without `/logs/read` (byte-offset reader).
+What is fully working right now:
+
+- **Server lifecycle** — start, stop, restart, kill, update, wipe via both the shell script and the API
+- **RCON execution** — arbitrary RCON commands with adaptive allow/deny policy and Steam `approve`/`reject` flow
+- **Status aggregation** — live status across all servers with player counts and server info
+- **Player lookup** — find a player by SteamID or name fragment via RCON
+- **Log inspection** — structured log tail with time-based filtering, byte-offset rolling reader, and LLM-assisted summarisation
+- **Plugin listing** — installed Oxide plugin inventory with uMod metadata
+- **Network monitoring** — live traffic stats on configured host interfaces
+- **Config read/write** — server config JSON via API with validation; GitOps-backed file editing from the agent
+- **Incident tracking** — periodic LLM review of log events, incident creation and resolution stored in JSONL
+- **Conversation memory** — per-admin message history injected into every LLM compose call (last 6 of 12)
+- **Feedback learning** — admins can send `feedback <text>` via Steam to teach the agent ignore rules and importance adjustments
+- **GitOps** — agent proposes config changes as git branches with safety checks (rejects pushes to `main`)
+- **Auto-pull** — agent polls the git remote, rebuilds, and restarts services on new commits
+- **Web dashboard** — full ops view at `/ui` covering server state, players, incidents, RCON console, and LLM settings
+- **Steam adapter** — whitelist-gated Steam chat with local command handling and inbox/outbox forwarding
+- **Sentry integration** — error reporting with breadcrumb logging across all services
+
+---
+
+## Not Yet Working / Known Issues
+
+- **Plugin version-aware updates** — `RustPluginToolHandler` can stage plugin files to a path but has no logic to compare installed vs. available uMod versions or auto-download updates. `pluginUpdates.downloadEnabled` defaults to `false`.
+- **Dashboard real-time updates** — the `/ui` dashboard polls endpoints on a timer. There are no WebSocket or SSE feeds, so state can lag and rapid events (bursts of players joining, RCON floods) are not reflected instantly.
+- **Log pagination for old entries** — `/servers/{s}/logs/tail` always works from the most recent N lines. Reaching entries older than the tail window requires `/logs/read` with manual byte-offset tracking; there is no cursor-based pagination API.
+- **SteamBot reconnection reliability** — the bot's reconnect-on-disconnect path exists but has not been stress-tested against Steam network drops or long idle periods.
+- **Autonomous player replies** — the architecture supports it but the policy module is not implemented. Any in-game RCON/admin relay for player-facing messages is blocked pending an auditable approval gate.
+- **GitOps merge / conflict resolution** — agent-created branches must be manually reviewed and merged. There is no automatic merge strategy or conflict resolver.
+- **NeoCortex semantic search** — memory lookup is flat-file key matching. Despite the "cortex" branding there are no vector embeddings; related-incident retrieval is purely chronological.
+- **API test coverage** — there are no tests for the ~45 REST endpoints. The xUnit suite covers agent internals only (GitOps safety, NeoCortex migration, command policy, incident recording).
+- **No container/Docker packaging** — deployment is systemd-only. There is no `Dockerfile` or compose file for containerised environments.
+- **CI coverage reporting** — the pipeline builds and runs tests but produces no coverage report or badge.
+- **LLM provider hot-swap** — changing the LLM model or base URL requires restarting the agent; there is no live reload path for kernel configuration.
+
+---
+
+## Needs Work
+
+Short-to-medium term items that would meaningfully improve reliability or usability:
+
+- **API refactor** — `api/Program.cs` is 4,600+ lines of inline route handlers. Splitting into controller classes and a service layer would make it maintainable and testable.
+- **API endpoint tests** — add an integration test project using `WebApplicationFactory` to cover the most critical lifecycle and RCON endpoints.
+- **Plugin manager** — build a dedicated version-comparison and download pipeline for Oxide plugins so `pluginUpdates.downloadEnabled` can be safely turned on.
+- **Dashboard WebSocket feed** — replace or supplement the polling loop with a server-sent events or WebSocket channel so the UI reflects console output and player changes in real time.
+- **SteamBot hardening** — add exponential back-off reconnect, dead-letter queue flushing on reconnect, and message dedup to prevent double-sends after reconnects.
+- **Log cursor API** — expose a cursor-based log pagination endpoint so the agent and dashboard can page through historical entries without manual byte offsets.
+- **Feedback loop for classification** — when an admin corrects the agent ("I meant X not Y"), write the correction back into `NeoCortexStore` as a learned rule rather than only applying it to the current turn.
+- **CI deployment step** — add a deploy job (rsync + systemctl restart) gated on passing tests so `main` always reflects what is running on the host.
+- **Coverage gate** — enforce a minimum coverage threshold in CI so regressions in agent logic are caught before merge.
+
+---
+
+## Future Plans
+
+Longer-horizon features that are architecturally planned but not started:
+
+- **Multi-server incident correlation** — cross-server log analysis to detect coordinated attacks, shared crash causes, or wipe-timing conflicts.
+- **Autonomous maintenance windows** — let the agent schedule and execute low-risk maintenance (restarts, updates, wipes) during configured quiet hours without admin approval.
+- **In-game admin relay** — optional RCON-based pipeline so the agent can respond to in-game admin chat, gated by a strict policy layer and full audit log.
+- **Player behaviour monitoring** — opt-in mode where the agent tracks unusual RCON events (mass kills, rapid connects/disconnects) and flags or acts on them.
+- **Vector memory** — replace flat-file incident lookup in `NeoCortexStore` with an embedded vector store (e.g. Chroma, sqlite-vss) for semantic incident retrieval and "has this happened before?" queries.
+- **Web UI as a standalone SPA** — extract the dashboard from the API binary into a proper frontend project (React or Svelte) with a build pipeline, allowing richer interactivity without bloating the API.
+- **CLI adapter** — a local `rustops` CLI that speaks to the API, giving operators a terminal interface alongside the Steam bot and dashboard.
+- **Multiple transport adapters** — Discord bot adapter as an alternative or complement to Steam chat, sharing the same inbox/outbox plumbing.
+- **Provisioning wizard** — guided new-server provisioning flow through the dashboard: pick map seed, port, plugins, generate and validate config, commit to git, and start.
+- **Plugin marketplace browser** — integrated uMod plugin search and install UI within the dashboard, replacing manual file staging.
