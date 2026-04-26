@@ -38,7 +38,8 @@ var agentRootDir = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_ROOT") ?? "
 var botRootDir = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_ROOT") ?? "/opt/rust-manager/SteamBot/OpsSteamBot";
 var agentSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_SETTINGS_PATH") ?? Path.Combine(agentRootDir, "agentsettings.json");
 var botSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_SETTINGS_PATH") ?? Path.Combine(botRootDir, "botsettings.json");
-var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE") ?? Path.Combine(configDir, "rustops.env");
+var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE")
+    ?? Path.Combine(Path.GetDirectoryName(configDir.TrimEnd('/', '\\')) ?? configDir, "config.env");
 RustOpsSentry.ConfigureScope(scope =>
 {
     scope.SetExtra("bindUrl", bindUrl);
@@ -3713,9 +3714,13 @@ static string BuildDashboardHtml() => """
       const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
 
       // Word frequency (excluding common stopwords) — today only
-      const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk']);
+      const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk',
+        // additional filler / non-content words
+        'like','what','how','when','why','who','where','all','if','been','from','will','would','could','should','dont','cant','wont','isnt','wasnt','your','their','our','his','her','then','than','more','also','still','even','some','into','over','out','off','too','here','there','now','after','before','back','just','about','because','because','again','while','might','need','want','think','know','see','way','time','day','guys','man','anyone','anyone','nothing','something','everything','thing','things','server','rust','game']);
+      // Only count words that appear to be actual player language (exclude console/plugin prefixes)
+      const isPlayerWord = w => w.length >= 3 && !/^(oxide|error|warning|info|debug|plugin|loading|loaded|unload|init|start|stop|null|true|false|void|http|https|www)$/.test(w);
       const freq = {};
-      for (const m of todayMsgs) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w)) freq[w] = (freq[w]||0) + 1; } }
+      for (const m of todayMsgs) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w) && isPlayerWord(w)) freq[w] = (freq[w]||0) + 1; } }
       const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8);
 
       // Fun word counts for today

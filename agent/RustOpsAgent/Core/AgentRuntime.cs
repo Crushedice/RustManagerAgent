@@ -29,6 +29,11 @@ internal sealed class AgentRuntime
     private readonly Dictionary<string, bool> _serverInitialized = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _remoteServers = new(StringComparer.OrdinalIgnoreCase);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _adminLocks = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _staticIgnorePatterns;
+    private readonly HashSet<string> _incidentPatterns;
+    private readonly HashSet<string> _startupIgnorePatterns;
+    private string _lastDigestDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
+    private DateTime _alertMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
     private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
@@ -58,6 +63,7 @@ internal sealed class AgentRuntime
         _autoPull = autoPull;
         _api = api;
         _deepKernel = kernel;
+        (_staticIgnorePatterns, _incidentPatterns, _startupIgnorePatterns) = LoadStaticLogRules(config.Monitor.LogRulesPath);
     }
 
     public void RequestStop() => _stop = true;
@@ -515,6 +521,87 @@ internal sealed class AgentRuntime
     {
         var lowered = message.Trim().ToLowerInvariant();
 
+        // "ignore <pattern>" / "ignore line <pattern>" — add pattern to dynamic log ignore list
+        if (lowered.StartsWith("ignore ", StringComparison.Ordinal))
+        {
+            var pattern = message["ignore ".Length..].Trim();
+            // Strip optional "line " or "lines " prefix for natural phrasing
+            if (pattern.StartsWith("line ", StringComparison.OrdinalIgnoreCase))
+                pattern = pattern["line ".Length..].Trim();
+            else if (pattern.StartsWith("lines ", StringComparison.OrdinalIgnoreCase))
+                pattern = pattern["lines ".Length..].Trim();
+
+            if (!string.IsNullOrWhiteSpace(pattern) && pattern.Length >= 3)
+            {
+                var logs = _neoCortex.LoadLogs();
+                var already = logs.IgnorePatterns.Contains(pattern, StringComparer.OrdinalIgnoreCase);
+                if (!already)
+                {
+                    logs.IgnorePatterns.Add(pattern);
+                    _neoCortex.SaveLogs(logs);
+
+                    // Also clean existing entries that match the new ignore pattern
+                    var removed = logs.RecentEntries.RemoveAll(e => e.Line.Contains(pattern, StringComparison.OrdinalIgnoreCase));
+                    if (removed > 0) _neoCortex.SaveLogs(logs);
+
+                    // Sync to ignore feedback store too
+                    var feedback = _neoCortex.LoadIgnoreFeedback();
+                    if (!feedback.PartialMatches.Contains(pattern, StringComparer.OrdinalIgnoreCase))
+                    {
+                        feedback.PartialMatches.Add(pattern);
+                        _neoCortex.SaveIgnoreFeedback(feedback);
+                    }
+                }
+
+                return already
+                    ? $"Already ignoring lines containing \"{pattern}\"."
+                    : $"Got it — I'll ignore log lines containing \"{pattern}\" from now on.";
+            }
+        }
+
+        // "unignore <pattern>" / "stop ignoring <pattern>" — remove from dynamic ignore list
+        if (lowered.StartsWith("unignore ", StringComparison.Ordinal) ||
+            lowered.StartsWith("stop ignoring ", StringComparison.Ordinal))
+        {
+            var prefix = lowered.StartsWith("unignore ") ? "unignore " : "stop ignoring ";
+            var pattern = message[prefix.Length..].Trim();
+            if (!string.IsNullOrWhiteSpace(pattern))
+            {
+                var logs = _neoCortex.LoadLogs();
+                var removed = logs.IgnorePatterns.RemoveAll(p => p.Equals(pattern, StringComparison.OrdinalIgnoreCase));
+                _neoCortex.SaveLogs(logs);
+                return removed > 0
+                    ? $"Removed ignore rule for \"{pattern}\"."
+                    : $"No ignore rule matched \"{pattern}\".";
+            }
+        }
+
+        // "mute alerts" / "silence alerts" / "no alerts" — suppress broadcast alerts for 1 hour
+        if (lowered is "mute alerts" or "silence alerts" or "no alerts" or "stop alerting" or "stop spamming")
+        {
+            _alertMutedUntilUtc = DateTime.UtcNow.AddHours(1);
+            return $"Alert broadcasts muted for 1 hour (until {_alertMutedUntilUtc:HH:mm} UTC). Say \"unmute alerts\" to re-enable.";
+        }
+
+        // "mute alerts <N>h" — mute for N hours
+        if (lowered.StartsWith("mute alerts ", StringComparison.Ordinal) || lowered.StartsWith("silence alerts ", StringComparison.Ordinal))
+        {
+            var prefix = lowered.StartsWith("mute alerts ") ? "mute alerts " : "silence alerts ";
+            var rest = lowered[prefix.Length..].Trim().TrimEnd('h').Trim();
+            if (int.TryParse(rest, out var hours) && hours is >= 1 and <= 48)
+            {
+                _alertMutedUntilUtc = DateTime.UtcNow.AddHours(hours);
+                return $"Alert broadcasts muted for {hours}h (until {_alertMutedUntilUtc:HH:mm} UTC).";
+            }
+        }
+
+        // "unmute alerts" / "resume alerts" — re-enable broadcasts
+        if (lowered is "unmute alerts" or "resume alerts" or "alerts on" or "start alerting")
+        {
+            _alertMutedUntilUtc = DateTime.MinValue;
+            return "Alert broadcasts re-enabled.";
+        }
+
         // "allow <command>" — add command to RCON allowlist
         if (lowered.StartsWith("allow ", StringComparison.Ordinal))
         {
@@ -618,6 +705,15 @@ internal sealed class AgentRuntime
         }
 
         _lastObservationAtUtc = DateTime.UtcNow;
+
+        // Daily log digest: archive yesterday's entries at UTC midnight and start fresh.
+        var todayDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
+        if (todayDate != _lastDigestDate)
+        {
+            _neoCortex.ArchiveAndResetLogs(_lastDigestDate);
+            _lastDigestDate = todayDate;
+            Console.WriteLine($"[observe] Daily log digest archived for {_lastDigestDate}. RecentEntries reset.");
+        }
 
         List<string> servers;
         try
@@ -749,8 +845,9 @@ internal sealed class AgentRuntime
         }, cancellationToken);
     }
 
+    // Rust dedicated server chat format: HH:MM:SS [Chat] PlayerName[SteamID64]: message
     private static readonly System.Text.RegularExpressions.Regex ChatLineRegex = new(
-        @"\[Chat\]|\bCHAT\b",
+        @"\[Chat\]",
         System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
 
     // Extracts (playerName, chatMessage) from a Rust chat log line, or returns null if not a chat line.
@@ -761,8 +858,6 @@ internal sealed class AgentRuntime
 
         // Format: ... [Chat] PlayerName[steamId]: message
         var chatIdx = line.IndexOf("[Chat]", StringComparison.OrdinalIgnoreCase);
-        if (chatIdx < 0)
-            chatIdx = line.IndexOf("CHAT", StringComparison.OrdinalIgnoreCase);
         if (chatIdx < 0)
             return null;
 
@@ -780,8 +875,10 @@ internal sealed class AgentRuntime
         if (string.IsNullOrWhiteSpace(playerName) || string.IsNullOrWhiteSpace(chatMessage))
             return null;
 
-        // Reject obviously non-player entries: names with commas (plugin lists), newlines, or excessive length
-        if (playerName.Contains(',') || playerName.Contains('\n') || playerName.Length > 60)
+        // Reject non-player entries: names with commas (plugin lists), newlines, brackets, or excessive length.
+        if (playerName.Contains(',') || playerName.Contains('\n') ||
+            playerName.Contains('[') || playerName.Contains(']') ||
+            playerName.Length > 60)
             return null;
 
         return (playerName, chatMessage);
@@ -789,15 +886,29 @@ internal sealed class AgentRuntime
 
     private async Task ObserveServerLogsAsync(string server, CancellationToken cancellationToken)
     {
+        var isFirstScan = !_logOffsets.ContainsKey(server);
         _logOffsets.TryGetValue(server, out var offset);
         var path = $"/servers/{Uri.EscapeDataString(server)}/logs/read?offset={offset}&maxBytes=65536";
         using var logs = await _api.GetAsync(path, cancellationToken);
         var root = logs.RootElement;
 
+        long newEndOffset = offset;
         if (root.TryGetProperty("endOffset", out var endOffsetNode) && endOffsetNode.ValueKind == JsonValueKind.Number)
         {
-            _logOffsets[server] = endOffsetNode.GetInt64();
+            newEndOffset = endOffsetNode.GetInt64();
         }
+
+        // On first scan after (re)start, skip all historical log content.
+        // Seek to the current end so we only process new lines going forward.
+        if (isFirstScan)
+        {
+            _logOffsets[server] = newEndOffset;
+            _serverInitialized[server] = true;
+            Console.WriteLine($"[observe] {server}: First scan — seeking to log offset {newEndOffset}, monitoring active.");
+            return;
+        }
+
+        _logOffsets[server] = newEndOffset;
 
         var knowledge = _neoCortex.LoadLogs();
         var consoleMonitor = _config.ConsoleMonitor.Enabled ? _neoCortex.LoadConsoleMonitor() : null;
@@ -822,6 +933,12 @@ internal sealed class AgentRuntime
                 if (string.IsNullOrWhiteSpace(line))
                     continue;
 
+                var lowered = line.ToLowerInvariant();
+
+                // Apply static IgnoreContains rules from agent-log-rules.json first.
+                if (_staticIgnorePatterns.Any(p => lowered.Contains(p.ToLowerInvariant(), StringComparison.Ordinal)))
+                    continue;
+
                 // Skip all noise before the server fully initializes.
                 if (line.Contains("SteamServer Initialized", StringComparison.OrdinalIgnoreCase))
                 {
@@ -829,11 +946,17 @@ internal sealed class AgentRuntime
                     Console.WriteLine($"[observe] {server}: SteamServer initialized — log monitoring active.");
                     continue; // skip the init line itself; it's just a marker
                 }
+
+                // During startup (before SteamServer Initialized), also apply StartupIgnoreContains patterns.
                 if (!_serverInitialized.TryGetValue(server, out var initialized) || !initialized)
+                {
+                    if (_startupIgnorePatterns.Any(p => lowered.Contains(p.ToLowerInvariant(), StringComparison.Ordinal)))
+                        continue;
+                    // Still skip lines that aren't startup-noise but aren't real events yet.
                     continue;
+                }
 
                 // Detect server restart: Unity/Steam init lines only appear at the start of a new boot.
-                var lowered = line.ToLowerInvariant();
                 if (initialized && (lowered.Contains("initializing steam") || lowered.StartsWith("oxide version")))
                 {
                     _serverInitialized[server] = false;
@@ -921,10 +1044,20 @@ internal sealed class AgentRuntime
                 }
 
                 // --- Legacy log knowledge stream ---
+                // Apply dynamic ignore patterns (set by admin "ignore X" directives).
                 if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
                     continue;
 
                 var importance = ScoreImportance(lowered, knowledge.ImportanceRules);
+
+                // Also promote IncidentContains matches from agent-log-rules.json to high importance.
+                if (importance < 3 && _incidentPatterns.Any(p => lowered.Contains(p.ToLowerInvariant(), StringComparison.Ordinal)))
+                    importance = 3;
+
+                // Only save meaningful entries (warnings/errors/incidents) — skip pure info noise.
+                if (importance < 2)
+                    continue;
+
                 knowledge.RecentEntries.Add(new LogObservation
                 {
                     ServerName = server,
@@ -954,20 +1087,27 @@ internal sealed class AgentRuntime
                 serverConsole.RepeatingMessages = top;
             }
 
-            // Escalate if error count exceeds threshold
+            // Escalate if error count exceeds threshold, unless alerts are muted.
             if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
             {
-                Console.WriteLine($"[console] ESCALATE {server}: {serverConsole.ErrorCountSinceLastAlert} errors since last alert.");
-                var topErrors = serverConsole.RecentErrors
-                    .OrderByDescending(e => e.Count)
-                    .Take(3)
-                    .Select(e => $"  • {e.Message[..(Math.Min(e.Message.Length, 60))]} ({e.Count}x)")
-                    .ToList();
-                var alertMsg = $"[{server}] {serverConsole.ErrorCountSinceLastAlert} console errors since last alert." +
-                    (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
-                BroadcastOutbox(alertMsg, server);
                 serverConsole.LastAlertAtUtc = DateTime.UtcNow;
                 serverConsole.ErrorCountSinceLastAlert = 0;
+                if (DateTime.UtcNow > _alertMutedUntilUtc)
+                {
+                    Console.WriteLine($"[console] ESCALATE {server}: {serverConsole.ErrorCountSinceLastAlert} errors since last alert.");
+                    var topErrors = serverConsole.RecentErrors
+                        .OrderByDescending(e => e.Count)
+                        .Take(3)
+                        .Select(e => $"  • {e.Message[..(Math.Min(e.Message.Length, 60))]} ({e.Count}x)")
+                        .ToList();
+                    var alertMsg = $"[{server}] {serverConsole.ErrorCountSinceLastAlert} console errors since last alert." +
+                        (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
+                    BroadcastOutbox(alertMsg, server);
+                }
+                else
+                {
+                    Console.WriteLine($"[console] {server}: escalation suppressed (alerts muted until {_alertMutedUntilUtc:HH:mm} UTC).");
+                }
             }
 
             consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
@@ -1759,6 +1899,45 @@ Open incidents (newest first):
                 "Failed to delete processed inbox/outbox file.",
                 "agent.files",
                 extras: new Dictionary<string, object?> { ["path"] = path });
+        }
+    }
+
+    private static (HashSet<string> ignore, HashSet<string> incident, HashSet<string> startupIgnore) LoadStaticLogRules(string? path)
+    {
+        var ignore = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var incident = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var startupIgnore = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return (ignore, incident, startupIgnore);
+
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            var root = doc.RootElement;
+            AddStrings(root, "IgnoreContains", ignore);
+            AddStrings(root, "IncidentContains", incident);
+            AddStrings(root, "StartupIgnoreContains", startupIgnore);
+            Console.WriteLine($"[agent] Log rules loaded from '{path}': {ignore.Count} ignore, {incident.Count} incident, {startupIgnore.Count} startup-ignore.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[agent] WARNING: Failed to load log rules from '{path}': {ex.Message}");
+        }
+
+        return (ignore, incident, startupIgnore);
+    }
+
+    private static void AddStrings(JsonElement root, string key, HashSet<string> target)
+    {
+        if (root.TryGetProperty(key, out var node) && node.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in node.EnumerateArray())
+            {
+                var s = item.GetString();
+                if (!string.IsNullOrWhiteSpace(s))
+                    target.Add(s);
+            }
         }
     }
 

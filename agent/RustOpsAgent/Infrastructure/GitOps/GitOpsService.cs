@@ -62,6 +62,9 @@ internal sealed class GitOpsService : IGitOpsService
             CreateNoWindow = true
         };
 
+        if (!string.IsNullOrWhiteSpace(_settings.GithubToken))
+            psi.Environment["GH_TOKEN"] = _settings.GithubToken;
+
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch git process.");
         var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
         var stdErrTask = process.StandardError.ReadToEndAsync(cancellationToken);
@@ -90,6 +93,17 @@ internal sealed class GitOpsService : IGitOpsService
             UseShellExecute = false,
             CreateNoWindow = true
         };
+
+        if (!string.IsNullOrWhiteSpace(_settings.GithubToken))
+        {
+            var token = _settings.GithubToken!;
+            psi.Environment["GIT_TERMINAL_PROMPT"] = "0";
+            psi.Environment["GIT_CONFIG_COUNT"] = "2";
+            psi.Environment["GIT_CONFIG_KEY_0"] = $"url.https://oauth2:{token}@github.com/.insteadOf";
+            psi.Environment["GIT_CONFIG_VALUE_0"] = "https://github.com/";
+            psi.Environment["GIT_CONFIG_KEY_1"] = "credential.helper";
+            psi.Environment["GIT_CONFIG_VALUE_1"] = "";
+        }
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException("Failed to launch git process.");
         var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);

@@ -10,6 +10,13 @@ internal sealed record ScopeResolution(
 
 internal static class ServerScopeResolver
 {
+    // Words that should never be treated as server names when they don't match a known server.
+    private static readonly HashSet<string> NonServerNameWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "your", "the", "this", "that", "my", "our", "their", "its",
+        "a", "an", "any", "some", "server", "servers", "both", "all", "each", "every"
+    };
+
     private static readonly Regex CollectivelyAllRegex = new(
         @"\b(all|every|each)\b|\ball\s+\d+\b|\ball\s+(one|two|three|four|five|six|seven|eight|nine|ten)\b|\ball\s+servers?\b|\ball\s+of\s+them\b|\bevery\s+server\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -35,14 +42,16 @@ internal static class ServerScopeResolver
         var requested = new List<string>();
         if (!string.IsNullOrWhiteSpace(requestedServer))
         {
-            var match = MatchKnownServer(requestedServer, canonicalKnownServers);
+            var trimmedServer = requestedServer.Trim();
+            var match = MatchKnownServer(trimmedServer, canonicalKnownServers);
             if (!string.IsNullOrWhiteSpace(match))
             {
                 requested.Add(match!);
             }
-            else
+            else if (!NonServerNameWords.Contains(trimmedServer))
             {
-                requested.Add(requestedServer.Trim());
+                // Only add verbatim if it's not a common English pronoun/placeholder word
+                requested.Add(trimmedServer);
             }
         }
 

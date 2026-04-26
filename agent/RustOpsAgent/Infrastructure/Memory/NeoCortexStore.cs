@@ -168,6 +168,32 @@ internal sealed class NeoCortexStore : IEvolutionStore
     public ClassifierKnowledgeState LoadClassifierKnowledge() => LoadJson(_classifierPath, new ClassifierKnowledgeState());
     public void SaveClassifierKnowledge(ClassifierKnowledgeState state) => SaveJson(_classifierPath, state);
 
+    /// <summary>
+    /// Moves all current log entries to a dated digest file and resets RecentEntries.
+    /// Called once per UTC day to prevent unbounded log accumulation.
+    /// Keeps the last 7 daily digest files.
+    /// </summary>
+    public void ArchiveAndResetLogs(string isoDate)
+    {
+        var logs = LoadLogs();
+        if (logs.RecentEntries.Count > 0)
+        {
+            var digestDir = Path.Combine(_root, "logs", "digests");
+            Directory.CreateDirectory(digestDir);
+            var digestPath = Path.Combine(digestDir, $"{isoDate}.jsonl");
+            var lines = logs.RecentEntries.Select(e => JsonSerializer.Serialize(e, JsonlOptions));
+            File.AppendAllLines(digestPath, lines);
+
+            // Prune digests older than 7 days
+            foreach (var old in Directory.GetFiles(digestDir, "*.jsonl").OrderByDescending(f => f).Skip(7))
+                try { File.Delete(old); } catch { /* ignore prune failures */ }
+        }
+
+        logs.RecentEntries.Clear();
+        logs.LastDigestDateUtc = DateTime.UtcNow;
+        SaveLogs(logs);
+    }
+
     // Compact (non-indented) options for JSONL — one object per line is required.
     private static readonly JsonSerializerOptions JsonlOptions = new()
     {

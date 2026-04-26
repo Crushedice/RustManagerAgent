@@ -45,6 +45,7 @@ internal sealed class LogKnowledgeState
     [JsonPropertyName("ignorePatterns")] public List<string> IgnorePatterns { get; set; } = new();
     [JsonPropertyName("importanceRules")] public List<string> ImportanceRules { get; set; } = new();
     [JsonPropertyName("recentEntries")] public List<LogObservation> RecentEntries { get; set; } = new();
+    [JsonPropertyName("lastDigestDateUtc")] public DateTime? LastDigestDateUtc { get; set; }
 }
 
 internal sealed class LogObservation

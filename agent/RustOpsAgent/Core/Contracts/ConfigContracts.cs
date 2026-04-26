@@ -50,6 +50,7 @@ internal sealed class MonitorSettings
     [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 10;
     [JsonPropertyName("incidentReviewIntervalMinutes")] public int IncidentReviewIntervalMinutes { get; set; } = 30;
     [JsonPropertyName("classifierEvolutionIntervalMinutes")] public int ClassifierEvolutionIntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("logRulesPath")] public string? LogRulesPath { get; set; }
 }
 
 internal sealed class CommandExecutionSettings
@@ -69,6 +70,7 @@ internal sealed class GitOpsSettings
     [JsonPropertyName("baseBranch")] public string BaseBranch { get; set; } = "main";
     [JsonPropertyName("pushBranchPrefix")] public string PushBranchPrefix { get; set; } = "agent/";
     [JsonPropertyName("allowPush")] public bool AllowPush { get; set; }
+    [JsonPropertyName("githubToken")] public string? GithubToken { get; set; }
 }
 
 internal sealed class AutoPullSettings
@@ -82,6 +84,7 @@ internal sealed class AutoPullSettings
     [JsonPropertyName("buildScript")] public string BuildScript { get; set; } = "Agent-Build.sh";
     [JsonPropertyName("restartEnabled")] public bool RestartEnabled { get; set; }
     [JsonPropertyName("serviceName")] public string ServiceName { get; set; } = "rustopsagent";
+    [JsonPropertyName("githubToken")] public string? GithubToken { get; set; }
 }
 
 internal sealed class NetworkSettings

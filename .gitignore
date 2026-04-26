@@ -3,16 +3,26 @@ obj/
 build/
 data/
 runtime/
+.dotnet/
 *.user
 *.suo
 *.log
 *.db
 *.env
 rustops.env
+config.env
+
+# Compiled binaries and generated .NET files
+*.dll
+*.pdb
+*.exe
+*.deps.json
+*.runtimeconfig.json
+
+# Instance-specific config files (use .example versions as templates)
+agentsettings.json
+botsettings.json
 OldProjectfiles/
 RusticalandOPS.zip
 .claude/worktrees/dreamy-brown-709393/
 .claude/worktrees/cranky-williamson-009cb6/
-.claude/
-.github/
-

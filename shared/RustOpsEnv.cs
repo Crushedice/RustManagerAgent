@@ -156,6 +156,10 @@ internal static partial class RustOpsEnv
 
         foreach (var baseDir in GetBaseDirectories(anchorPath))
         {
+            Add(Path.Combine(baseDir, "config.env"));
+            Add(Path.Combine(baseDir, "..", "config.env"));
+            Add(Path.Combine(baseDir, "..", "..", "config.env"));
+            // Legacy fallback paths kept for backward compatibility during migration
             Add(Path.Combine(baseDir, "rustops.env"));
             Add(Path.Combine(baseDir, "config", "rustops.env"));
             Add(Path.Combine(baseDir, "..", "config", "rustops.env"));

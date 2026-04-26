@@ -433,6 +433,12 @@ Admin message:
         return raw[start..(end + 1)];
     }
 
+    private static readonly HashSet<string> ServerHintExclusions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "your", "the", "this", "that", "my", "our", "their", "its",
+        "a", "an", "any", "some", "server", "servers"
+    };
+
     private static string? ExtractServerHint(string message)
     {
         var match = Regex.Match(
@@ -441,7 +447,8 @@ Admin message:
             RegexOptions.IgnoreCase);
         if (match.Success)
         {
-            return match.Groups["server"].Value.Trim();
+            var server = match.Groups["server"].Value.Trim();
+            return ServerHintExclusions.Contains(server) ? null : server;
         }
 
         return null;

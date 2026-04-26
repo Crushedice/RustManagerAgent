@@ -137,12 +137,50 @@ internal static class ConfigLoader
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_LLM_COMPOSE_CHAT_SYSTEM_PROMPT")
             ?? RustOpsEnv.ResolvePlaceholders(config.LlmCompose.ChatSystemPrompt ?? string.Empty);
 
+        if (!string.IsNullOrWhiteSpace(config.Monitor.LogRulesPath))
+            config.Monitor.LogRulesPath = ResolvePath(config.Monitor.LogRulesPath, root);
+
         config.Memory.StatePath = ResolvePath(config.Memory.StatePath, root);
         config.Memory.NeoCortexRoot = ResolvePath(config.Memory.NeoCortexRoot, root);
         config.Inbox.ChatInboxPath = ResolvePath(config.Inbox.ChatInboxPath, root);
         config.Inbox.DecisionInboxPath = ResolvePath(config.Inbox.DecisionInboxPath, root);
         config.Inbox.FeedbackInboxPath = ResolvePath(config.Inbox.FeedbackInboxPath, root);
         config.Outbox.MessageOutboxPath = ResolvePath(config.Outbox.MessageOutboxPath, root);
+
+        config.GitOps.GithubToken =
+            RustOpsEnv.FirstNonEmptyEnvironment("GITHUB_TOKEN", "RUSTOPS_GITOPS_GITHUB_TOKEN")
+            ?? RustOpsEnv.ResolvePlaceholders(config.GitOps.GithubToken ?? string.Empty);
+        config.GitOps.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_ENABLED", config.GitOps.Enabled);
+        config.GitOps.RepoPath =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REPO_PATH")
+            ?? RustOpsEnv.ResolvePlaceholders(config.GitOps.RepoPath);
+        config.GitOps.RemoteName =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REMOTE")
+            ?? RustOpsEnv.ResolvePlaceholders(config.GitOps.RemoteName);
+        config.GitOps.BaseBranch =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_BASE_BRANCH")
+            ?? RustOpsEnv.ResolvePlaceholders(config.GitOps.BaseBranch);
+        config.GitOps.AllowPush =
+            RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_ALLOW_PUSH", config.GitOps.AllowPush);
+
+        config.AutoPull.GithubToken =
+            RustOpsEnv.FirstNonEmptyEnvironment("GITHUB_TOKEN", "RUSTOPS_GITOPS_GITHUB_TOKEN")
+            ?? RustOpsEnv.ResolvePlaceholders(config.AutoPull.GithubToken ?? string.Empty);
+        config.AutoPull.Enabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_PULL_ENABLED", config.AutoPull.Enabled);
+        config.AutoPull.IntervalMinutes =
+            RustOpsEnv.GetInt32("RUSTOPS_GITOPS_AUTO_PULL_INTERVAL_MINUTES", config.AutoPull.IntervalMinutes);
+        config.AutoPull.RepoPath =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REPO_PATH")
+            ?? RustOpsEnv.ResolvePlaceholders(config.AutoPull.RepoPath);
+        config.AutoPull.RemoteName =
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_GITOPS_REMOTE")
+            ?? RustOpsEnv.ResolvePlaceholders(config.AutoPull.RemoteName);
+        config.AutoPull.BuildEnabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_PULL_REBUILD", config.AutoPull.BuildEnabled);
+        config.AutoPull.RestartEnabled =
+            RustOpsEnv.GetBoolean("RUSTOPS_GITOPS_AUTO_RESTART_AFTER_PULL_REBUILD", config.AutoPull.RestartEnabled);
 
         if (!config.GitOps.PushBranchPrefix.StartsWith("agent/", StringComparison.OrdinalIgnoreCase))
         {

@@ -37,7 +37,8 @@ internal sealed class AutoPullService
         var output = new StringBuilder();
         try
         {
-            var pullOut = await RunAsync("git", $"pull {_settings.RemoteName} {_settings.BranchName}", _settings.RepoPath, cancellationToken);
+            var gitEnv = BuildGitEnv();
+            var pullOut = await RunAsync("git", $"pull {_settings.RemoteName} {_settings.BranchName}", _settings.RepoPath, gitEnv, cancellationToken);
             output.AppendLine(pullOut);
             Console.WriteLine($"[autopull] git pull: {pullOut.Trim()}");
 
@@ -54,7 +55,7 @@ internal sealed class AutoPullService
                     ? _settings.BuildScript
                     : Path.Combine(_settings.RepoPath, _settings.BuildScript);
 
-                var buildOut = await RunAsync("bash", $"\"{buildScript}\"", _settings.RepoPath, cancellationToken);
+                var buildOut = await RunAsync("bash", $"\"{buildScript}\"", _settings.RepoPath, null, cancellationToken);
                 output.AppendLine(buildOut);
                 Console.WriteLine($"[autopull] build: {buildOut.Trim()}");
             }
@@ -62,7 +63,7 @@ internal sealed class AutoPullService
             if (_settings.RestartEnabled && !string.IsNullOrWhiteSpace(_settings.ServiceName))
             {
                 Console.WriteLine($"[autopull] Restarting service: {_settings.ServiceName}");
-                var restartOut = await RunAsync("systemctl", $"restart {_settings.ServiceName}", "/", cancellationToken);
+                var restartOut = await RunAsync("systemctl", $"restart {_settings.ServiceName}", "/", null, cancellationToken);
                 output.AppendLine(restartOut);
             }
 
@@ -78,7 +79,26 @@ internal sealed class AutoPullService
         return _lastStatus;
     }
 
-    private static async Task<string> RunAsync(string fileName, string arguments, string workingDirectory, CancellationToken cancellationToken)
+    private Dictionary<string, string>? BuildGitEnv()
+    {
+        if (string.IsNullOrWhiteSpace(_settings.GithubToken))
+            return null;
+
+        var token = _settings.GithubToken!;
+        // Use GIT_CONFIG_* env vars (git 2.31+) to inject the PAT via URL rewrite,
+        // avoiding the need for a ~/.git-credentials file under the service user account.
+        return new Dictionary<string, string>
+        {
+            ["GIT_TERMINAL_PROMPT"] = "0",
+            ["GIT_CONFIG_COUNT"] = "2",
+            ["GIT_CONFIG_KEY_0"] = $"url.https://oauth2:{token}@github.com/.insteadOf",
+            ["GIT_CONFIG_VALUE_0"] = "https://github.com/",
+            ["GIT_CONFIG_KEY_1"] = "credential.helper",
+            ["GIT_CONFIG_VALUE_1"] = ""
+        };
+    }
+
+    private static async Task<string> RunAsync(string fileName, string arguments, string workingDirectory, Dictionary<string, string>? env, CancellationToken cancellationToken)
     {
         var psi = new ProcessStartInfo
         {
@@ -90,6 +110,12 @@ internal sealed class AutoPullService
             UseShellExecute = false,
             CreateNoWindow = true
         };
+
+        if (env != null)
+        {
+            foreach (var kvp in env)
+                psi.Environment[kvp.Key] = kvp.Value;
+        }
 
         using var process = Process.Start(psi) ?? throw new InvalidOperationException($"Failed to start process: {fileName}");
         var stdOutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
