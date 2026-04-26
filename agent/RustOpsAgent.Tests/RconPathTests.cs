@@ -6,13 +6,13 @@ namespace RustOpsAgent.Tests;
 public class RconPathTests
 {
     [Fact]
-    public void LoadConnectionFromConfig_Uses_AdditionalArgs_Host_When_RconIp_Is_Missing()
+    public void LoadConnectionFromConfig_Uses_RconIp_From_AdditionalArgs_When_TopLevel_Missing()
     {
         using var doc = JsonDocument.Parse("""
         {
           "rcon.port": 28016,
           "rcon.password": "secret",
-          "additionalArgs": "+server.ip 10.10.0.7 +rcon.web 1"
+          "additionalArgs": "+rcon.ip 10.10.0.7 +rcon.web 1"
         }
         """);
 
@@ -24,8 +24,44 @@ public class RconPathTests
     }
 
     [Fact]
-    public void LoadConnectionFromConfig_Returns_Null_When_WebRcon_Is_Disabled()
+    public void LoadConnectionFromConfig_Does_Not_Use_ServerIp_As_RconHost()
     {
+        // server.ip is the player-facing bind address, not the RCON connection target.
+        // When rcon.ip is absent, we must default to 127.0.0.1 rather than server.ip.
+        using var doc = JsonDocument.Parse("""
+        {
+          "rcon.port": 28016,
+          "rcon.password": "secret",
+          "server.ip": "10.10.0.7"
+        }
+        """);
+
+        var connection = RustDirectRconHelper.LoadConnectionFromConfig(doc.RootElement);
+
+        Assert.NotNull(connection);
+        Assert.Equal("ws://127.0.0.1:28016/secret", connection!.Value.Uri.ToString());
+    }
+
+    [Fact]
+    public void LoadConnectionFromConfig_Reads_Port_And_Password_From_AdditionalArgs()
+    {
+        using var doc = JsonDocument.Parse("""
+        {
+          "additionalArgs": "+rcon.port 28017 +rcon.password mypass +rcon.web 1"
+        }
+        """);
+
+        var connection = RustDirectRconHelper.LoadConnectionFromConfig(doc.RootElement);
+
+        Assert.NotNull(connection);
+        Assert.Equal("ws://127.0.0.1:28017/mypass", connection!.Value.Uri.ToString());
+        Assert.Equal("mypass", connection.Value.Password);
+    }
+
+    [Fact]
+    public void LoadConnectionFromConfig_Connects_Even_When_RconWeb_Is_Zero()
+    {
+        // rcon.web is no longer gated — WebRCON is always the transport.
         using var doc = JsonDocument.Parse("""
         {
           "rcon.port": 28016,
@@ -36,7 +72,8 @@ public class RconPathTests
 
         var connection = RustDirectRconHelper.LoadConnectionFromConfig(doc.RootElement);
 
-        Assert.Null(connection);
+        Assert.NotNull(connection);
+        Assert.Equal("ws://127.0.0.1:28016/secret", connection!.Value.Uri.ToString());
     }
 
     [Fact]

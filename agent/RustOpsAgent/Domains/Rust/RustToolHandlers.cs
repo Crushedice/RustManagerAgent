@@ -478,9 +478,10 @@ internal sealed class RustRconToolHandler : IToolHandler
             // ""    = RCON connected and executed; many Rust commands (say, kick) return empty — this is NOT a failure
             if (directReply is not null)
             {
+                var endpoint = RustDirectRconHelper.GetSessionEndpoint(server) ?? "unknown";
                 reply = string.IsNullOrWhiteSpace(directReply)
-                    ? $"RCON {server}: command sent (server returned no output, which is normal for broadcast commands)."
-                    : $"RCON {server}: {TruncateOutput(directReply)}";
+                    ? $"RCON {server} ({endpoint}): `{command}` executed — server returned no output. Run `status` on {server} to confirm RCON is reaching the correct server."
+                    : $"RCON {server} ({endpoint}): {TruncateOutput(directReply)}";
                 succeeded = true;
             }
             else
@@ -1195,6 +1196,11 @@ internal static class RustDirectRconHelper
         return Array.Empty<string>();
     }
 
+    public static string? GetSessionEndpoint(string server)
+    {
+        return Sessions.TryGetValue(server, out var session) ? session.ConnectionEndpoint : null;
+    }
+
     public static async Task<string?> TryExecuteAsync(string server, string command, CancellationToken cancellationToken)
     {
         try
@@ -1266,28 +1272,17 @@ internal static class RustDirectRconHelper
     internal static (Uri Uri, string Password)? LoadConnectionFromConfig(JsonElement root)
     {
         var additionalArgs = ReadConfigValue(root, "additionalArgs");
+
+        // rcon.ip is the explicit RCON bind address. server.ip is the player-facing bind address
+        // (often "0.0.0.0" or a public interface) and is NOT a valid RCON connection target.
         var host =
             ReadConfigValue(root, "rcon.ip") ??
             ReadArgValue(additionalArgs, "rcon.ip") ??
-            ReadConfigValue(root, "server.ip") ??
-            ReadArgValue(additionalArgs, "server.ip") ??
             "127.0.0.1";
 
-        var webValue =
-            ReadConfigValue(root, "rcon.web") ??
-            ReadArgValue(additionalArgs, "rcon.web");
-        var webEnabled = string.IsNullOrWhiteSpace(webValue) ||
-            (webValue == "1" ||
-            webValue.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-            webValue.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
-            webValue.Equals("on", StringComparison.OrdinalIgnoreCase));
-        if (!webEnabled)
-        {
-            return null;
-        }
-
-        var portText = ReadConfigValue(root, "rcon.port");
-        var password = ReadConfigValue(root, "rcon.password");
+        // rcon.web is always enabled — WebRCON is the only supported transport.
+        var portText = ReadConfigValue(root, "rcon.port") ?? ReadArgValue(additionalArgs, "rcon.port");
+        var password = ReadConfigValue(root, "rcon.password") ?? ReadArgValue(additionalArgs, "rcon.password");
         if (!int.TryParse(portText, out var port) || port <= 0 || port > 65535 || string.IsNullOrWhiteSpace(password))
         {
             return null;

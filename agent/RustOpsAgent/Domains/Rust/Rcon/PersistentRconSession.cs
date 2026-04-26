@@ -14,6 +14,8 @@ internal sealed class PersistentRconSession : IAsyncDisposable
         _password = password;
     }
 
+    public string ConnectionEndpoint => $"{_uri.Host}:{_uri.Port}";
+
     public bool Matches(Uri uri, string password) =>
         Uri.Compare(_uri, uri, UriComponents.AbsoluteUri, UriFormat.SafeUnescaped, StringComparison.OrdinalIgnoreCase) == 0 &&
         string.Equals(_password, password, StringComparison.Ordinal);
