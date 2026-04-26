@@ -1,4 +1,4 @@
-using Microsoft.SemanticKernel;
+﻿using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
 using Sentry;
 using RustOpsAgent.Core;
@@ -150,7 +150,8 @@ var handlers = new List<IToolHandler>
     new RustPluginToolHandler(apiClient, config.PluginUpdates),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps),
-    new RustChatToolHandler(neoCortex, autoPull)
+    new RustChatToolHandler(neoCortex, autoPull),
+    new RustServerManagementToolHandler(apiClient)
 };
 
 var registry = new ToolRegistry(handlers);

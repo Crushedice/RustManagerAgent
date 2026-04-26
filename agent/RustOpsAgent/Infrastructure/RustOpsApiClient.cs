@@ -1,4 +1,4 @@
-using System.Net.Http.Headers;
+﻿using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
@@ -50,6 +50,38 @@ internal sealed class RustOpsApiClient : IDisposable
         }
 
         return JsonDocument.Parse(body);
+    }
+
+    public async Task<JsonDocument> PutAsync(string path, object? payload, CancellationToken cancellationToken)
+    {
+        RustOpsSentry.AddBreadcrumb($"PUT {path}", "agent.api");
+        var json = payload is null ? "{}" : JsonSerializer.Serialize(payload, JsonDefaults.Default);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var response = await _http.PutAsync(path.TrimStart('/'), content, cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            RustOpsSentry.AddBreadcrumb($"PUT {path} failed with {(int)response.StatusCode}.", "agent.api");
+            throw new InvalidOperationException($"API PUT {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {body}");
+        }
+
+        return JsonDocument.Parse(body);
+    }
+
+    public async Task<JsonDocument> DeleteAsync(string path, CancellationToken cancellationToken)
+    {
+        RustOpsSentry.AddBreadcrumb($"DELETE {path}", "agent.api");
+        using var response = await _http.DeleteAsync(path.TrimStart('/'), cancellationToken);
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            RustOpsSentry.AddBreadcrumb($"DELETE {path} failed with {(int)response.StatusCode}.", "agent.api");
+            throw new InvalidOperationException($"API DELETE {path} failed: {(int)response.StatusCode} {response.ReasonPhrase} {body}");
+        }
+
+        return string.IsNullOrWhiteSpace(body) || body == "null"
+            ? JsonDocument.Parse("{}")
+            : JsonDocument.Parse(body);
     }
 
     public void Dispose() => _http.Dispose();

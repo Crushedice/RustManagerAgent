@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using rustmgrapi.Api.Models;
 
 namespace rustmgrapi.Api.Services;

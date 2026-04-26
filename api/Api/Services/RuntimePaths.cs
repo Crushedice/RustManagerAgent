@@ -1,4 +1,4 @@
-namespace rustmgrapi.Api.Services;
+﻿namespace rustmgrapi.Api.Services;
 
 internal sealed class RuntimePaths
 {

@@ -1,4 +1,4 @@
-using Microsoft.SemanticKernel;
+﻿using Microsoft.SemanticKernel;
 using Sentry;
 using System.Text.Json;
 using RustOpsAgent.Core.Contracts;

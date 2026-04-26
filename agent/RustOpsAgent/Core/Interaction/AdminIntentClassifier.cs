@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.SemanticKernel;
@@ -37,10 +37,10 @@ Return strict JSON only with keys:
 intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
 
 intent enum:
-chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification
+chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification, server_management
 
 targetRef enum:
-rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply
+rust.server.control, rust.player.lookup, rust.rcon.command, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply, rust.server.management
 
 slots object keys:
 serverName, serverNames, scopeKind, playerName, commandText, timeRange, severity
@@ -56,6 +56,7 @@ Rules:
 - Words like "issue", "issues", "problem", "problems" when paired with "plugin", "oxide", or "umod" → intent=troubleshooting, targetRef=rust.plugins.verify.
 - When the request is to execute/run/send an RCON command or any raw server command (e.g. "run say Hello", "execute status", "rcon say X") → intent=rcon_command, targetRef=rust.rcon.command, put the command text in slots.commandText. NEVER use server_control for this.
 - server_control is ONLY for lifecycle actions: start, stop, restart, kill, update, wipe on RUST GAME SERVERS.
+- When the request is to add, register, remove, delete, or edit a server connection (remote or local) — e.g. "add remote server", "register server at 1.2.3.4", "remove Cotton from the list", "provision a new server", "update rcon credentials for X" → intent=server_management, targetRef=rust.server.management. Put the server name in slots.serverName and the RCON IP in slots.commandText if provided.
 - CRITICAL: Requests about git operations, pulling code, rebuilding the agent, or building the codebase (e.g. "pull from main", "can you rebuild?", "git pull", "build the agent") are ALWAYS → intent=chat, targetRef=rust.chat.reply. These are about the AGENT SOFTWARE, not the Rust game servers. NEVER classify these as server_control or troubleshooting. The agent does not control game server builds — it only manages their lifecycle (start/stop/restart/wipe).
 
 Conversation context:
@@ -249,6 +250,11 @@ Admin message:
 
     private static AdminIntentType InferHeuristicIntent(string lowered)
     {
+        if (lowered.Contains("add server") || lowered.Contains("add remote") || lowered.Contains("register server") ||
+            lowered.Contains("remove server") || lowered.Contains("delete server") || lowered.Contains("provision server") ||
+            lowered.Contains("new server") || lowered.Contains("update rcon") || lowered.Contains("edit server") ||
+            lowered.Contains("rcon credential") || lowered.Contains("connect server"))
+            return AdminIntentType.ServerManagement;
         if (lowered.Contains("pull") || lowered.Contains("git") || lowered.Contains("rebuild") || lowered.Contains("build"))
             return AdminIntentType.Chat;
         if (lowered.Contains("network") || lowered.Contains("throughput") || lowered.Contains("latency") || lowered.Contains("eth0") || lowered.Contains("wg1") || lowered.Contains("wt1"))
@@ -327,6 +333,7 @@ Admin message:
             AdminIntentType.RconCommand or
             AdminIntentType.StatusCheck or
             AdminIntentType.Troubleshooting;
+        // ServerManagement does NOT require a pre-resolved server scope — it defines its own
 
     private static string BuildClarificationQuestion(AdminIntentType intent, IReadOnlyList<string> knownServers, string? preferredQuestion)
     {
@@ -354,6 +361,7 @@ Admin message:
             AdminIntentType.ServerControl => "rust.server.control",
             AdminIntentType.PlayerLookup => "rust.player.lookup",
             AdminIntentType.RconCommand => "rust.rcon.command",
+            AdminIntentType.ServerManagement => "rust.server.management",
             AdminIntentType.Chat or AdminIntentType.Clarification => "rust.chat.reply",
             AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting => InferDiagnosticsTarget(loweredMessage),
             _ => null
@@ -396,6 +404,7 @@ Admin message:
             "server_control" => "rust.server.control",
             "player_lookup" => "rust.player.lookup",
             "rcon_command" => "rust.rcon.command",
+            "server_management" or "server.management" => "rust.server.management",
             "chat" or "clarification" => "rust.chat.reply",
             _ => targetRef
         };
@@ -418,6 +427,7 @@ Admin message:
         "file_edit" => AdminIntentType.FileEdit,
         "status_check" => AdminIntentType.StatusCheck,
         "troubleshooting" => AdminIntentType.Troubleshooting,
+        "server_management" => AdminIntentType.ServerManagement,
         _ => AdminIntentType.Clarification
     };
 

@@ -1,4 +1,4 @@
-using RustOpsAgent.Core.Contracts;
+﻿using RustOpsAgent.Core.Contracts;
 
 namespace RustOpsAgent.Core.Interaction;
 

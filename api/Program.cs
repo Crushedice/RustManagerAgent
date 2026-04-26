@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -762,11 +762,17 @@ app.MapPut("/servers/remote/{name}", (string name, RemoteServerEntry updated) =>
     if (idx < 0)
         return Results.NotFound();
 
-    remoteServers[idx] = updated;
-    SaveRemoteServers(remoteServers);
-    WriteRemoteServerStubConfig(updated);
+    // Keep the existing password if the client sent an empty one (UI omits it when unchanged)
+    var effectivePassword = string.IsNullOrWhiteSpace(updated.RconPassword)
+        ? remoteServers[idx].RconPassword
+        : updated.RconPassword;
+    var effective = updated with { RconPassword = effectivePassword };
 
-    return Results.Ok(new { name = updated.Name, remote = true });
+    remoteServers[idx] = effective;
+    SaveRemoteServers(remoteServers);
+    WriteRemoteServerStubConfig(effective);
+
+    return Results.Ok(new { name = effective.Name, remote = true });
 });
 
 app.MapDelete("/servers/remote/{name}", (string name) =>
@@ -2046,29 +2052,21 @@ static string GetConfigPath(string server) =>
 
 static RconConnectionInfo ResolveRconConnectionInfo(string server, ServerConfig cfg)
 {
+    // rcon.ip is the explicit RCON bind address. server.ip is the player-facing bind address
+    // and is NOT a valid outbound RCON connection target.
     var host =
         ReadRawServerConfigValue(server, "rcon.ip") ??
         ReadArgValue(cfg.AdditionalArgs, "rcon.ip") ??
-        ReadRawServerConfigValue(server, "server.ip") ??
-        ReadArgValue(cfg.AdditionalArgs, "server.ip") ??
         "127.0.0.1";
 
-    var webValue =
-        ReadRawServerConfigValue(server, "rcon.web") ??
-        ReadArgValue(cfg.AdditionalArgs, "rcon.web");
-    var webEnabled = string.IsNullOrWhiteSpace(webValue) ||
-        webValue == "1" ||
-        webValue.Equals("true", StringComparison.OrdinalIgnoreCase) ||
-        webValue.Equals("yes", StringComparison.OrdinalIgnoreCase) ||
-        webValue.Equals("on", StringComparison.OrdinalIgnoreCase);
-
+    // rcon.web is always enabled — WebRCON is the only supported transport.
     var trimmedHost = host.Trim().Trim('"');
     var port = (ushort)Math.Clamp(cfg.RconPort, 1, 65535);
     var password = cfg.RconPassword?.Trim() ?? string.Empty;
     if (string.IsNullOrWhiteSpace(password))
         throw new InvalidOperationException($"rcon.password is empty for '{server}'.");
 
-    return new RconConnectionInfo(trimmedHost, port, password, webEnabled);
+    return new RconConnectionInfo(trimmedHost, port, password, true);
 }
 
 static string? ReadRawServerConfigValue(string server, string key)
@@ -3468,6 +3466,7 @@ static string BuildDashboardHtml() => """
       <button class="tab active" data-target="serversGroup">Servers</button>
       <button class="tab" data-target="agentGroup">Agent</button>
       <button class="tab" data-target="llmGroup">LLM</button>
+      <button class="tab" data-target="serverMgmtGroup">Server Mgmt</button>
     </div>
 
     <section id="serversGroup" class="section-group active">
@@ -3506,6 +3505,63 @@ static string BuildDashboardHtml() => """
         <div class="card wide"><h2>Recent LLM Interactions <span class="legend" data-tip="Each record shows when the agent called the model, what kind of request it made, whether it succeeded, and a short response preview if one was recorded.">?</span></h2><div id="llmInteractions" class="list"></div></div>
       </div>
     </section>
+
+    <section id="serverMgmtGroup" class="section-group">
+      <div class="grid">
+        <div class="card wide">
+          <h2>Remote Servers <span class="legend" data-tip="Servers managed via RCON only. The agent and API relay commands to these. They do not run on this machine.">?</span><button type="button" id="showAddRemoteForm" style="margin-left:auto;padding:8px 14px;font-size:13px;">+ Add Remote</button></h2>
+          <div id="addRemoteServerForm" style="display:none;margin-bottom:18px;padding:16px;border:1px solid var(--line);border-radius:14px;background:rgba(21,36,52,.55);">
+            <div class="row">
+              <div><label for="remoteNameInput" class="tiny muted">Name (unique key)</label><input id="remoteNameInput" type="text" placeholder="e.g. Cotton"></div>
+              <div><label for="remoteDisplayNameInput" class="tiny muted">Display Name</label><input id="remoteDisplayNameInput" type="text" placeholder="e.g. Cotton PvP"></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+              <div><label for="remoteRconIpInput" class="tiny muted">RCON IP</label><input id="remoteRconIpInput" type="text" placeholder="e.g. 192.168.1.100"></div>
+              <div><label for="remoteRconPortInput" class="tiny muted">RCON Port</label><input id="remoteRconPortInput" type="number" min="1" max="65535" placeholder="28016"></div>
+              <div><label for="remoteRconPasswordInput" class="tiny muted">RCON Password</label><input id="remoteRconPasswordInput" type="password" placeholder="leave blank to keep existing"></div>
+            </div>
+            <div class="row" style="margin-top:10px;">
+              <div><label for="remoteGamePortInput" class="tiny muted">Game Port (optional)</label><input id="remoteGamePortInput" type="number" min="0" max="65535" placeholder="28015"></div>
+              <div></div><div></div>
+            </div>
+            <div class="toolbar" style="margin-top:12px;">
+              <div id="remoteFormStatus" class="muted"></div>
+              <div style="display:flex;gap:8px;"><button type="button" id="cancelRemoteForm" class="ghost">Cancel</button><button type="button" id="saveRemoteServer">Save</button></div>
+            </div>
+          </div>
+          <div id="remoteServersStatus" class="muted" style="margin-bottom:8px;">Not loaded.</div>
+          <table><thead><tr><th>Name</th><th>Display Name</th><th>RCON IP</th><th>Ports</th><th>Actions</th></tr></thead><tbody id="remoteServersList"></tbody></table>
+        </div>
+        <div class="card wide">
+          <h2>Provision Local Server <span class="legend" data-tip="Creates a new server config for a Rust server on this machine. Does not install or start the server — use rustmgr after provisioning.">?</span></h2>
+          <div class="row">
+            <div><label for="provName" class="tiny muted">Name (config key)</label><input id="provName" type="text" placeholder="e.g. Vanilla1"></div>
+            <div><label for="provHostname" class="tiny muted">Server Hostname</label><input id="provHostname" type="text" placeholder="My Rust Server"></div>
+            <div><label for="provIdentity" class="tiny muted">Server Identity</label><input id="provIdentity" type="text" placeholder="e.g. vanilla1"></div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div><label for="provServerPort" class="tiny muted">Game Port</label><input id="provServerPort" type="number" min="1" max="65535" placeholder="28015"></div>
+            <div><label for="provRconPort" class="tiny muted">RCON Port</label><input id="provRconPort" type="number" min="1" max="65535" placeholder="28016"></div>
+            <div><label for="provAppPort" class="tiny muted">App Port (Companion)</label><input id="provAppPort" type="number" min="1" max="65535" placeholder="28082"></div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div><label for="provRconPassword" class="tiny muted">RCON Password</label><input id="provRconPassword" type="password" placeholder="strong-password"></div>
+            <div><label for="provMaxPlayers" class="tiny muted">Max Players</label><input id="provMaxPlayers" type="number" min="1" max="500" placeholder="100"></div>
+            <div></div>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <div><label for="provWorldSize" class="tiny muted">World Size</label><input id="provWorldSize" type="number" min="1000" max="6000" placeholder="3500"></div>
+            <div><label for="provSeed" class="tiny muted">Seed (0 = random)</label><input id="provSeed" type="number" placeholder="0"></div>
+            <div><label for="provServerDir" class="tiny muted">Server Directory (full path)</label><input id="provServerDir" type="text" placeholder="/opt/rust/servers/vanilla1"></div>
+          </div>
+          <div style="margin-top:10px;"><label class="check"><input id="provCreateDirs" type="checkbox" checked> Create directories on disk</label></div>
+          <div class="toolbar" style="margin-top:12px;">
+            <div id="provisionStatus" class="muted"></div>
+            <button type="button" id="provisionServer">Provision Server</button>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
   <script>
     const $ = id => document.getElementById(id);
@@ -3535,6 +3591,110 @@ static string BuildDashboardHtml() => """
     function activateTab(target) {
       tabs.forEach(tab => tab.classList.toggle('active', tab.dataset.target === target));
       panes.forEach(pane => pane.classList.toggle('active', pane.id === target));
+    }
+
+    let remoteServerEditMode = null;
+
+    async function loadRemoteServers() {
+      try {
+        $('remoteServersStatus').textContent = 'Loading…';
+        const servers = await fetchJson('/servers/remote/list');
+        $('remoteServersStatus').textContent = `${servers.length} remote server(s) registered.`;
+        $('remoteServersList').innerHTML = (servers || []).map(s => `<tr><td><strong>${esc(s.name)}</strong></td><td>${esc(s.displayName || '')}</td><td>${esc(s.rconIp)}</td><td>RCON ${esc(s.rconPort)}${s.gamePort ? ` / Game ${esc(s.gamePort)}` : ''}</td><td style="display:flex;gap:6px;flex-wrap:wrap;"><button type="button" class="ghost remote-test" data-name="${esc(s.name)}" style="padding:5px 10px;font-size:12px;">Test</button><button type="button" class="ghost remote-edit" data-name="${esc(s.name)}" data-display="${esc(s.displayName||'')}" data-ip="${esc(s.rconIp)}" data-port="${esc(s.rconPort)}" data-gameport="${esc(s.gamePort||0)}" style="padding:5px 10px;font-size:12px;">Edit</button><button type="button" class="ghost remote-delete" data-name="${esc(s.name)}" style="padding:5px 10px;font-size:12px;color:var(--bad);">Delete</button></td></tr>`).join('') || '<tr><td colspan="5" class="muted">No remote servers registered.</td></tr>';
+      } catch (error) { $('remoteServersStatus').textContent = `Failed to load: ${error.message}`; }
+    }
+
+    function showAddRemoteForm() {
+      remoteServerEditMode = null;
+      $('remoteNameInput').value = '';
+      $('remoteNameInput').disabled = false;
+      $('remoteDisplayNameInput').value = '';
+      $('remoteRconIpInput').value = '';
+      $('remoteRconPortInput').value = '';
+      $('remoteRconPasswordInput').value = '';
+      $('remoteGamePortInput').value = '';
+      $('remoteFormStatus').textContent = '';
+      $('addRemoteServerForm').style.display = 'block';
+      $('saveRemoteServer').textContent = 'Add Server';
+    }
+
+    function showEditRemoteForm(name, displayName, ip, port, gamePort) {
+      remoteServerEditMode = name;
+      $('remoteNameInput').value = name;
+      $('remoteNameInput').disabled = true;
+      $('remoteDisplayNameInput').value = displayName;
+      $('remoteRconIpInput').value = ip;
+      $('remoteRconPortInput').value = port;
+      $('remoteRconPasswordInput').value = '';
+      $('remoteGamePortInput').value = gamePort > 0 ? gamePort : '';
+      $('remoteFormStatus').textContent = 'Leave password blank to keep the existing one.';
+      $('addRemoteServerForm').style.display = 'block';
+      $('saveRemoteServer').textContent = 'Update Server';
+    }
+
+    function hideRemoteForm() {
+      $('addRemoteServerForm').style.display = 'none';
+      $('remoteFormStatus').textContent = '';
+      remoteServerEditMode = null;
+    }
+
+    async function saveRemoteServerForm() {
+      const name = $('remoteNameInput').value.trim();
+      const displayName = $('remoteDisplayNameInput').value.trim();
+      const rconIp = $('remoteRconIpInput').value.trim();
+      const rconPort = parseInt($('remoteRconPortInput').value, 10) || 0;
+      const rconPassword = $('remoteRconPasswordInput').value;
+      const gamePort = parseInt($('remoteGamePortInput').value, 10) || 0;
+      const isEdit = remoteServerEditMode !== null;
+      if (!name || !rconIp || !rconPort) { $('remoteFormStatus').textContent = 'Name, RCON IP, and RCON Port are required.'; return; }
+      if (!isEdit && !rconPassword) { $('remoteFormStatus').textContent = 'RCON Password is required when adding a new server.'; return; }
+      try {
+        $('remoteFormStatus').textContent = isEdit ? 'Updating…' : 'Adding…';
+        const payload = { name, displayName: displayName || name, rconIp, rconPort, rconPassword: rconPassword || '', gamePort };
+        if (isEdit) {
+          await fetchJson(`/servers/remote/${encodeURIComponent(name)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        } else {
+          await fetchJson('/servers/remote', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        }
+        hideRemoteForm();
+        await loadRemoteServers();
+      } catch (error) { $('remoteFormStatus').textContent = `Error: ${error.message}`; }
+    }
+
+    async function deleteRemoteServer(name) {
+      if (!confirm(`Delete remote server "${name}"? This cannot be undone.`)) return;
+      try {
+        await fetchJson(`/servers/remote/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        await loadRemoteServers();
+      } catch (error) { alert(`Failed to delete: ${error.message}`); }
+    }
+
+    async function testRemoteServer(name) {
+      try {
+        const result = await fetchJson(`/servers/remote/${encodeURIComponent(name)}/test`, { method: 'POST' });
+        alert(`RCON test for ${name}: OK (${result.latencyMs}ms)`);
+      } catch (error) { alert(`RCON test for ${name} failed: ${error.message}`); }
+    }
+
+    async function provisionServer() {
+      const name = $('provName').value.trim();
+      const hostname = $('provHostname').value.trim();
+      const identity = $('provIdentity').value.trim() || name.toLowerCase();
+      const serverPort = parseInt($('provServerPort').value, 10) || 28015;
+      const rconPort = parseInt($('provRconPort').value, 10) || 28016;
+      const appPort = parseInt($('provAppPort').value, 10) || 28082;
+      const rconPassword = $('provRconPassword').value.trim();
+      const maxPlayers = parseInt($('provMaxPlayers').value, 10) || 100;
+      const worldSize = parseInt($('provWorldSize').value, 10) || 3500;
+      const seed = parseInt($('provSeed').value, 10) || 0;
+      const serverDir = $('provServerDir').value.trim();
+      const createDirectories = $('provCreateDirs').checked;
+      if (!name || !rconPassword || !serverDir) { $('provisionStatus').textContent = 'Name, RCON password, and server directory are required.'; return; }
+      try {
+        $('provisionStatus').textContent = 'Provisioning…';
+        const result = await fetchJson('/servers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, createDirectories, config: { name, 'server.hostname': hostname || name, 'server.port': serverPort, 'rcon.port': rconPort, 'app.port': appPort, 'rcon.password': rconPassword, 'server.identity': identity, 'server.maxplayers': maxPlayers, 'server.worldsize': worldSize, 'server.seed': seed, serverDir } }) });
+        $('provisionStatus').textContent = result.message || 'Provisioned successfully.';
+      } catch (error) { $('provisionStatus').textContent = `Error: ${error.message}`; }
     }
 
     async function loadRules() {
@@ -3780,16 +3940,24 @@ static string BuildDashboardHtml() => """
     tabs.forEach(tab => tab.addEventListener('click', () => {
       activateTab(tab.dataset.target);
       if (tab.dataset.target === 'agentGroup') loadIncidentFeedback();
+      if (tab.dataset.target === 'serverMgmtGroup') loadRemoteServers();
     }));
     $('refresh').addEventListener('click', () => { load(); loadIncidentFeedback(); });
     $('saveRules').addEventListener('click', saveRules);
     $('saveOllamaConfig').addEventListener('click', saveOllamaConfig);
     $('saveCommandConfig').addEventListener('click', saveCommandConfig);
     $('commandFreeMode').addEventListener('change', () => { $('commandAllowList').disabled = $('commandFreeMode').checked; });
+    $('showAddRemoteForm').addEventListener('click', showAddRemoteForm);
+    $('cancelRemoteForm').addEventListener('click', hideRemoteForm);
+    $('saveRemoteServer').addEventListener('click', saveRemoteServerForm);
+    $('provisionServer').addEventListener('click', provisionServer);
     document.addEventListener('click', event => {
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
       if (target.classList.contains('use-model')) { $('ollamaModel').value = target.dataset.model || ''; return; }
+      if (target.classList.contains('remote-test')) { testRemoteServer(target.dataset.name || ''); return; }
+      if (target.classList.contains('remote-edit')) { showEditRemoteForm(target.dataset.name||'', target.dataset.display||'', target.dataset.ip||'', Number(target.dataset.port||0), Number(target.dataset.gameport||0)); return; }
+      if (target.classList.contains('remote-delete')) { deleteRemoteServer(target.dataset.name || ''); return; }
       if (target.classList.contains('incident-verdict')) {
         const id = target.dataset.id || '';
         const verdict = target.dataset.verdict || '';

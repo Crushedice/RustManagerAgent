@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Collections.Concurrent;
 using Sentry;
@@ -1048,6 +1048,189 @@ internal sealed class RustNetworkToolHandler : IToolHandler
 
         return new ToolExecutionResult(true, message);
     }
+}
+
+internal sealed class RustServerManagementToolHandler : IToolHandler
+{
+    private readonly RustOpsApiClient _api;
+
+    public RustServerManagementToolHandler(RustOpsApiClient api) => _api = api;
+
+    public string Name => "rust.server.management";
+    public IReadOnlyCollection<AdminIntentType> EligibleIntents => new[] { AdminIntentType.ServerManagement };
+
+    public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        var msg = context.Message.ToLowerInvariant();
+
+        if (IsRemoveIntent(msg))
+            return await HandleRemoveAsync(context, cancellationToken);
+
+        if (IsTestIntent(msg))
+            return await HandleTestAsync(context, cancellationToken);
+
+        if (IsListIntent(msg))
+            return await HandleListAsync(cancellationToken);
+
+        if (IsProvisionIntent(msg))
+            return await HandleProvisionAsync(context, cancellationToken);
+
+        // Default: add / register
+        return await HandleAddAsync(context, cancellationToken);
+    }
+
+    private static bool IsRemoveIntent(string msg) =>
+        msg.Contains("remove") || msg.Contains("delete") || msg.Contains("unregister");
+
+    private static bool IsTestIntent(string msg) =>
+        msg.Contains("test") && (msg.Contains("connection") || msg.Contains("rcon") || msg.Contains("connect"));
+
+    private static bool IsListIntent(string msg) =>
+        (msg.Contains("list") || msg.Contains("show") || msg.Contains("what server")) &&
+        (msg.Contains("remote") || msg.Contains("server"));
+
+    private static bool IsProvisionIntent(string msg) =>
+        msg.Contains("provision") || msg.Contains("local server") || msg.Contains("new local");
+
+    private async Task<ToolExecutionResult> HandleListAsync(CancellationToken ct)
+    {
+        using var response = await _api.GetAsync("/servers/remote/list", ct);
+        var root = response.RootElement;
+        if (root.ValueKind != JsonValueKind.Array || root.GetArrayLength() == 0)
+            return new ToolExecutionResult(true, "No remote RCON servers registered.");
+
+        var lines = root.EnumerateArray()
+            .Select(s =>
+            {
+                var name = s.TryGetProperty("name", out var n) ? n.GetString() : "?";
+                var display = s.TryGetProperty("displayName", out var d) ? d.GetString() : name;
+                var ip = s.TryGetProperty("rconIp", out var ip_) ? ip_.GetString() : "?";
+                var port = s.TryGetProperty("rconPort", out var p) ? p.GetInt32().ToString() : "?";
+                return $"• {display} ({name}) → {ip}:{port}";
+            })
+            .ToList();
+
+        return new ToolExecutionResult(true, $"Remote RCON servers ({lines.Count}):\n{string.Join('\n', lines)}");
+    }
+
+    private async Task<ToolExecutionResult> HandleAddAsync(ToolExecutionContext context, CancellationToken ct)
+    {
+        var parsed = ParseServerSpec(context.Message);
+        if (parsed is null)
+            return new ToolExecutionResult(false,
+                "To add a remote server I need: name, RCON IP/host, port, and password. " +
+                "Say something like: \"add remote server MyServer at 1.2.3.4:28016 password abc123\"",
+                null, false, "clarification_required");
+
+        var body = new
+        {
+            name = parsed.Name,
+            displayName = parsed.DisplayName ?? parsed.Name,
+            rconIp = parsed.Host,
+            rconPort = parsed.Port,
+            rconPassword = parsed.Password,
+            gamePort = parsed.GamePort
+        };
+
+        try
+        {
+            using var response = await _api.PostAsync("/servers/remote", body, ct);
+            return new ToolExecutionResult(true,
+                $"Remote server '{parsed.Name}' registered at {parsed.Host}:{parsed.Port}. " +
+                $"Run `test rcon connection for {parsed.Name}` to verify connectivity.",
+                parsed.Name, true);
+        }
+        catch (Exception ex) when (ex.Message.Contains("duplicate_name", StringComparison.OrdinalIgnoreCase))
+        {
+            return new ToolExecutionResult(false, $"A server named '{parsed.Name}' already exists.", null, false, "duplicate");
+        }
+    }
+
+    private async Task<ToolExecutionResult> HandleRemoveAsync(ToolExecutionContext context, CancellationToken ct)
+    {
+        var name = context.Route.Slots.ServerName
+            ?? context.SelectionState.LastServerName
+            ?? ExtractQuotedOrLastWord(context.Message);
+
+        if (string.IsNullOrWhiteSpace(name))
+            return new ToolExecutionResult(false, "Which server should I remove? Say its name.", null, false, "clarification_required");
+
+        try
+        {
+            using var _ = await _api.DeleteAsync($"/servers/remote/{Uri.EscapeDataString(name)}", ct);
+            return new ToolExecutionResult(true, $"Remote server '{name}' removed.", name, true);
+        }
+        catch (Exception ex)
+        {
+            return new ToolExecutionResult(false, $"Could not remove '{name}': {ex.Message}", name, false, "api_error");
+        }
+    }
+
+    private async Task<ToolExecutionResult> HandleTestAsync(ToolExecutionContext context, CancellationToken ct)
+    {
+        var name = context.Route.Slots.ServerName
+            ?? context.SelectionState.LastServerName
+            ?? ExtractQuotedOrLastWord(context.Message);
+
+        if (string.IsNullOrWhiteSpace(name))
+            return new ToolExecutionResult(false, "Which server should I test? Say its name.", null, false, "clarification_required");
+
+        try
+        {
+            using var response = await _api.PostAsync($"/servers/remote/{Uri.EscapeDataString(name)}/test", new { }, ct);
+            var root = response.RootElement;
+            var ok = root.TryGetProperty("ok", out var okNode) && okNode.ValueKind == JsonValueKind.True;
+            var msg = root.TryGetProperty("message", out var msgNode) ? msgNode.GetString() : null;
+            var latencyMs = root.TryGetProperty("latencyMs", out var lat) ? lat.GetInt32() : (int?)null;
+            var suffix = latencyMs.HasValue ? $" ({latencyMs}ms)" : string.Empty;
+            return new ToolExecutionResult(ok,
+                ok ? $"RCON connection to '{name}' successful{suffix}. {msg}" : $"RCON test failed for '{name}': {msg}",
+                name, false);
+        }
+        catch (Exception ex)
+        {
+            return new ToolExecutionResult(false, $"RCON test for '{name}' failed: {ex.Message}", name, false, "rcon_error");
+        }
+    }
+
+    private async Task<ToolExecutionResult> HandleProvisionAsync(ToolExecutionContext context, CancellationToken ct)
+    {
+        return new ToolExecutionResult(false,
+            "Provisioning a local server requires a full config (ports, seed, worldsize, server directory, etc.). " +
+            "Use the web dashboard's Server Management tab to fill in the form, or say what you need and I'll guide you through it.",
+            null, false, "clarification_required");
+    }
+
+    private static RemoteServerSpec? ParseServerSpec(string message)
+    {
+        var nameMatch = Regex.Match(message, @"(?:server|add|register|connect)\s+([A-Za-z0-9_\-\.]+)", RegexOptions.IgnoreCase);
+        var atMatch = Regex.Match(message, @"(?:at|to|host|ip)\s+([\w\.\-]+)(?::(\d+))?", RegexOptions.IgnoreCase);
+        var portMatch = Regex.Match(message, @"port\s+(\d+)", RegexOptions.IgnoreCase);
+        var passMatch = Regex.Match(message, @"(?:password|pass|pw|rconpassword)\s+(\S+)", RegexOptions.IgnoreCase);
+
+        var name = nameMatch.Success ? nameMatch.Groups[1].Value : null;
+        var host = atMatch.Success ? atMatch.Groups[1].Value : null;
+        var portText = atMatch.Success && atMatch.Groups[2].Success
+            ? atMatch.Groups[2].Value
+            : portMatch.Success ? portMatch.Groups[1].Value : null;
+        var password = passMatch.Success ? passMatch.Groups[1].Value : null;
+
+        if (string.IsNullOrWhiteSpace(name) || string.IsNullOrWhiteSpace(host) ||
+            !int.TryParse(portText, out var port) || string.IsNullOrWhiteSpace(password))
+            return null;
+
+        return new RemoteServerSpec(name, null, host, port, password, 0);
+    }
+
+    private static string? ExtractQuotedOrLastWord(string message)
+    {
+        var quoted = Regex.Match(message, @"""([^""]+)""");
+        if (quoted.Success) return quoted.Groups[1].Value.Trim();
+        var words = message.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return words.Length > 0 ? words[^1] : null;
+    }
+
+    private sealed record RemoteServerSpec(string Name, string? DisplayName, string Host, int Port, string Password, int GamePort);
 }
 
 internal static class RustToolHelper

@@ -1,4 +1,4 @@
-using System.Text.Json;
+﻿using System.Text.Json;
 using RustOpsAgent.Core.Contracts;
 
 namespace RustOpsAgent.Infrastructure.Memory;

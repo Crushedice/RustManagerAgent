@@ -1,4 +1,4 @@
-Noted on the assistant feel — I'll keep that in mind as a throughline, especially when we touch the agent's conversation handling. Starting now with a full codebase scan.
+﻿Noted on the assistant feel — I'll keep that in mind as a throughline, especially when we touch the agent's conversation handling. Starting now with a full codebase scan.
 
 Now reading the key files in parallel before writing anything.
 

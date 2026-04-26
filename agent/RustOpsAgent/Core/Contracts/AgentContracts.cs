@@ -1,4 +1,4 @@
-using System.Text.Json.Serialization;
+﻿using System.Text.Json.Serialization;
 
 namespace RustOpsAgent.Core.Contracts;
 
@@ -11,7 +11,8 @@ internal enum AdminIntentType
     FileEdit,
     StatusCheck,
     Troubleshooting,
-    Clarification
+    Clarification,
+    ServerManagement
 }
 
 internal enum ServerScopeKind

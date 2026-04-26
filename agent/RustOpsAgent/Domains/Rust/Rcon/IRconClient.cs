@@ -1,4 +1,4 @@
-namespace RustOpsAgent.Domains.Rust.Rcon;
+﻿namespace RustOpsAgent.Domains.Rust.Rcon;
 
 internal interface IRconClient : IAsyncDisposable
 {

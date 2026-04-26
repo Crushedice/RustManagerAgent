@@ -1,4 +1,4 @@
-using rustmgrapi.Api.Models;
+﻿using rustmgrapi.Api.Models;
 using rustmgrapi.Api.Services;
 
 namespace rustmgrapi.Api.Endpoints;

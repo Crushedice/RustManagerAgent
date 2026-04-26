@@ -1,4 +1,4 @@
-namespace RustOpsAgent.Infrastructure.GitOps;
+﻿namespace RustOpsAgent.Infrastructure.GitOps;
 
 internal interface IGitOpsService
 {

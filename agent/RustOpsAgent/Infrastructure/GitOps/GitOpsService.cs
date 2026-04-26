@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using RustOpsAgent.Core.Contracts;
 
 namespace RustOpsAgent.Infrastructure.GitOps;
