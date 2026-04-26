@@ -22,6 +22,16 @@ internal sealed class ToolRegistry
     public IToolHandler? ResolveSingle(ToolExecutionContext context)
     {
         var route = context.Route;
+
+        // When the LLM provides a targetRef, look it up across ALL handlers first.
+        // This handles the case where the LLM classifies intent as server_control but
+        // targetRef as rust.rcon.command — the targetRef wins as the stronger signal.
+        if (!string.IsNullOrWhiteSpace(route.TargetRef) &&
+            _handlers.TryGetValue(route.TargetRef, out var targeted))
+        {
+            return targeted;
+        }
+
         var eligible = ResolveEligible(route);
         if (eligible.Count == 0)
         {
@@ -33,30 +43,12 @@ internal sealed class ToolRegistry
             return eligible[0];
         }
 
-        var message = context.Message.ToLowerInvariant();
-        if (route.Intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting)
-        {
-            if (message.Contains("network") || message.Contains("latency") || message.Contains("throughput") || message.Contains("eth0") || message.Contains("wg1") || message.Contains("wt1"))
-            {
-                return eligible.FirstOrDefault(h => h.Name == "rust.network.inspect") ?? eligible[0];
-            }
-
-            if (message.Contains("plugin") || message.Contains("umod") || message.Contains("oxide"))
-            {
-                return eligible.FirstOrDefault(h => h.Name == "rust.plugins.verify") ?? eligible[0];
-            }
-
-            if (message.Contains("log") || message.Contains("error") || message.Contains("exception"))
-            {
-                return eligible.FirstOrDefault(h => h.Name == "rust.logs.inspect") ?? eligible[0];
-            }
-        }
-
         return route.Intent switch
         {
             AdminIntentType.ServerControl => eligible.FirstOrDefault(h => h.Name == "rust.server.control") ?? eligible[0],
             AdminIntentType.RconCommand => eligible.FirstOrDefault(h => h.Name == "rust.rcon.command") ?? eligible[0],
             AdminIntentType.PlayerLookup => eligible.FirstOrDefault(h => h.Name == "rust.player.lookup") ?? eligible[0],
+            AdminIntentType.Chat or AdminIntentType.Clarification => eligible.FirstOrDefault(h => h.Name == "rust.chat.reply") ?? eligible[0],
             AdminIntentType.StatusCheck => eligible.FirstOrDefault(h => h.Name == "rust.status.check") ?? eligible[0],
             AdminIntentType.Troubleshooting => eligible.FirstOrDefault(h => h.Name == "rust.logs.inspect") ?? eligible[0],
             _ => eligible[0]

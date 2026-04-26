@@ -36,10 +36,12 @@ Make sure the runtime directories exist:
 sudo mkdir -p /opt/rust-manager/config
 sudo mkdir -p /opt/rust-manager/runtime
 sudo mkdir -p /opt/rust-manager/tasks
+sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/chat-inbox
 sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/feedback-inbox
 sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/decision-inbox
 sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/message-outbox
 sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/message-outbox-sent
+sudo mkdir -p /opt/rust-manager/agent/RustOpsAgent/data/message-outbox-deadletter
 sudo chown -R rustmgr:rustmgr /opt/rust-manager
 ```
 

@@ -38,7 +38,22 @@ var agentRootDir = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_ROOT") ?? "
 var botRootDir = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_ROOT") ?? "/opt/rust-manager/SteamBot/OpsSteamBot";
 var agentSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_AGENT_SETTINGS_PATH") ?? Path.Combine(agentRootDir, "agentsettings.json");
 var botSettingsPath = Environment.GetEnvironmentVariable("RUSTOPS_STEAMBOT_SETTINGS_PATH") ?? Path.Combine(botRootDir, "botsettings.json");
-var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE") ?? Path.Combine(configDir, "rustops.env");
+var sharedEnvPath = RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_ENV_FILE")
+    ?? Path.Combine(Path.GetDirectoryName(configDir.TrimEnd('/', '\\')) ?? configDir, "config.env");
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetExtra("bindUrl", bindUrl);
+    scope.SetExtra("rustMgrPath", rustMgrPath);
+    scope.SetExtra("runtimeDir", runtimeDir);
+    scope.SetExtra("configDir", configDir);
+    scope.SetExtra("tasksDir", tasksDir);
+    scope.SetExtra("agentRootDir", agentRootDir);
+    scope.SetExtra("botRootDir", botRootDir);
+    scope.SetExtra("agentSettingsPath", agentSettingsPath);
+    scope.SetExtra("botSettingsPath", botSettingsPath);
+    scope.SetExtra("sharedEnvPath", sharedEnvPath);
+});
+RustOpsSentry.AddBreadcrumb($"API starting on {bindUrl}.", "startup");
 
 const int defaultConsoleLines = 120;
 const int defaultEventLines   = 100;
@@ -58,13 +73,20 @@ app.Use(async (ctx, next) =>
     }
     catch (Exception ex)
     {
-        SentrySdk.ConfigureScope(scope =>
-        {
-            scope.SetTag("http.method", ctx.Request.Method);
-            scope.SetTag("http.path", ctx.Request.Path.Value ?? "/");
-            scope.SetExtra("queryString", ctx.Request.QueryString.Value ?? string.Empty);
-        });
-        SentrySdk.CaptureException(ex);
+        RustOpsSentry.CaptureException(
+            ex,
+            $"Unhandled HTTP pipeline exception for {ctx.Request.Method} {ctx.Request.Path}.",
+            "http.request",
+            tags: new Dictionary<string, string?>
+            {
+                ["http.method"] = ctx.Request.Method,
+                ["http.path"] = ctx.Request.Path.Value ?? "/"
+            },
+            extras: new Dictionary<string, object?>
+            {
+                ["queryString"] = ctx.Request.QueryString.Value ?? string.Empty,
+                ["traceIdentifier"] = ctx.TraceIdentifier
+            });
         throw;
     }
 });
@@ -82,6 +104,7 @@ app.Use(async (ctx, next) =>
     var supplied = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
     if (!string.Equals(supplied, apiKey, StringComparison.Ordinal))
     {
+        RustOpsSentry.AddBreadcrumb($"Rejected unauthorized request for {ctx.Request.Path}.", "http.auth");
         ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
         await ctx.Response.WriteAsJsonAsync(new ApiError("unauthorized", "Invalid API key."));
         return;
@@ -154,7 +177,7 @@ app.MapGet("/dashboard/summary", async () =>
 
     var services = await GetManagedServicesSnapshotAsync();
 
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
 
     return Results.Ok(new
     {
@@ -169,6 +192,7 @@ app.MapGet("/dashboard/summary", async () =>
             agentSettingsPath = agentPaths.AgentSettingsPath,
             botSettingsPath = agentPaths.BotSettingsPath,
             agentStatePath = agentPaths.StatePath,
+            agentNeoCortexRoot = agentPaths.NeoCortexRoot,
             agentLogRulesPath = agentPaths.LogRulesPath
         },
         counts = new
@@ -255,7 +279,7 @@ app.MapPut("/agent/log-rules", async (HttpRequest request) =>
 IResult ReadLlmConfig()
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
 
     return Results.Ok(new
@@ -272,7 +296,7 @@ IResult ReadLlmConfig()
 IResult WriteLlmConfig(AgentLlmConfigUpdate request)
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var current = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
 
     var normalized = new AgentLlmConfigView
@@ -323,7 +347,8 @@ IResult WriteLlmConfig(AgentLlmConfigUpdate request)
         ["RUSTOPS_LLM_SECONDARY_HTTP_REFERER"] = normalized.Secondary.HttpReferer?.Trim() ?? string.Empty,
         ["RUSTOPS_LLM_SECONDARY_APP_TITLE"] = normalized.Secondary.AppTitle?.Trim() ?? string.Empty,
         ["RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"] = normalized.UseChatSystemPrompt ? "true" : "false",
-        ["RUSTOPS_LLM_CHAT_SYSTEM_PROMPT"] = normalized.ChatSystemPrompt ?? string.Empty
+        // Newlines are escaped as literal \n so the env file stays single-line.
+        ["RUSTOPS_LLM_CHAT_SYSTEM_PROMPT"] = (normalized.ChatSystemPrompt ?? string.Empty).Replace("\r", "").Replace("\n", "\\n")
     });
     UpsertAgentSettingsLlmValues(agentPaths.AgentSettingsPath, normalized);
 
@@ -406,12 +431,147 @@ IResult WriteCommandConfig(AgentCommandConfigUpdate request)
 app.MapGet("/agent/commands/config", ReadCommandConfig);
 app.MapPut("/agent/commands/config", WriteCommandConfig);
 
+app.MapGet("/agent/incidents/list", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var incidentsPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents.jsonl");
+    var feedbackPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents-feedback.json");
+
+    var feedbacks = new Dictionary<string, IncidentFeedbackEntry>(StringComparer.OrdinalIgnoreCase);
+    if (File.Exists(feedbackPath))
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(File.ReadAllText(feedbackPath));
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                feedbacks[prop.Name] = new IncidentFeedbackEntry(
+                    prop.Value.TryGetProperty("verdict", out var v) ? v.GetString() : null,
+                    prop.Value.TryGetProperty("note", out var n) ? n.GetString() : null,
+                    prop.Value.TryGetProperty("answeredAtUtc", out var a) && a.TryGetDateTime(out var dt) ? dt : null);
+            }
+        }
+        catch { /* ignore parse errors */ }
+    }
+
+    if (!File.Exists(incidentsPath))
+        return Results.Ok(Array.Empty<object>());
+
+    var incidents = File.ReadLines(incidentsPath)
+        .Where(line => !string.IsNullOrWhiteSpace(line))
+        .Select(line =>
+        {
+            try
+            {
+                var doc = JsonDocument.Parse(line);
+                var root = doc.RootElement;
+                var id = root.TryGetProperty("id", out var idNode) ? idNode.GetString() ?? string.Empty : string.Empty;
+                feedbacks.TryGetValue(id, out var fb);
+                return (object)new
+                {
+                    id,
+                    classification = root.TryGetProperty("classification", out var c) ? c.GetString() : null,
+                    request = root.TryGetProperty("request", out var r) ? r.GetString() : null,
+                    failureReason = root.TryGetProperty("failureReason", out var f) ? f.GetString() : null,
+                    missingCapability = root.TryGetProperty("missingCapability", out var m) ? m.GetString() : null,
+                    recurrencePrevention = root.TryGetProperty("recurrencePrevention", out var rp) ? rp.GetString() : null,
+                    timestamp = root.TryGetProperty("timestamp", out var ts) && ts.TryGetDateTime(out var tdt) ? tdt : (DateTime?)null,
+                    resolved = root.TryGetProperty("resolved", out var res) && res.GetBoolean(),
+                    adminVerdict = fb?.Verdict,
+                    adminNote = fb?.Note,
+                    answeredAtUtc = fb?.AnsweredAtUtc
+                };
+            }
+            catch { return null; }
+        })
+        .Where(item => item is not null)
+        .Reverse()
+        .Take(50)
+        .ToList();
+
+    return Results.Ok(incidents);
+});
+
+app.MapPost("/agent/incidents/{id}/feedback", async (string id, HttpRequest request) =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var feedbackPath = Path.Combine(agentPaths.NeoCortexRoot, "evolution", "incidents-feedback.json");
+
+    string body;
+    using (var reader = new StreamReader(request.Body))
+        body = await reader.ReadToEndAsync();
+
+    string? verdict = null;
+    string? note = null;
+    try
+    {
+        var doc = JsonDocument.Parse(body);
+        if (doc.RootElement.TryGetProperty("verdict", out var v)) verdict = v.GetString();
+        if (doc.RootElement.TryGetProperty("note", out var n)) note = n.GetString();
+    }
+    catch { return Results.BadRequest(new ApiError("invalid_json", "Could not parse request body.")); }
+
+    var feedbacks = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+    if (File.Exists(feedbackPath))
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(File.ReadAllText(feedbackPath));
+            foreach (var prop in doc.RootElement.EnumerateObject())
+                feedbacks[prop.Name] = JsonSerializer.Deserialize<object>(prop.Value.GetRawText())!;
+        }
+        catch { /* start fresh */ }
+    }
+
+    feedbacks[id] = new { verdict, note, answeredAtUtc = DateTime.UtcNow };
+    Directory.CreateDirectory(Path.GetDirectoryName(feedbackPath)!);
+    File.WriteAllText(feedbackPath, JsonSerializer.Serialize(feedbacks, new JsonSerializerOptions { WriteIndented = true }));
+
+    return Results.Ok(new { id, verdict, note, savedAtUtc = DateTime.UtcNow });
+});
+
+// -- Console monitor ----------------------------------------------------------
+app.MapGet("/agent/console-monitor", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var consolePath = Path.Combine(agentPaths.NeoCortexRoot, "console", "monitor.json");
+    if (!File.Exists(consolePath))
+        return Results.Ok(new { servers = new Dictionary<string, object>(), updatedAtUtc = (DateTime?)null });
+    try
+    {
+        var content = File.ReadAllText(consolePath);
+        return Results.Content(content, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
+// -- Player chat / sentiment --------------------------------------------------
+app.MapGet("/agent/player-chat/recent", () =>
+{
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var chatPath = Path.Combine(agentPaths.NeoCortexRoot, "chat", "knowledge.json");
+    if (!File.Exists(chatPath))
+        return Results.Ok(new { recentMessages = Array.Empty<object>(), sentimentScore = (double?)null, sentimentLabel = (string?)null, sentimentSummary = (string?)null, keyThemes = Array.Empty<string>(), constructiveFeedback = Array.Empty<string>(), analysedAtUtc = (DateTime?)null });
+    try
+    {
+        var content = File.ReadAllText(chatPath);
+        return Results.Content(content, "application/json");
+    }
+    catch (Exception ex)
+    {
+        return Results.Ok(new { error = ex.Message });
+    }
+});
+
 app.MapGet("/host/services", async () => Results.Ok(await GetManagedServicesSnapshotAsync()));
 
 app.MapGet("/host/llm/summary", async () =>
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
     var summary = await ReadLmStudioSummaryAsync(values);
     return Results.Ok(summary);
@@ -420,7 +580,7 @@ app.MapGet("/host/llm/summary", async () =>
 app.MapGet("/host/ollama/summary", async () =>
 {
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
-    var memory = LoadAgentMemorySnapshot(agentPaths.StatePath);
+    var memory = LoadAgentMemorySnapshot(agentPaths);
     var values = ReadAgentLlmConfig(sharedEnvPath, agentPaths.AgentSettingsPath, memory.RuntimeStatus);
     var summary = await ReadLmStudioSummaryAsync(values);
     return Results.Ok(summary);
@@ -434,7 +594,7 @@ app.MapGet("/host/network/interfaces", async () =>
     {
         var payload = TryExtractJson(result.StdOut);
         return payload is not null
-            ? Results.Text(payload, "application/json")
+            ? Results.Content(payload, "application/json")
             : Results.Ok(new { raw = result.StdOut });
     }
 
@@ -446,8 +606,89 @@ app.MapGet("/host/network/interfaces", async () =>
 
 app.MapGet("/host/network/summary", () => Results.Ok(BuildHostNetworkSummary()));
 
+// -- Remote Server Helpers -------------------------------------------------------
+List<RemoteServerEntry> LoadRemoteServers()
+{
+    var path = Path.Combine(configDir, "remote-servers.json");
+    if (!File.Exists(path))
+        return new();
+    try
+    {
+        var json = File.ReadAllText(path);
+        var doc = JsonDocument.Parse(json);
+        if (doc.RootElement.TryGetProperty("servers", out var serversArr) &&
+            serversArr.ValueKind == JsonValueKind.Array)
+        {
+            var servers = new List<RemoteServerEntry>();
+            foreach (var entry in serversArr.EnumerateArray())
+            {
+                var name = entry.TryGetProperty("name", out var n) ? n.GetString() : null;
+                var displayName = entry.TryGetProperty("displayName", out var d) ? d.GetString() : null;
+                var rconIp = entry.TryGetProperty("rconIp", out var ip) ? ip.GetString() : null;
+                var rconPort = entry.TryGetProperty("rconPort", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0;
+                var rconPassword = entry.TryGetProperty("rconPassword", out var pwd) ? pwd.GetString() : null;
+                var gamePort = entry.TryGetProperty("gamePort", out var gp) && gp.ValueKind == JsonValueKind.Number ? gp.GetInt32() : 0;
+                if (!string.IsNullOrWhiteSpace(name) && !string.IsNullOrWhiteSpace(rconIp) &&
+                    rconPort > 0 && !string.IsNullOrWhiteSpace(rconPassword))
+                {
+                    servers.Add(new RemoteServerEntry(
+                        name, displayName ?? name, rconIp, rconPort, rconPassword, gamePort));
+                }
+            }
+            return servers;
+        }
+    }
+    catch { }
+    return new();
+}
+
+void SaveRemoteServers(List<RemoteServerEntry> servers)
+{
+    var path = Path.Combine(configDir, "remote-servers.json");
+    var doc = new JsonObject
+    {
+        ["servers"] = JsonValue.Create(servers.Select(s => new JsonObject
+        {
+            ["name"] = s.Name,
+            ["displayName"] = s.DisplayName,
+            ["rconIp"] = s.RconIp,
+            ["rconPort"] = s.RconPort,
+            ["rconPassword"] = s.RconPassword,
+            ["gamePort"] = s.GamePort
+        }).ToList())
+    };
+    File.WriteAllText(path, JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true }));
+}
+
+void WriteRemoteServerStubConfig(RemoteServerEntry server)
+{
+    var path = Path.Combine(configDir, $"{server.Name}.json");
+    var config = new JsonObject
+    {
+        ["name"] = server.Name,
+        ["remote"] = true,
+        ["rcon.ip"] = server.RconIp,
+        ["rcon.port"] = server.RconPort,
+        ["rcon.password"] = server.RconPassword
+    };
+    File.WriteAllText(path, JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true }));
+}
+
+void DeleteRemoteServerStubConfig(string name)
+{
+    var path = Path.Combine(configDir, $"{name}.json");
+    if (File.Exists(path))
+        File.Delete(path);
+}
+
+bool IsRemoteServerName(string name)
+{
+    var remoteServers = LoadRemoteServers();
+    return remoteServers.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+}
+
 // -- Server list ---------------------------------------------------------------
-// Calls rustmgr list as the authoritative source, then cross-checks config dir.
+// Calls rustmgr list as the authoritative source, then includes remote servers.
 app.MapGet("/servers", async () =>
 {
     var result = await ExecRustMgrAsync("list");
@@ -458,11 +699,115 @@ app.MapGet("/servers", async () =>
         .Where(n => !string.IsNullOrWhiteSpace(n))
         .ToList();
 
-    return Results.Ok(names.Select(name => new
+    var localServers = names.Select(name => new
     {
         name,
-        configExists = File.Exists(Path.Combine(configDir, $"{name}.json"))
+        configExists = File.Exists(Path.Combine(configDir, $"{name}.json")),
+        remote = false
+    }).Cast<object>().ToList();
+
+    // Add remote servers
+    var remoteServers = LoadRemoteServers();
+    var remoteServerObjs = remoteServers.Select(s => new
+    {
+        name = s.Name,
+        configExists = true,
+        remote = true
+    }).Cast<object>().ToList();
+
+    localServers.AddRange(remoteServerObjs);
+    return Results.Ok(localServers);
+});
+
+// -- Remote Server CRUD ----------------------------------------------------------
+app.MapGet("/servers/remote/list", () =>
+{
+    var remoteServers = LoadRemoteServers();
+    return Results.Ok(remoteServers.Select(s => new
+    {
+        name = s.Name,
+        displayName = s.DisplayName,
+        rconIp = s.RconIp,
+        rconPort = s.RconPort,
+        gamePort = s.GamePort
     }));
+});
+
+app.MapPost("/servers/remote", (RemoteServerEntry server) =>
+{
+    if (string.IsNullOrWhiteSpace(server.Name))
+        return Results.BadRequest(new ApiError("invalid_name", "Server name is required"));
+
+    var remoteServers = LoadRemoteServers();
+    if (remoteServers.Any(s => s.Name.Equals(server.Name, StringComparison.OrdinalIgnoreCase)))
+        return Results.BadRequest(new ApiError("duplicate_name", "A remote server with this name already exists"));
+
+    if (File.Exists(Path.Combine(configDir, $"{server.Name}.json")))
+        return Results.BadRequest(new ApiError("local_exists", "A local server with this name already exists"));
+
+    remoteServers.Add(server);
+    SaveRemoteServers(remoteServers);
+    WriteRemoteServerStubConfig(server);
+
+    return Results.Created($"/servers/{server.Name}", new { name = server.Name, remote = true });
+});
+
+app.MapPut("/servers/remote/{name}", (string name, RemoteServerEntry updated) =>
+{
+    if (!name.Equals(updated.Name, StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new ApiError("name_mismatch", "Server name in URL and body must match"));
+
+    var remoteServers = LoadRemoteServers();
+    var idx = remoteServers.FindIndex(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (idx < 0)
+        return Results.NotFound();
+
+    remoteServers[idx] = updated;
+    SaveRemoteServers(remoteServers);
+    WriteRemoteServerStubConfig(updated);
+
+    return Results.Ok(new { name = updated.Name, remote = true });
+});
+
+app.MapDelete("/servers/remote/{name}", (string name) =>
+{
+    var remoteServers = LoadRemoteServers();
+    var idx = remoteServers.FindIndex(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (idx < 0)
+        return Results.NotFound();
+
+    remoteServers.RemoveAt(idx);
+    SaveRemoteServers(remoteServers);
+    DeleteRemoteServerStubConfig(name);
+
+    return Results.NoContent();
+});
+
+app.MapPost("/servers/remote/{name}/test", async (string name) =>
+{
+    var remoteServers = LoadRemoteServers();
+    var server = remoteServers.FirstOrDefault(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+    if (server == null)
+        return Results.NotFound();
+
+    try
+    {
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        await using var rcon = new RustRcon(server.RconIp, (ushort)server.RconPort, server.RconPassword);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await rcon.ConnectAsync(cts.Token);
+        var reply = await rcon.SendAndReceiveAsync("status", cts.Token);
+        sw.Stop();
+        return Results.Ok(new { ok = true, latencyMs = sw.ElapsedMilliseconds });
+    }
+    catch (OperationCanceledException)
+    {
+        return Results.BadRequest(new ApiError("timeout", "RCON connection timeout after 5 seconds"));
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("connection_failed", $"Failed to connect to RCON: {ex.Message}"));
+    }
 });
 
 // -- Agent convenience: all servers with status in one call --------------------
@@ -502,6 +847,18 @@ app.MapGet("/servers/{server}/status", async (string server) =>
 // The agent calls this instead of assembling several calls itself.
 app.MapGet("/servers/{server}/health", async (string server) =>
 {
+    // Check if this is a remote server first
+    if (IsRemoteServerName(server))
+    {
+        return Results.Ok(new
+        {
+            name = server,
+            state = "rcon-only",
+            remote = true,
+            checkedAt = DateTime.UtcNow
+        });
+    }
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -544,6 +901,9 @@ app.MapGet("/servers/{server}/health", async (string server) =>
 // -- Start ---------------------------------------------------------------------
 app.MapPost("/servers/{server}/start", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -557,6 +917,9 @@ app.MapPost("/servers/{server}/start", async (string server) =>
 // -- Stop ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/stop", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -567,6 +930,9 @@ app.MapPost("/servers/{server}/stop", async (string server) =>
 // -- Restart -------------------------------------------------------------------
 app.MapPost("/servers/{server}/restart", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Start/stop/restart operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -580,6 +946,9 @@ app.MapPost("/servers/{server}/restart", async (string server) =>
 // -- Kill ----------------------------------------------------------------------
 app.MapPost("/servers/{server}/kill", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -590,6 +959,9 @@ app.MapPost("/servers/{server}/kill", async (string server) =>
 // -- Update (SteamCMD) ---------------------------------------------------------
 app.MapPost("/servers/{server}/update", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Update operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -600,6 +972,9 @@ app.MapPost("/servers/{server}/update", async (string server) =>
 // -- uMod update ---------------------------------------------------------------
 app.MapPost("/servers/{server}/umod", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -610,6 +985,9 @@ app.MapPost("/servers/{server}/umod", async (string server) =>
 // -- Sync config ---------------------------------------------------------------
 app.MapPost("/servers/{server}/sync-config", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "This operation is not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -622,6 +1000,9 @@ app.MapPost("/servers/{server}/sync-config", async (string server) =>
 // the script; the API just proxies it.
 app.MapPost("/servers/{server}/wipe", async (string server) =>
 {
+    if (IsRemoteServerName(server))
+        return Results.BadRequest(new ApiError("remote_server", "Wipe operations are not available for remote servers."));
+
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
@@ -891,7 +1272,24 @@ app.MapPost("/servers/{server}/command", async (string server, ServerCommandRequ
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "RCON command endpoint failed.", server, request.Command?.Trim());
+        var fallback = await ExecRustMgrAsync("send", server, command);
+        if (!fallback.Ok)
+        {
+            return Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
+        }
+
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            transport = "rustmgr-send",
+            endpoint = new { host = endpoint.Host, port = endpoint.Port },
+            reply = (string?)null,
+            warning = $"WebRCON failed: {ex.Message}",
+            fallback = string.IsNullOrWhiteSpace(fallback.StdOut) ? "command accepted by rustmgr send" : fallback.StdOut.Trim()
+        });
     }
 });
 
@@ -935,7 +1333,27 @@ app.MapPost("/servers/{server}/command/exec", async (string server, ServerComman
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "Command exec RCON endpoint failed.", server, command);
+        var fallback = await ExecRustMgrAsync("send", server, command);
+        if (!fallback.Ok)
+        {
+            return Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
+        }
+
+        var fallbackOutput = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
+        return Results.Ok(new
+        {
+            ok = true,
+            server,
+            command,
+            waitMs,
+            logPath,
+            transport = "rustmgr-send",
+            endpoint = new { host = endpoint.Host, port = endpoint.Port },
+            directReply = (string?)null,
+            warning = $"WebRCON failed: {ex.Message}",
+            output = fallbackOutput
+        });
     }
 
     var output = await ReadCommandOutputDeltaAsync(logPath, startOffset, waitMs, maxBytes, maxLines);
@@ -969,7 +1387,8 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
     if (!result.Ok) return Results.BadRequest(result);
 
     var n = Math.Max(1, lines.GetValueOrDefault(defaultConsoleLines));
-    return Results.Text(TailLines(result.StdOut ?? string.Empty, n), "text/plain; charset=utf-8");
+    var content = TailLines(result.StdOut ?? string.Empty, n);
+    return Results.Ok(new { server, lines = n, content });
 });
 
 // -- Agent convenience: structured recent log lines ----------------------------
@@ -977,7 +1396,7 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
 // agent ask "what happened in the last N minutes" without sending the full log.
 // Lines that don't start with a recognised timestamp are attached to the
 // previous entry as continuation text (stack traces etc).
-app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since) =>
+app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since, int? offset) =>
 {
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
@@ -993,9 +1412,16 @@ app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, stri
     if (!string.IsNullOrWhiteSpace(since) && DateTime.TryParse(since, out var sinceUtc))
         entries = entries.Where(e => e.Timestamp == null || e.Timestamp >= sinceUtc).ToList();
 
+    var skip  = Math.Max(0, offset.GetValueOrDefault(0));
+    var total = entries.Count;
+    if (skip > 0)
+        entries = entries.Skip(skip).ToList();
+
     return Results.Ok(new
     {
         server,
+        total,
+        offset = skip,
         count  = entries.Count,
         entries
     });
@@ -1038,7 +1464,8 @@ app.MapGet("/servers/{server}/commands", async (string server, int? lines) =>
     var result = await ExecRustMgrAsync("commands", server, n.ToString());
     if (!result.Ok) return Results.BadRequest(result);
 
-    return Results.Text(result.StdOut ?? string.Empty, "text/plain; charset=utf-8");
+    var content = result.StdOut ?? string.Empty;
+    return Results.Ok(new { server, lines = n, content });
 });
 
 // -- Agent convenience: command trace as structured JSON -----------------------
@@ -1084,11 +1511,16 @@ app.MapGet("/servers/{server}/serverinfo", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse serverinfo response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "Server info RCON endpoint failed.", server, "serverinfo");
+        var fallback = await ExecRustMgrAsync("query", server, "serverinfo");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Content(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1114,11 +1546,16 @@ app.MapGet("/servers/{server}/players", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse playerlist response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "Player list RCON endpoint failed.", server, "playerlist");
+        var fallback = await ExecRustMgrAsync("query", server, "playerlist");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Content(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1144,11 +1581,16 @@ app.MapGet("/servers/{server}/bans", async (string server) =>
         var payload = TryExtractJson(directReply);
         return payload is null
             ? Results.BadRequest(new ApiError("parse_error", "Could not parse bans response."))
-            : Results.Text(payload, "application/json");
+            : Results.Content(payload, "application/json");
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        CaptureHandledApiException(ex, "Bans RCON endpoint failed.", server, "bans");
+        var fallback = await ExecRustMgrAsync("query", server, "bans");
+        var payload = TryExtractJson(fallback.StdOut);
+        return fallback.Ok && payload is not null
+            ? Results.Content(payload, "application/json")
+            : Results.BadRequest(new ApiError("rcon_error", $"WebRCON failed: {ex.Message}. rustmgr fallback failed: {BuildRustMgrError(fallback)}"));
     }
 });
 
@@ -1187,6 +1629,7 @@ app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest re
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Kick RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1226,6 +1669,7 @@ app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest req
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Ban RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1264,6 +1708,7 @@ app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest r
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Unban RCON endpoint failed.", server, command);
         return Results.BadRequest(new ApiError("rcon_error", ex.Message));
     }
 });
@@ -1272,7 +1717,7 @@ app.Run();
 }
 catch (Exception ex)
 {
-    SentrySdk.CaptureException(ex);
+    RustOpsSentry.CaptureException(ex, "rustmgrapi terminated unexpectedly.", "runtime");
     throw;
 }
 finally
@@ -1284,6 +1729,32 @@ finally
 // Helpers
 // -----------------------------------------------------------------------------
 
+static void CaptureHandledApiException(Exception ex, string context, string? server = null, string? command = null, string? path = null)
+{
+    var tags = new Dictionary<string, string?> { ["handled"] = "true" };
+    if (!string.IsNullOrWhiteSpace(server))
+        tags["server"] = server;
+
+    var extras = new Dictionary<string, object?>();
+    if (!string.IsNullOrWhiteSpace(command))
+        extras["command"] = command;
+    if (!string.IsNullOrWhiteSpace(path))
+        extras["path"] = path;
+
+    RustOpsSentry.CaptureException(ex, context, "api.handled", tags, extras);
+}
+
+static string BuildRustMgrError(CommandExecutionResult result)
+{
+    if (!string.IsNullOrWhiteSpace(result.Message))
+        return result.Message!;
+    if (!string.IsNullOrWhiteSpace(result.StdErr))
+        return result.StdErr!;
+    if (!string.IsNullOrWhiteSpace(result.StdOut))
+        return result.StdOut!;
+    return $"exit code {result.ExitCode}";
+}
+
 static async Task<bool> IsValidServerAsync(string server)
 {
     var result = await ExecRustMgrAsync("list");
@@ -1294,7 +1765,7 @@ static async Task<bool> IsValidServerAsync(string server)
 
 // Parses the structured output rustmgr status actually emits:
 //   name: <server>
-//   state: running|offline|restarting|session-only
+//   state: running|offline|starting|session-only
 //   session: yes|no
 //   autorestart: yes|no
 //   pid: <number>           ? only present when running
@@ -1559,7 +2030,11 @@ static string? TryExtractJson(string? text)
         using var _ = JsonDocument.Parse(candidate);
         return candidate;
     }
-    catch { return null; }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Failed to extract JSON payload from RCON response.");
+        return null;
+    }
 }
 
 static string Escape(string value) => value.Replace("\"", "\\\"");
@@ -1617,8 +2092,9 @@ static string? ReadRawServerConfigValue(string server, string key)
             _ => node.ToString()
         };
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to read raw server config value.", path: path);
         return null;
     }
 }
@@ -1643,8 +2119,9 @@ static ServerConfig? LoadServerConfig(string server)
     {
         return JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path), JsonDefaults.Options);
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to deserialize server config.", server, path: path);
         return null;
     }
 }
@@ -1682,7 +2159,14 @@ static object DescribeMailbox(string name, string path)
     };
 }
 
-static AgentDashboardSnapshot LoadAgentMemorySnapshot(string path)
+static AgentDashboardSnapshot LoadAgentMemorySnapshot(AgentRuntimePaths paths)
+{
+    var snapshot = LoadLegacyAgentMemorySnapshot(paths.StatePath);
+    MergeNeoCortexSnapshot(snapshot, paths.NeoCortexRoot);
+    return snapshot;
+}
+
+static AgentDashboardSnapshot LoadLegacyAgentMemorySnapshot(string path)
 {
     var stateFile = BuildStateFileStatus(path);
     if (!File.Exists(path))
@@ -1720,6 +2204,7 @@ static AgentDashboardSnapshot LoadAgentMemorySnapshot(string path)
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to parse agent dashboard state file.", path: path);
         return new AgentDashboardSnapshot
         {
             AgentErrors = new List<string> { "Failed to parse agent-state.json." },
@@ -1763,6 +2248,10 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_STATE_PATH") ?? agentSettings?.Memory?.StatePath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "agent-state.json")),
+        NeoCortexRoot = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_AGENT_NEOCORTEX_ROOT") ?? agentSettings?.Memory?.NeoCortexRoot,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "NeoCortex")),
         FeedbackInboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_FEEDBACK_INBOX_PATH") ?? agentSettings?.Inbox?.FeedbackInboxPath,
             agentBaseDir,
@@ -1855,7 +2344,10 @@ static AgentLlmConfigView ReadAgentLlmConfig(string envPath, string agentSetting
         UseChatSystemPrompt = TryParseBooleanValue(
             GetEnvValue(env, "RUSTOPS_LLM_USE_CHAT_SYSTEM_PROMPT"),
             llm?.UseChatSystemPrompt ?? false),
-        ChatSystemPrompt = GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT")
+        // Unescape \n sequences stored by WriteLlmConfig to keep env file single-line.
+        ChatSystemPrompt = (GetEnvValue(env, "RUSTOPS_LLM_CHAT_SYSTEM_PROMPT") is { } envPrompt
+            ? envPrompt.Replace("\\n", "\n")
+            : null)
             ?? llm?.ChatSystemPrompt
             ?? "You are a local Rust server operations agent talking to an admin.\nUse the provided tools to inspect state and perform bounded operations.\nPrefer using tools over guessing.\nFor start, stop, restart, and validate-oxide you must target a known server.\nIf the server is unclear, ask a concise clarification question instead of guessing.\nUse recent memory, incidents, and action history to explain what is happening.\nReply naturally, with concrete operational language.\nStart with the direct answer, then key evidence or next action.\nDo not invent facts.\nYou may use self-diagnostics and workspace tools to improve your own behavior.\nAny file writes must stay inside the configured self-repair scope root.\nIf an admin asks to execute a server console command, use execute_server_command.\nIf an admin asks what a command does, use get_server_command_memory.\nIf an admin teaches command behavior, use teach_server_command.\nIf an admin asks about plugins or updates, use list_server_plugins and check_plugin_updates.\nIf an admin asks to push source changes to git, use git_push_branch.\nIf an admin asks to pull latest source updates, use git_pull_rebuild."
     };
@@ -1970,9 +2462,160 @@ static AgentSettingsFileView? TryLoadAgentSettingsFile(string path)
 
         return settings;
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to load agent settings file.", path: path);
         return null;
+    }
+}
+
+static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCortexRoot)
+{
+    if (string.IsNullOrWhiteSpace(neoCortexRoot) || !Directory.Exists(neoCortexRoot))
+    {
+        return;
+    }
+
+    var operationsPath = Path.Combine(neoCortexRoot, "operations", "active-state.json");
+    if (File.Exists(operationsPath))
+    {
+        try
+        {
+            using var operations = JsonDocument.Parse(File.ReadAllText(operationsPath));
+            var root = operations.RootElement;
+
+            if (root.TryGetProperty("runtimeStatus", out var runtimeStatus) && runtimeStatus.ValueKind == JsonValueKind.Object)
+            {
+                if (runtimeStatus.TryGetProperty("llmEnabled", out var llmEnabledNode) &&
+                    (llmEnabledNode.ValueKind == JsonValueKind.True || llmEnabledNode.ValueKind == JsonValueKind.False))
+                {
+                    snapshot.RuntimeStatus.LlmEnabled = llmEnabledNode.GetBoolean();
+                }
+                snapshot.RuntimeStatus.LlmProvider = ReadString(runtimeStatus, "llmProvider") ?? snapshot.RuntimeStatus.LlmProvider;
+                snapshot.RuntimeStatus.UpdatedAtUtc = ReadDateTime(runtimeStatus, "updatedAtUtc") ?? snapshot.RuntimeStatus.UpdatedAtUtc;
+                snapshot.RuntimeStatus.LastLlmInteractionAtUtc = ReadDateTime(runtimeStatus, "lastLlmInteractionAtUtc") ?? snapshot.RuntimeStatus.LastLlmInteractionAtUtc;
+            }
+
+            if (root.TryGetProperty("recentActions", out var actions) && actions.ValueKind == JsonValueKind.Array)
+            {
+                snapshot.RecentActions = snapshot.RecentActions
+                    .Concat(actions.EnumerateArray().Select(item => new DashboardAction
+                    {
+                        ActionId = null,
+                        ServerName = ReadString(item, "serverName"),
+                        ActionType = ReadString(item, "intent"),
+                        ExecutedAtUtc = ReadDateTime(item, "timestampUtc"),
+                        Success = string.Equals(ReadString(item, "result"), "success", StringComparison.OrdinalIgnoreCase),
+                        Trigger = "neocortex",
+                        Summary = ReadString(item, "result")
+                    }))
+                    .OrderByDescending(item => item.ExecutedAtUtc)
+                    .Take(20)
+                    .ToList();
+            }
+
+            if (root.TryGetProperty("llmInteractions", out var interactions) && interactions.ValueKind == JsonValueKind.Array)
+            {
+                snapshot.LlmInteractions = interactions.EnumerateArray()
+                    .Select(item => new DashboardLlmInteraction
+                    {
+                        AtUtc = ReadDateTime(item, "atUtc"),
+                        Type = ReadString(item, "type"),
+                        Model = ReadString(item, "model"),
+                        Success = ReadBool(item, "success"),
+                        Context = ReadString(item, "context"),
+                        ResponsePreview = ReadString(item, "responsePreview")
+                    })
+                    .OrderByDescending(item => item.AtUtc)
+                    .Take(20)
+                    .ToList();
+            }
+        }
+        catch (Exception ex)
+        {
+            CaptureHandledApiException(ex, "Failed to parse NeoCortex operations state.", path: operationsPath);
+            snapshot.AgentErrors = snapshot.AgentErrors
+                .Concat(new[] { "Failed to parse NeoCortex operations state." })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(8)
+                .ToList();
+        }
+    }
+
+    var evolutionPath = Path.Combine(neoCortexRoot, "evolution", "incidents.jsonl");
+    if (!File.Exists(evolutionPath))
+    {
+        return;
+    }
+
+    try
+    {
+        var records = File.ReadLines(evolutionPath)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .Select(line =>
+            {
+                try
+                {
+                    return JsonDocument.Parse(line).RootElement.Clone();
+                }
+                catch
+                {
+                    return default;
+                }
+            })
+            .Where(item => item.ValueKind == JsonValueKind.Object)
+            .ToList();
+
+        snapshot.RecentIncidents = snapshot.RecentIncidents
+            .Concat(records.Select(item => new DashboardIncident
+            {
+                ServerName = "general",
+                CreatedAtUtc = ReadDateTime(item, "timestamp"),
+                Title = ReadString(item, "classification"),
+                Category = ReadString(item, "missingCapability"),
+                Summary = ReadString(item, "failureReason")
+            }))
+            .OrderByDescending(item => item.CreatedAtUtc)
+            .Take(20)
+            .ToList();
+
+        var groupedGaps = records
+            .GroupBy(item => $"{ReadString(item, "classification")}|{ReadString(item, "missingCapability")}", StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var first = group
+                    .Select(item => ReadDateTime(item, "timestamp"))
+                    .Where(value => value.HasValue)
+                    .Select(value => value!.Value)
+                    .OrderBy(value => value)
+                    .ToList();
+                return new DashboardCapabilityGap
+                {
+                    Category = group.Select(item => ReadString(item, "classification")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)),
+                    Description = group.Select(item => ReadString(item, "recurrencePrevention")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value))
+                        ?? group.Select(item => ReadString(item, "failureReason")).FirstOrDefault(value => !string.IsNullOrWhiteSpace(value)),
+                    Count = group.Count(),
+                    FirstObservedAtUtc = first.FirstOrDefault(),
+                    LastObservedAtUtc = first.LastOrDefault()
+                };
+            })
+            .OrderByDescending(item => item.LastObservedAtUtc)
+            .Take(20)
+            .ToList();
+
+        if (groupedGaps.Count > 0)
+        {
+            snapshot.CapabilityGaps = groupedGaps;
+        }
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Failed to parse NeoCortex evolution state.", path: evolutionPath);
+        snapshot.AgentErrors = snapshot.AgentErrors
+            .Concat(new[] { "Failed to parse NeoCortex evolution state." })
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(8)
+            .ToList();
     }
 }
 
@@ -1985,8 +2628,9 @@ static BotSettingsFileView? TryLoadBotSettingsFile(string path)
     {
         return JsonSerializer.Deserialize<BotSettingsFileView>(File.ReadAllText(path), JsonDefaults.Options);
     }
-    catch
+    catch (Exception ex)
     {
+        CaptureHandledApiException(ex, "Failed to load Steam bot settings file.", path: path);
         return null;
     }
 }
@@ -2464,6 +3108,7 @@ static async Task<LlmSummaryView> ReadLmStudioSummaryAsync(AgentLlmConfigView co
     catch (Exception ex)
     {
         summary.Error = ex.Message;
+        CaptureHandledApiException(ex, "Failed to read LM Studio summary.");
     }
 
     return summary;
@@ -2792,7 +3437,6 @@ static string BuildDashboardHtml() => """
     .unknown,.pending,.degraded,.starting { background:rgba(244,185,92,.14); color:var(--warn); }
     table { width:100%; border-collapse:collapse; }
     th,td { text-align:left; padding:10px 8px; border-bottom:1px solid rgba(39,64,87,.7); vertical-align:top; font-size:14px; }
-    .list { display:grid; gap:10px; }
     .item { padding:12px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:rgba(21,36,52,.55); }
     .mailbox-grid,.kv { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
     pre { white-space:pre-wrap; font-size:12px; color:var(--muted); margin:0; }
@@ -2806,7 +3450,8 @@ static string BuildDashboardHtml() => """
     .tiny { font-size:12px; }
     .chip-list { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
     .chip { display:inline-flex; align-items:center; padding:6px 10px; border-radius:999px; background:rgba(102,200,255,.10); border:1px solid rgba(102,200,255,.22); color:var(--text); font-size:12px; }
-    .codebox { padding:14px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:#08131d; min-height:200px; }
+    .codebox { padding:14px; border:1px solid rgba(39,64,87,.7); border-radius:14px; background:#08131d; min-height:200px; max-height:420px; overflow-y:auto; }
+    .list { display:grid; gap:10px; max-height:420px; overflow-y:auto; padding-right:4px; }
     .toolbar { display:flex; justify-content:space-between; gap:12px; align-items:center; margin-top:12px; flex-wrap:wrap; }
     @media (max-width:1080px) { .stats { grid-template-columns:repeat(2,minmax(0,1fr)); } .grid,.topbar,.mailbox-grid,.kv,.row,.micro-grid { grid-template-columns:1fr; display:grid; } }
   </style>
@@ -2843,6 +3488,9 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
         <div class="card"><h2>Capability Gaps <span class="legend" data-tip="Patterns the agent recorded when it could not fulfill a request. Each entry feeds the self-repair evolution cycle to propose a concrete improvement.">?</span></h2><div id="capabilityGaps" class="list"></div></div>
         <div class="card"><h2>Evolution History <span class="legend" data-tip="Each entry is one self-repair cycle: how many bounded actions were applied, what they changed, and the LLM reasoning behind the decision.">?</span></h2><div id="selfRepairHistory" class="list"></div></div>
+        <div class="card"><h2>Server Console <span class="legend" data-tip="Live error counts per server pulled from the agent's console monitor. Errors are deduplicated and counted since the last agent restart.">?</span></h2><div id="consoleStats" class="list"></div></div>
+        <div class="card"><h2>Player Chat <span class="legend" data-tip="Stats computed from the player chat stream the agent reads in real time. Word counts cover today's messages only. Sentiment is updated every 30 minutes by the LLM.">?</span></h2><div id="chatStats" class="list"></div></div>
+        <div class="card wide"><h2>Incident Feedback <span class="legend" data-tip="Each row is an incident the agent recorded when it failed to fulfill a request. Use the verdict buttons and note field to give the agent real feedback — it reads this to improve future handling.">?</span></h2><div id="incidentFeedbackStatus" class="muted" style="margin-bottom:10px;">Loading incidents…</div><div id="incidentFeedbackList" class="list"></div></div>
         <div class="card"><h2>Agent Log Rules <span class="legend" data-tip="Edit JSON arrays here.\nignoreContains: always ignore these substrings.\nstartupIgnoreContains: ignore only during startup window.\nincidentContains: always elevate these substrings.\nExample:\n{\n  &quot;ignoreContains&quot;: [&quot;known noise&quot;],\n  &quot;startupIgnoreContains&quot;: [&quot;shader unsupported&quot;],\n  &quot;incidentContains&quot;: [&quot;Error while compiling&quot;]\n}">?</span></h2><div id="rulesMeta" class="muted">Not loaded.</div><textarea id="rulesEditor" spellcheck="false" style="margin-top:12px;"></textarea><div class="toolbar"><div id="rulesSaveStatus" class="muted">No changes saved yet.</div><button id="saveRules">Save Rules</button></div></div>
         <div class="card"><h2>Command Policy <span class="legend" data-tip="Controls whether the agent can execute raw server commands.\nIf Free mode is disabled, only allowlisted commands can be executed.\nChanges apply after restarting rustopsagent.service.">?</span></h2><div id="commandConfigMeta" class="muted">Not loaded.</div><div class="row" style="margin-top:12px;"><label class="check"><input id="commandEnabled" type="checkbox"> Command execution enabled</label><label class="check"><input id="commandFreeMode" type="checkbox"> Free mode (no allowlist restriction)</label></div><div class="row" style="margin-top:12px;"><div><label for="commandDefaultWaitMs" class="tiny muted">Default wait (ms)</label><input id="commandDefaultWaitMs" type="number" min="200" max="20000" step="100"></div><div><label for="commandMaxWaitMs" class="tiny muted">Max wait (ms)</label><input id="commandMaxWaitMs" type="number" min="500" max="30000" step="100"></div></div><div class="row" style="margin-top:12px;"><div><label for="commandMaxOutputChars" class="tiny muted">Max output chars</label><input id="commandMaxOutputChars" type="number" min="500" max="64000" step="100"></div></div><div style="margin-top:12px;"><label for="commandAllowList" class="tiny muted">Allowlist (comma/line separated)</label><textarea id="commandAllowList" spellcheck="false" style="min-height:140px;"></textarea></div><div class="toolbar"><div id="commandSaveStatus" class="muted">No changes saved yet.</div><button id="saveCommandConfig">Save Command Policy</button></div></div>
       </div>
@@ -2995,13 +3643,15 @@ static string BuildDashboardHtml() => """
     async function load() {
       localStorage.setItem('rustops.apiKey', keyInput.value.trim());
       try {
-        const [summary, _, llmSummary, llmConfig, commandConfig] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config')]);
+        const [summary, _, llmSummary, llmConfig, commandConfig, consoleData, chatData] = await Promise.all([fetchJson('/dashboard/summary'), loadRules(), fetchJson('/host/llm/summary'), fetchJson('/agent/llm/config'), fetchJson('/agent/commands/config'), fetchJson('/agent/console-monitor').catch(() => ({})), fetchJson('/agent/player-chat/recent').catch(() => ({}))]);
         $('stamp').textContent = `Updated ${fmt(summary.generatedAtUtc)} | API ${summary.host.bindUrl}`;
         $('stats').innerHTML = [metric('Servers', summary.counts?.servers ?? 0, 'configured via rustmgr'), metric('Online', summary.counts?.onlineServers ?? 0, 'currently running'), metric('Pending Actions', summary.counts?.pendingActions ?? 0, 'agent approval queue'), metric('Incidents', summary.counts?.incidents ?? 0, 'recent tracked issues'), metric('Outbox', summary.counts?.messageOutbox ?? 0, 'messages waiting for Steam'), metric('LLM Calls', (summary.llmInteractions || []).length, 'recent recorded interactions'), metric('Capability Gaps', summary.counts?.capabilityGaps ?? 0, 'unfulfilled request patterns'), metric('Evolution Runs', summary.counts?.selfRepairRuns ?? 0, 'agent improvement cycles')].join('');
         renderServers(summary.servers || []);
         renderAgent(summary);
         renderLlm(summary, llmSummary, llmConfig);
         renderCommandConfig(commandConfig);
+        renderConsoleStats(consoleData);
+        renderChatStats(chatData);
       } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
     }
 
@@ -3040,14 +3690,115 @@ static string BuildDashboardHtml() => """
       } catch (error) { alert(`Failed to save command policy: ${error.message}`); }
     }
 
-    tabs.forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.target)));
-    $('refresh').addEventListener('click', load);
+    function renderConsoleStats(data) {
+      const servers = data?.servers || {};
+      const entries = Object.entries(servers);
+      if (entries.length === 0) { $('consoleStats').innerHTML = '<div class="muted">No console data yet.</div>'; return; }
+      $('consoleStats').innerHTML = entries.map(([name, s]) => {
+        const topErrors = (s.recentErrors || []).sort((a, b) => b.count - a.count).slice(0, 3);
+        const topHtml = topErrors.length ? topErrors.map(e => `<div class="muted" style="margin-top:4px;font-size:12px;">• ${esc(e.message.length > 70 ? e.message.slice(0,70)+'…' : e.message)} <span style="color:var(--accent)">(${e.count}x)</span></div>`).join('') : '<div class="muted" style="font-size:12px;">No errors recorded.</div>';
+        const total = s.totalErrorsIngested ?? 0;
+        return `<div class="item"><div style="font-weight:700;">${esc(name)}</div><div class="muted" style="margin-top:4px;font-size:12px;">${total} error${total !== 1 ? 's' : ''} ingested total</div>${topHtml}</div>`;
+      }).join('');
+    }
+
+    function renderChatStats(data) {
+      const messages = data?.recentMessages || [];
+      const score = data?.sentimentScore;
+      const label = data?.sentimentLabel || 'unknown';
+      const summary = data?.sentimentSummary || '';
+      const themes = (data?.keyThemes || []).slice(0, 5);
+      const feedback = (data?.constructiveFeedback || []).slice(0, 3);
+
+      const today = new Date().toDateString();
+      const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
+
+      // Word frequency (excluding common stopwords) — today only
+      const stopwords = new Set(['the','and','to','a','in','i','you','is','it','of','for','on','that','this','was','are','with','he','she','they','we','be','at','by','not','my','have','had','has','do','me','can','get','just','so','go','up','got','did','yeah','ok','im','its','but','no','yes','hey','lol','gg','wtf','idk',
+        // additional filler / non-content words
+        'like','what','how','when','why','who','where','all','if','been','from','will','would','could','should','dont','cant','wont','isnt','wasnt','your','their','our','his','her','then','than','more','also','still','even','some','into','over','out','off','too','here','there','now','after','before','back','just','about','because','because','again','while','might','need','want','think','know','see','way','time','day','guys','man','anyone','anyone','nothing','something','everything','thing','things','server','rust','game']);
+      // Only count words that appear to be actual player language (exclude console/plugin prefixes)
+      const isPlayerWord = w => w.length >= 3 && !/^(oxide|error|warning|info|debug|plugin|loading|loaded|unload|init|start|stop|null|true|false|void|http|https|www)$/.test(w);
+      const freq = {};
+      for (const m of todayMsgs) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w) && isPlayerWord(w)) freq[w] = (freq[w]||0) + 1; } }
+      const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8);
+
+      // Fun word counts for today
+      const funWords = ['fuck','shit','damn','noob','toxic','cheater','hacker','cope','seethe'];
+      const funStats = funWords.map(w => [w, todayMsgs.filter(m=>(m.message||'').toLowerCase().includes(w)).length]).filter(([,c])=>c>0);
+
+      const scoreColor = score == null ? 'var(--muted)' : score >= 6 ? '#4caf50' : score >= 4 ? '#ff9800' : '#f44336';
+      const scoreHtml = score != null ? `<span style="color:${scoreColor};font-weight:700;">${score.toFixed(1)}/10</span> <span class="muted">${esc(label)}</span>` : '<span class="muted">Not yet analysed</span>';
+
+      const parts = [
+        `<div class="item"><div style="font-weight:700;">Sentiment</div><div style="margin-top:6px;">${scoreHtml}</div>${summary ? `<div class="muted" style="margin-top:4px;font-size:12px;">${esc(summary)}</div>` : ''}</div>`,
+        `<div class="item"><div style="font-weight:700;">Volume</div><div class="muted" style="margin-top:6px;font-size:12px;">${messages.length} messages total &nbsp;·&nbsp; ${todayMsgs.length} today</div></div>`,
+      ];
+      if (themes.length) parts.push(`<div class="item"><div style="font-weight:700;">Key Themes</div><div class="muted" style="margin-top:6px;font-size:12px;">${themes.map(t=>esc(t)).join(' · ')}</div></div>`);
+      if (feedback.length) parts.push(`<div class="item"><div style="font-weight:700;">Player Feedback</div>${feedback.map(f=>`<div class="muted" style="margin-top:4px;font-size:12px;">• ${esc(f)}</div>`).join('')}</div>`);
+      if (topWords.length) parts.push(`<div class="item"><div style="font-weight:700;">Top Words</div><div style="margin-top:6px;font-size:12px;">${topWords.map(([w,c])=>`<span style="margin-right:10px;">${esc(w)} <span class="muted">${c}</span></span>`).join('')}</div></div>`);
+      if (funStats.length) parts.push(`<div class="item"><div style="font-weight:700;">Today's Fun Facts</div>${funStats.map(([w,c])=>`<div class="muted" style="margin-top:4px;font-size:12px;">"${esc(w)}" said ${c}x today</div>`).join('')}</div>`);
+      if (!parts.length) { $('chatStats').innerHTML = '<div class="muted">No player chat data yet.</div>'; return; }
+      $('chatStats').innerHTML = parts.join('');
+    }
+
+    async function loadIncidentFeedback() {
+      try {
+        const incidents = await fetchJson('/agent/incidents/list');
+        $('incidentFeedbackStatus').textContent = `${incidents.length} incident(s) recorded.`;
+        if (!incidents.length) { $('incidentFeedbackList').innerHTML = '<div class="muted">No incidents recorded yet.</div>'; return; }
+        $('incidentFeedbackList').innerHTML = incidents.map(inc => {
+          const verdictBadge = inc.adminVerdict ? `<span class="pill ${inc.adminVerdict === 'resolved' ? 'ok' : inc.adminVerdict === 'wontfix' ? 'offline' : 'unknown'}" style="margin-left:8px;">${esc(inc.adminVerdict)}</span>` : '';
+          return `<div class="item" data-incident-id="${esc(inc.id)}">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+              <strong>${esc(inc.classification || 'unknown')}</strong>${verdictBadge}
+              <span class="muted tiny">${esc(fmt(inc.timestamp))}</span>
+            </div>
+            <div class="muted" style="margin-top:6px;">${esc(inc.request || '')}</div>
+            <div class="tiny muted" style="margin-top:6px;">Failure: ${esc(inc.failureReason || 'n/a')}</div>
+            <div class="tiny muted">Missing: ${esc(inc.missingCapability || 'n/a')}</div>
+            <div class="tiny muted">Prevention: ${esc(inc.recurrencePrevention || 'n/a')}</div>
+            ${inc.adminNote ? `<div class="tiny" style="margin-top:6px;color:var(--accent);">Admin note: ${esc(inc.adminNote)}</div>` : ''}
+            <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="resolved" style="padding:6px 10px;font-size:12px;">Resolved</button>
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="wontfix" style="padding:6px 10px;font-size:12px;">Won&apos;t fix</button>
+              <button type="button" class="ghost incident-verdict" data-id="${esc(inc.id)}" data-verdict="needs-work" style="padding:6px 10px;font-size:12px;">Needs work</button>
+              <input type="text" class="incident-note" data-id="${esc(inc.id)}" placeholder="Admin note (optional)" value="${esc(inc.adminNote || '')}" style="flex:1;min-width:140px;padding:6px 10px;font-size:12px;">
+            </div>
+          </div>`;
+        }).join('');
+      } catch (error) { $('incidentFeedbackStatus').textContent = `Failed to load: ${error.message}`; }
+    }
+
+    async function submitIncidentFeedback(id, verdict, note) {
+      try {
+        await fetchJson(`/agent/incidents/${encodeURIComponent(id)}/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ verdict, note }) });
+        await loadIncidentFeedback();
+      } catch (error) { alert(`Failed to save feedback: ${error.message}`); }
+    }
+
+    tabs.forEach(tab => tab.addEventListener('click', () => {
+      activateTab(tab.dataset.target);
+      if (tab.dataset.target === 'agentGroup') loadIncidentFeedback();
+    }));
+    $('refresh').addEventListener('click', () => { load(); loadIncidentFeedback(); });
     $('saveRules').addEventListener('click', saveRules);
     $('saveOllamaConfig').addEventListener('click', saveOllamaConfig);
     $('saveCommandConfig').addEventListener('click', saveCommandConfig);
     $('commandFreeMode').addEventListener('change', () => { $('commandAllowList').disabled = $('commandFreeMode').checked; });
-    document.addEventListener('click', event => { const target = event.target; if (target instanceof HTMLElement && target.classList.contains('use-model')) $('ollamaModel').value = target.dataset.model || ''; });
-    if (keyInput.value) load();
+    document.addEventListener('click', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (target.classList.contains('use-model')) { $('ollamaModel').value = target.dataset.model || ''; return; }
+      if (target.classList.contains('incident-verdict')) {
+        const id = target.dataset.id || '';
+        const verdict = target.dataset.verdict || '';
+        const noteEl = document.querySelector(`.incident-note[data-id="${CSS.escape(id)}"]`);
+        const note = noteEl instanceof HTMLInputElement ? noteEl.value.trim() : '';
+        submitIncidentFeedback(id, verdict, note);
+      }
+    });
+    if (keyInput.value) { load(); loadIncidentFeedback(); }
   </script>
 </body>
 </html>
@@ -3409,7 +4160,14 @@ static async Task<CommandExecutionResult> ExecProcessAsync(string fileName, para
     {
         using var process = new Process { StartInfo = psi };
         if (!process.Start())
+        {
+            RustOpsSentry.CaptureMessage(
+                $"Failed to start external process '{fileName}'.",
+                "api.process",
+                SentryLevel.Error,
+                extras: new Dictionary<string, object?> { ["arguments"] = args });
             return new CommandExecutionResult { Ok = false, ExitCode = -1, Arguments = args, StdErr = $"Failed to start '{fileName}'." };
+        }
 
         var stdOutTask = process.StandardOutput.ReadToEndAsync();
         var stdErrTask = process.StandardError.ReadToEndAsync();
@@ -3426,6 +4184,11 @@ static async Task<CommandExecutionResult> ExecProcessAsync(string fileName, para
     }
     catch (Exception ex)
     {
+        CaptureHandledApiException(
+            ex,
+            $"External process '{fileName}' execution failed.",
+            command: string.Join(' ', args),
+            path: fileName);
         return new CommandExecutionResult
             { Ok = false, ExitCode = -1, Arguments = new[] { fileName }.Concat(args), StdErr = ex.Message };
     }
@@ -3481,7 +4244,7 @@ public sealed class ManagedTaskRequest
 public sealed class ServerStatusResponse
 {
     public string  Name        { get; set; } = string.Empty;
-    /// <summary>running | offline | restarting | session-only | unknown</summary>
+    /// <summary>running | offline | starting | session-only | unknown</summary>
     public string  State       { get; set; } = "unknown";
     /// <summary>true only when State == "running"</summary>
     public bool    Online      { get; set; }
@@ -3673,6 +4436,7 @@ public sealed class AgentRuntimePaths
     public string AgentSettingsPath { get; set; } = string.Empty;
     public string BotSettingsPath { get; set; } = string.Empty;
     public string StatePath { get; set; } = string.Empty;
+    public string NeoCortexRoot { get; set; } = string.Empty;
     public string FeedbackInboxPath { get; set; } = string.Empty;
     public string DecisionInboxPath { get; set; } = string.Empty;
     public string ChatInboxPath { get; set; } = string.Empty;
@@ -3794,12 +4558,15 @@ public sealed class AgentSettingsFileView
     [JsonPropertyName("monitor")] public AgentSettingsMonitorView? Monitor { get; set; }
     [JsonPropertyName("commandExecution")] public AgentSettingsCommandExecutionView? CommandExecution { get; set; }
     [JsonPropertyName("llm")] public AgentSettingsLlmView? Llm { get; set; }
+    [JsonPropertyName("llmCompose")] public AgentSettingsLlmView? LlmCompose { get; set; }
+    [JsonPropertyName("llmDeep")] public AgentSettingsLlmView? LlmDeep { get; set; }
     [JsonPropertyName("ollama")] public AgentSettingsLlmView? LegacyOllama { get; set; }
 }
 
 public sealed class AgentSettingsMemoryView
 {
     [JsonPropertyName("statePath")] public string? StatePath { get; set; }
+    [JsonPropertyName("neoCortexRoot")] public string? NeoCortexRoot { get; set; }
 }
 
 public sealed class AgentSettingsInboxView
@@ -3966,6 +4733,10 @@ public sealed class ServerConfig
 }
 
 public sealed record RconConnectionInfo(string Host, ushort Port, string Password, bool WebRconEnabled);
+
+public sealed record RemoteServerEntry(string Name, string DisplayName, string RconIp, int RconPort, string RconPassword, int GamePort = 0);
+
+internal sealed record IncidentFeedbackEntry(string? Verdict, string? Note, DateTime? AnsweredAtUtc);
 
 /// <summary>
 /// Lightweight RCON wrapper for Rust server console interaction.

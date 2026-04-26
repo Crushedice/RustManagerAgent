@@ -11,6 +11,14 @@ internal sealed class AgentConfig
     [JsonPropertyName("monitor")] public MonitorSettings Monitor { get; set; } = new();
     [JsonPropertyName("gitOps")] public GitOpsSettings GitOps { get; set; } = new();
     [JsonPropertyName("llm")] public LlmSettings Llm { get; set; } = new();
+    [JsonPropertyName("llmCompose")] public LlmSettings LlmCompose { get; set; } = new();
+    [JsonPropertyName("llmDeep")] public LlmSettings LlmDeep { get; set; } = new();
+    [JsonPropertyName("autoPull")] public AutoPullSettings AutoPull { get; set; } = new();
+    [JsonPropertyName("network")] public NetworkSettings Network { get; set; } = new();
+    [JsonPropertyName("pluginUpdates")] public PluginUpdateSettings PluginUpdates { get; set; } = new();
+    [JsonPropertyName("commandExecution")] public CommandExecutionSettings CommandExecution { get; set; } = new();
+    [JsonPropertyName("cpuAffinity")] public CpuAffinitySettings CpuAffinity { get; set; } = new();
+    [JsonPropertyName("consoleMonitor")] public ConsoleMonitorSettings ConsoleMonitor { get; set; } = new();
 }
 
 internal sealed class ApiSettings
@@ -40,6 +48,18 @@ internal sealed class OutboxSettings
 internal sealed class MonitorSettings
 {
     [JsonPropertyName("pollSeconds")] public int PollSeconds { get; set; } = 10;
+    [JsonPropertyName("incidentReviewIntervalMinutes")] public int IncidentReviewIntervalMinutes { get; set; } = 30;
+    [JsonPropertyName("classifierEvolutionIntervalMinutes")] public int ClassifierEvolutionIntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("logRulesPath")] public string? LogRulesPath { get; set; }
+}
+
+internal sealed class CommandExecutionSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("freeMode")] public bool FreeMode { get; set; }
+    [JsonPropertyName("allowList")] public List<string> AllowList { get; set; } = new() { "playerlist", "serverinfo", "bans", "oxide.plugins", "status", "version" };
+    [JsonPropertyName("autoAllowAfterSuccesses")] public int AutoAllowAfterSuccesses { get; set; } = 5;
+    [JsonPropertyName("requireApprovalAfterFailures")] public int RequireApprovalAfterFailures { get; set; } = 2;
 }
 
 internal sealed class GitOpsSettings
@@ -50,6 +70,55 @@ internal sealed class GitOpsSettings
     [JsonPropertyName("baseBranch")] public string BaseBranch { get; set; } = "main";
     [JsonPropertyName("pushBranchPrefix")] public string PushBranchPrefix { get; set; } = "agent/";
     [JsonPropertyName("allowPush")] public bool AllowPush { get; set; }
+    [JsonPropertyName("githubToken")] public string? GithubToken { get; set; }
+}
+
+internal sealed class AutoPullSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    [JsonPropertyName("intervalMinutes")] public int IntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("repoPath")] public string RepoPath { get; set; } = "/opt/rust-manager/src";
+    [JsonPropertyName("remoteName")] public string RemoteName { get; set; } = "origin";
+    [JsonPropertyName("branchName")] public string BranchName { get; set; } = "main";
+    [JsonPropertyName("buildEnabled")] public bool BuildEnabled { get; set; }
+    [JsonPropertyName("buildScript")] public string BuildScript { get; set; } = "Agent-Build.sh";
+    [JsonPropertyName("restartEnabled")] public bool RestartEnabled { get; set; }
+    [JsonPropertyName("serviceName")] public string ServiceName { get; set; } = "rustopsagent";
+    [JsonPropertyName("githubToken")] public string? GithubToken { get; set; }
+}
+
+internal sealed class NetworkSettings
+{
+    [JsonPropertyName("trackedInterfaces")] public List<string> TrackedInterfaces { get; set; } = new() { "eth0", "wt1", "wg1" };
+}
+
+internal sealed class PluginUpdateSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("checkIntervalMinutes")] public int CheckIntervalMinutes { get; set; } = 60;
+    [JsonPropertyName("notifyAdmins")] public bool NotifyAdmins { get; set; } = true;
+    [JsonPropertyName("searchUrlTemplate")] public string SearchUrlTemplate { get; set; } = "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}";
+    [JsonPropertyName("searchFilter")] public string SearchFilter { get; set; } = "rust";
+    [JsonPropertyName("downloadEnabled")] public bool DownloadEnabled { get; set; }
+    [JsonPropertyName("stagingPath")] public string StagingPath { get; set; } = "data/plugin-staging";
+}
+
+internal sealed class CpuAffinitySettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; }
+    // Maps server name to CPU list for taskset, e.g. "0-3" or "0,1,2,3"
+    [JsonPropertyName("servers")] public Dictionary<string, string> Servers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+
+internal sealed class ConsoleMonitorSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+    [JsonPropertyName("errorEscalationThreshold")] public int ErrorEscalationThreshold { get; set; } = 10;
+    [JsonPropertyName("repeatThreshold")] public int RepeatThreshold { get; set; } = 5;
+    [JsonPropertyName("sentimentAnalysisIntervalMinutes")] public int SentimentAnalysisIntervalMinutes { get; set; } = 30;
+    [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 200;
+    [JsonPropertyName("sentimentAlertThreshold")] public double SentimentAlertThreshold { get; set; } = 4.0;
+    [JsonPropertyName("compileErrorSeedThreshold")] public int CompileErrorSeedThreshold { get; set; } = 5;
 }
 
 internal sealed class LlmSettings
@@ -61,6 +130,10 @@ internal sealed class LlmSettings
     [JsonPropertyName("apiKey")] public string? ApiKey { get; set; }
     [JsonPropertyName("httpReferer")] public string? HttpReferer { get; set; }
     [JsonPropertyName("appTitle")] public string? AppTitle { get; set; }
+    [JsonPropertyName("useForRecommendations")] public bool UseForRecommendations { get; set; } = true;
+    [JsonPropertyName("requestStrategy")] public string? RequestStrategy { get; set; } = "fallback";
+    [JsonPropertyName("useChatSystemPrompt")] public bool UseChatSystemPrompt { get; set; } = true;
+    [JsonPropertyName("chatSystemPrompt")] public string? ChatSystemPrompt { get; set; }
 }
 
 internal sealed class ChatInboxItem

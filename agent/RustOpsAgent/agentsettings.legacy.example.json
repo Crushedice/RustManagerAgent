@@ -1,0 +1,11 @@
+{
+  "note": "Legacy settings sample moved from prior monolithic agent; kept only for migration reference.",
+  "deprecated": [
+    "monitor.controlPollSeconds",
+    "monitor.logLinesPerScan",
+    "policy.*",
+    "commandExecution.*",
+    "pluginUpdates.*",
+    "selfRepair.*"
+  ]
+}

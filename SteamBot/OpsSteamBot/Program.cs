@@ -8,6 +8,12 @@ using SteamKit2;
 var configPath = args.FirstOrDefault() ?? Path.Combine(AppContext.BaseDirectory, "botsettings.json");
 RustOpsEnv.LoadFromDefaultLocations(configPath);
 using var sentry = RustOpsSentry.Initialize("opssteambot");
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetExtra("configPath", Path.GetFullPath(configPath));
+    scope.SetExtra("appBaseDirectory", AppContext.BaseDirectory);
+});
+RustOpsSentry.AddBreadcrumb($"Steam bot starting with config path {Path.GetFullPath(configPath)}.", "startup");
 
 try
 {
@@ -15,10 +21,27 @@ if (!File.Exists(configPath))
 {
     Console.Error.WriteLine($"Config file not found: {configPath}");
     Console.Error.WriteLine("Copy botsettings.example.json to botsettings.json and fill in your values.");
+    RustOpsSentry.CaptureMessage(
+        $"Steam bot config file not found: {configPath}",
+        "startup",
+        SentryLevel.Error,
+        extras: new Dictionary<string, object?> { ["configPath"] = Path.GetFullPath(configPath) });
     return 1;
 }
 
 var config = AppConfig.Load(configPath, configPath);
+RustOpsSentry.ConfigureScope(scope =>
+{
+    scope.SetExtra("apiBaseUrl", config.Api.BaseUrl);
+    scope.SetExtra("agentStatePath", config.Agent.StatePath);
+    scope.SetExtra("feedbackInboxPath", config.Agent.FeedbackInboxPath);
+    scope.SetExtra("decisionInboxPath", config.Agent.DecisionInboxPath);
+    scope.SetExtra("chatInboxPath", config.Agent.ChatInboxPath);
+    scope.SetExtra("messageOutboxPath", config.Agent.MessageOutboxPath);
+    scope.SetExtra("deadLetterPath", config.Agent.DeadLetterPath);
+    scope.SetTag("steam.admin.count", config.Steam.AdminSteamIds.Count.ToString());
+});
+RustOpsSentry.AddBreadcrumb("Steam bot configuration loaded.", "startup");
 Console.WriteLine($"Config loaded from {Path.GetFullPath(configPath)}");
 Console.WriteLine($"API base URL: {config.Api.BaseUrl}");
 Console.WriteLine($"Agent state path: {config.Agent.StatePath}");
@@ -38,7 +61,7 @@ return 0;
 catch (Exception ex)
 {
     Console.Error.WriteLine(ex);
-    SentrySdk.CaptureException(ex);
+    RustOpsSentry.CaptureException(ex, "Steam bot terminated unexpectedly.", "runtime");
     return 1;
 }
 finally
@@ -59,6 +82,9 @@ internal sealed class OpsSteamBot
     private string? _authCode;
     private bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
+    private int _pendingChats;
+    private EPersonaState _currentPersonaState = EPersonaState.Offline;
+    private DateTime _lastSetOnlineUtc = DateTime.MinValue;
 
     public OpsSteamBot(AppConfig config, RustMgrApiClient api)
     {
@@ -110,20 +136,38 @@ internal sealed class OpsSteamBot
             try
             {
                 await PollOutboxAsync();
+                ApplyIdlePresenceIfNeeded();
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"Outbox loop failed: {ex.Message}");
-                SentrySdk.CaptureException(ex);
+                RustOpsSentry.CaptureException(ex, "Steam bot outbox loop failed.", "steam.outbox");
             }
 
             await Task.Delay(250);
         }
     }
 
+    private void ApplyIdlePresenceIfNeeded()
+    {
+        if (_currentPersonaState != EPersonaState.Online)
+            return;
+
+        if (Interlocked.CompareExchange(ref _pendingChats, 0, 0) > 0)
+            return;
+
+        // Safety net: still Online but nothing pending for >60 s → force Away.
+        if (DateTime.UtcNow - _lastSetOnlineUtc > TimeSpan.FromSeconds(60))
+        {
+            Console.WriteLine("[Presence] Idle timeout — forcing Away.");
+            SetPresence(EPersonaState.Away);
+        }
+    }
+
     private void OnConnected(SteamClient.ConnectedCallback callback)
     {
         Console.WriteLine("Connected to Steam. Logging in...");
+        RustOpsSentry.AddBreadcrumb("Connected to Steam. Starting login.", "steam.connection");
 
         _user.LogOn(new SteamUser.LogOnDetails
         {
@@ -137,7 +181,18 @@ internal sealed class OpsSteamBot
     {
         Console.WriteLine("Disconnected from Steam. Reconnecting in 5 seconds...");
         RustOpsSentry.AddBreadcrumb("Disconnected from Steam. Scheduling reconnect.", "steam.connection");
-        Task.Delay(TimeSpan.FromSeconds(5)).ContinueWith(_ => _client.Connect());
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(5));
+                _client.Connect();
+            }
+            catch (Exception ex)
+            {
+                RustOpsSentry.CaptureException(ex, "Steam reconnect attempt failed.", "steam.connection");
+            }
+        });
     }
 
     private void OnLoggedOn(SteamUser.LoggedOnCallback callback)
@@ -162,13 +217,16 @@ internal sealed class OpsSteamBot
         if (callback.Result != EResult.OK)
         {
             Console.Error.WriteLine($"Steam login failed: {callback.Result}");
-            SentrySdk.CaptureMessage($"Steam login failed: {callback.Result}");
+            RustOpsSentry.CaptureMessage(
+                $"Steam login failed: {callback.Result}",
+                "steam.connection",
+                SentryLevel.Warning);
             return;
         }
 
         Console.WriteLine("Logged on.");
         RustOpsSentry.AddBreadcrumb("Logged on to Steam.", "steam.connection");
-        _friends.SetPersonaState(EPersonaState.Online);
+        SetPresence(EPersonaState.Away);
         if (!string.IsNullOrWhiteSpace(_config.Steam.PersonaName))
             _friends.SetPersonaName(_config.Steam.PersonaName);
     }
@@ -180,7 +238,7 @@ internal sealed class OpsSteamBot
 
     private void OnAccountInfo(SteamUser.AccountInfoCallback callback)
     {
-        _friends.SetPersonaState(EPersonaState.Online);
+        SetPresence(EPersonaState.Away);
     }
 
     private async void OnFriendMessage(SteamFriends.FriendMsgCallback callback)
@@ -204,16 +262,27 @@ internal sealed class OpsSteamBot
         try
         {
             var response = await HandleIncomingMessageAsync(senderId, text);
-            foreach (var chunk in ChunkMessage(response))
+            if (!string.IsNullOrWhiteSpace(response))
             {
-                _friends.SendChatMessage(callback.Sender, EChatEntryType.ChatMsg, chunk);
-                await Task.Delay(350);
+                foreach (var chunk in ChunkMessage(response))
+                {
+                    _friends.SendChatMessage(callback.Sender, EChatEntryType.ChatMsg, chunk);
+                    await Task.Delay(350);
+                }
             }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine(ex);
-            SentrySdk.CaptureException(ex);
+            RustOpsSentry.CaptureException(
+                ex,
+                "Steam admin message handling failed.",
+                "steam.chat",
+                extras: new Dictionary<string, object?>
+                {
+                    ["senderId"] = senderId.ToString(),
+                    ["message"] = text
+                });
             var userMessage = ex is ApiClientException apiEx
                 ? apiEx.Message
                 : $"Error: {ex.Message}";
@@ -262,6 +331,17 @@ internal sealed class OpsSteamBot
 
                 ArchiveOutboxFile(path);
                 _outboxFailureCounts.Remove(path);
+
+                if (IsChatReplyOutboxFile(path) && !string.IsNullOrWhiteSpace(json.TargetAdminId))
+                {
+                    var remaining = Interlocked.Decrement(ref _pendingChats);
+                    Console.WriteLine($"[Presence] Reply sent — pending={remaining}");
+                    if (remaining <= 0)
+                    {
+                        _pendingChats = 0;
+                        SetPresence(EPersonaState.Away);
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -294,7 +374,11 @@ internal sealed class OpsSteamBot
     private void HandleOutboxFailure(string path, Exception ex)
     {
         Console.Error.WriteLine($"Failed to process outbox message '{path}': {ex.Message}");
-        SentrySdk.CaptureException(ex);
+        RustOpsSentry.CaptureException(
+            ex,
+            "Failed to process Steam bot outbox file.",
+            "steam.outbox",
+            extras: new Dictionary<string, object?> { ["path"] = path });
 
         var currentCount = _outboxFailureCounts.TryGetValue(path, out var count) ? count : 0;
         currentCount++;
@@ -315,7 +399,11 @@ internal sealed class OpsSteamBot
         catch (Exception moveEx)
         {
             Console.Error.WriteLine($"Failed to move outbox file '{path}' to dead-letter: {moveEx.Message}");
-            SentrySdk.CaptureException(moveEx);
+            RustOpsSentry.CaptureException(
+                moveEx,
+                "Failed to move Steam bot outbox file to dead-letter.",
+                "steam.outbox",
+                extras: new Dictionary<string, object?> { ["path"] = path });
         }
     }
 
@@ -433,6 +521,16 @@ internal sealed class OpsSteamBot
         File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonOptions.Default));
     }
 
+    private void SetPresence(EPersonaState state)
+    {
+        if (_currentPersonaState == state)
+            return;
+
+        _currentPersonaState = state;
+        Console.WriteLine($"[Presence] {state}");
+        _friends.SetPersonaState(state);
+    }
+
     private string QueueChatRequest(ulong senderId, string input)
     {
         var item = new ChatInboxItem
@@ -444,7 +542,11 @@ internal sealed class OpsSteamBot
         };
 
         WriteInboxFile(_config.Agent.ChatInboxPath, "chat", item);
-        return "Request received. I'll reply shortly.";
+        var pending = Interlocked.Increment(ref _pendingChats);
+        _lastSetOnlineUtc = DateTime.UtcNow;
+        Console.WriteLine($"[Presence] Chat queued — pending={pending}");
+        SetPresence(EPersonaState.Online);
+        return string.Empty;
     }
 
     private string GetHelpText()
@@ -557,7 +659,8 @@ internal sealed class RustMgrApiClient : IDisposable
     {
         _http = new HttpClient
         {
-            BaseAddress = new Uri(settings.BaseUrl.TrimEnd('/'))
+            BaseAddress = new Uri(settings.BaseUrl.TrimEnd('/')),
+            Timeout = TimeSpan.FromSeconds(20)
         };
         _http.DefaultRequestHeaders.Add("X-Api-Key", settings.ApiKey);
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
@@ -565,6 +668,7 @@ internal sealed class RustMgrApiClient : IDisposable
 
     public async Task<JsonDocument> GetJsonAsync(string path)
     {
+        RustOpsSentry.AddBreadcrumb($"Steam bot API GET {path}", "steam.api");
         using var response = await _http.GetAsync(path);
         return await ReadJsonAsync(response);
     }

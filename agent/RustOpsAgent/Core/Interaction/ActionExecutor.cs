@@ -13,14 +13,16 @@ internal sealed class ActionExecutor : IActionExecutor
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        if (context.Route.NeedsClarification)
+        if (context.Route.NeedsClarification && IsBlockingClarification(context.Route))
         {
             return new ToolExecutionResult(
                 false,
                 context.Route.ClarificationQuestion ?? "Please clarify the target server or command.",
                 context.SelectionState.LastServerName,
                 false,
-                "clarification_required");
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: context.Route.Slots.ScopeKind);
         }
 
         var handler = _registry.ResolveSingle(context);
@@ -30,5 +32,20 @@ internal sealed class ActionExecutor : IActionExecutor
         }
 
         return await handler.ExecuteAsync(context, cancellationToken);
+    }
+
+    private static bool IsBlockingClarification(AdminIntentRoute route)
+    {
+        if (route.Intent is AdminIntentType.ServerControl or AdminIntentType.RconCommand or AdminIntentType.PlayerLookup)
+        {
+            return true;
+        }
+
+        if (route.Intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting or AdminIntentType.FileEdit)
+        {
+            return false;
+        }
+
+        return route.Intent == AdminIntentType.Clarification;
     }
 }

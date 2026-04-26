@@ -1,6 +1,9 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Collections.Concurrent;
+using Sentry;
 using RustOpsAgent.Core.Contracts;
+using RustOpsAgent.Core.Interaction;
 using RustOpsAgent.Domains.Rust.Rcon;
 using RustOpsAgent.Infrastructure;
 using RustOpsAgent.Infrastructure.Memory;
@@ -21,36 +24,155 @@ internal sealed class RustStatusToolHandler : IToolHandler
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
-        if (string.IsNullOrWhiteSpace(server))
+        var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+        var scope = RustToolHelper.ResolveServerScope(context, knownServers, allowPluralDefaultAll: true);
+        if (scope.Servers.Count == 0)
         {
-            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
-            var list = knownServers.Count > 0 ? string.Join(", ", knownServers.Take(10)) : "none";
-            return new ToolExecutionResult(true, $"Known servers: {list}");
+            var clarification = RustToolHelper.BuildScopeClarificationQuestion(
+                context.Route.Intent,
+                knownServers,
+                allowAllServers: true);
+            return new ToolExecutionResult(
+                false,
+                clarification,
+                context.SelectionState.LastServerName,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
-        var root = health.RootElement;
-        var state = root.TryGetProperty("state", out var stateNode) ? stateNode.GetString() : "unknown";
-        var errors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
-            ? errorsNode.EnumerateArray().Select(e => e.ToString()).Take(3).ToList()
-            : new List<string>();
+        var results = new List<AggregateStatusServerResult>();
+        foreach (var server in scope.Servers)
+        {
+            results.Add(await CheckServerStatusAsync(server, cancellationToken));
+        }
 
-        var msg = errors.Count > 0
-            ? $"{server} is {state}. Recent errors: {string.Join(" | ", errors)}"
-            : $"{server} is {state}. No recent errors were reported.";
+        var successful = results.Where(result => result.CheckSucceeded).ToList();
+        var failedServers = results
+            .Where(result => !result.CheckSucceeded)
+            .Select(result => result.Server)
+            .ToList();
+        var offlineServers = successful
+            .Where(result => !result.Online)
+            .Select(result => result.Server)
+            .ToList();
+        var onlineCount = successful.Count(result => result.Online);
 
-        return new ToolExecutionResult(true, msg, server, false, Payload: root.ToString());
+        if (scope.ScopeKind == ServerScopeKind.Single && successful.Count == 1)
+        {
+            var single = successful[0];
+            var singleMessage = single.RecentErrors is { Count: > 0 }
+                ? $"{single.Server} is {single.State}. Recent errors: {string.Join(" | ", single.RecentErrors.Take(3))}"
+                : $"{single.Server} is {single.State}. No recent errors were reported.";
+
+            return new ToolExecutionResult(
+                true,
+                singleMessage,
+                single.Server,
+                false,
+                Payload: single,
+                SelectedServers: new[] { single.Server },
+                ScopeKind: ServerScopeKind.Single);
+        }
+
+        var aggregatePayload = new AggregateStatusPayload(
+            scope.ScopeKind == ServerScopeKind.Unspecified ? ServerScopeKind.Subset : scope.ScopeKind,
+            scope.Servers,
+            onlineCount,
+            offlineServers,
+            failedServers,
+            results);
+
+        var message = $"{onlineCount}/{scope.Servers.Count} servers are online.";
+        if (offlineServers.Count > 0)
+        {
+            message += $" Offline: {string.Join(", ", offlineServers)}.";
+        }
+
+        if (failedServers.Count > 0)
+        {
+            message += $" Failed to check: {string.Join(", ", failedServers)}.";
+        }
+
+        return new ToolExecutionResult(
+            successful.Count > 0,
+            message,
+            null,
+            false,
+            successful.Count > 0 ? null : "status_check_failed",
+            aggregatePayload,
+            scope.Servers,
+            scope.ScopeKind);
+    }
+
+    private async Task<AggregateStatusServerResult> CheckServerStatusAsync(string server, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var health = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", cancellationToken);
+            var root = health.RootElement;
+            var state = ReadHealthState(root);
+            var errors = root.TryGetProperty("recentErrors", out var errorsNode) && errorsNode.ValueKind == JsonValueKind.Array
+                ? errorsNode.EnumerateArray().Select(item => item.ToString()).Where(item => !string.IsNullOrWhiteSpace(item)).Take(3).ToList()
+                : new List<string>();
+
+            return new AggregateStatusServerResult(
+                server,
+                state,
+                IsOnlineState(state),
+                true,
+                null,
+                errors);
+        }
+        catch (Exception ex)
+        {
+            return new AggregateStatusServerResult(
+                server,
+                "unknown",
+                false,
+                false,
+                ex.Message,
+                Array.Empty<string>());
+        }
+    }
+
+    private static string ReadHealthState(JsonElement root)
+    {
+        if (root.TryGetProperty("status", out var statusNode) &&
+            statusNode.ValueKind == JsonValueKind.Object &&
+            statusNode.TryGetProperty("state", out var nestedState))
+        {
+            return nestedState.GetString() ?? "unknown";
+        }
+
+        return root.TryGetProperty("state", out var stateNode)
+            ? stateNode.GetString() ?? "unknown"
+            : "unknown";
+    }
+
+    private static bool IsOnlineState(string? state)
+    {
+        if (string.IsNullOrWhiteSpace(state))
+        {
+            return false;
+        }
+
+        return state.Equals("running", StringComparison.OrdinalIgnoreCase) ||
+               state.Equals("online", StringComparison.OrdinalIgnoreCase) ||
+               state.Equals("healthy", StringComparison.OrdinalIgnoreCase);
     }
 }
 
 internal sealed class RustServerControlToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
 
-    public RustServerControlToolHandler(RustOpsApiClient api)
+    public RustServerControlToolHandler(RustOpsApiClient api, Action<string, string, string?>? notifyAdmin = null)
     {
         _api = api;
+        _notifyAdmin = notifyAdmin;
     }
 
     public string Name => "rust.server.control";
@@ -59,43 +181,251 @@ internal sealed class RustServerControlToolHandler : IToolHandler
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
         var message = context.Message.ToLowerInvariant();
+
+        // If admin is answering our pending restart-countdown clarification ("60", "300 seconds", "5 min"),
+        // reconstruct the full restart intent from conversation state instead of falling through to /start.
+        var pending = context.SelectionState.PendingClarification;
+        if (pending is not null &&
+            string.Equals(pending.Intent, "ServerControl", StringComparison.OrdinalIgnoreCase) &&
+            pending.Question?.Contains("seconds", StringComparison.OrdinalIgnoreCase) == true &&
+            !string.IsNullOrWhiteSpace(context.SelectionState.LastServerName))
+        {
+            var secs = TryExtractAnyNumber(message);
+            if (secs.HasValue)
+                return await ExecuteRestartAsync(context, context.SelectionState.LastServerName, secs.Value, cancellationToken);
+        }
+
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for server control actions.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.ServerControl, knownServers, allowAllServers: false),
+                null, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        if (message.Contains("countdown") || message.Contains("in 3") || message.Contains("in three") || message.Contains("3 min"))
-        {
-            await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command", new { command = "say Server restart in 3 minutes" }, cancellationToken);
-            await Task.Delay(TimeSpan.FromMinutes(3), cancellationToken);
-            await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, cancellationToken);
-            return new ToolExecutionResult(true, $"Restart countdown executed for {server} with minimum 3 minutes.", server, true);
-        }
+        if (message.Contains("restart"))
+            return await HandleRestartAsync(context, server, cancellationToken);
 
         var endpoint = ResolveEndpoint(message);
+        if (endpoint is null)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"What should I do to {server}? Say start, stop, restart, kill, or update.",
+                server, false, "clarification_required",
+                SelectedServers: new[] { server },
+                ScopeKind: ServerScopeKind.Single);
+        }
+
         using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
         return new ToolExecutionResult(true, $"Executed {endpoint.Split('/').Last()} for {server}.", server, true, Payload: response.RootElement.ToString());
     }
 
-    private static string ResolveEndpoint(string message)
+    private async Task<ToolExecutionResult> HandleRestartAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
+    {
+        var seconds = ParseRestartSeconds(context.Message);
+        if (seconds is null)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"How many seconds should the countdown be before {server} restarts? (e.g., say 'restart {server} in 300 seconds')",
+                server, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Single);
+        }
+        return await ExecuteRestartAsync(context, server, seconds.Value, cancellationToken);
+    }
+
+    private async Task<ToolExecutionResult> ExecuteRestartAsync(ToolExecutionContext context, string server, int seconds, CancellationToken cancellationToken)
+    {
+
+        // Send RCON restart command (Rust's graceful countdown shutdown).
+        // If RCON is unavailable, fall back to the API restart endpoint which triggers rustmgr immediately.
+        var rconSent = false;
+        try
+        {
+            var rconResult = await RustDirectRconHelper.TryExecuteAsync(server, $"restart {seconds}", cancellationToken);
+            rconSent = !string.IsNullOrWhiteSpace(rconResult);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureMessage(
+                $"RCON restart command failed for '{server}', falling back to API.",
+                "agent.server-control", Sentry.SentryLevel.Warning,
+                extras: new Dictionary<string, object?> { ["server"] = server, ["exception"] = ex.Message });
+        }
+
+        if (!rconSent)
+        {
+            using var _ = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/restart", new { }, cancellationToken);
+        }
+
+        var method = rconSent ? $"RCON restart {seconds}s countdown" : "API restart (immediate)";
+        var adminId = context.AdminId;
+        var notifyAdmin = _notifyAdmin;
+        var api = _api;
+        var countdownSeconds = seconds;
+
+        // Background task: monitor offline → online transition and notify the admin.
+        _ = Task.Run(async () =>
+        {
+            await MonitorRestartAsync(server, countdownSeconds, adminId, notifyAdmin, api);
+        });
+
+        return new ToolExecutionResult(
+            true,
+            $"Restart initiated for {server} ({method}). I'll notify you when the server goes offline and again when it's back.",
+            server, true,
+            SelectedServers: new[] { server },
+            ScopeKind: ServerScopeKind.Single);
+    }
+
+    private static async Task MonitorRestartAsync(
+        string server, int countdownSeconds,
+        string adminId, Action<string, string, string?>? notifyAdmin, RustOpsApiClient api)
+    {
+        // Wait until close to when the server should shut down, then start polling.
+        var preWait = Math.Max(10, countdownSeconds - 15);
+        await Task.Delay(TimeSpan.FromSeconds(preWait));
+
+        // Phase 1: wait for the server to go offline (up to 5 min after the countdown expires).
+        var offlineDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(5);
+        var wentOffline = false;
+        while (DateTime.UtcNow < offlineDeadline)
+        {
+            if (!await IsServerOnlineAsync(server, api))
+            {
+                wentOffline = true;
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server is now offline — waiting for the process to restart.", server);
+                break;
+            }
+            await Task.Delay(TimeSpan.FromSeconds(12));
+        }
+
+        if (!wentOffline)
+        {
+            notifyAdmin?.Invoke(adminId, $"[{server}] Server did not appear to go offline within the expected window — please check manually.", server);
+            return;
+        }
+
+        // Phase 2: wait for the server process to come back (rustmgr.sh handles the actual restart).
+        // Rust servers have a bootstrapper phase followed by the long-lived server process; the
+        // health endpoint going to "running" means the server is fully up and accepting connections.
+        var onlineDeadline = DateTime.UtcNow + TimeSpan.FromMinutes(15);
+        var processUpNotified = false;
+        while (DateTime.UtcNow < onlineDeadline)
+        {
+            await Task.Delay(TimeSpan.FromSeconds(15));
+            var online = await IsServerOnlineAsync(server, api);
+
+            // Detect the moment the process first comes up (may still be loading).
+            if (!processUpNotified && await IsProcessUpAsync(server, api))
+            {
+                processUpNotified = true;
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server process is up — loading world, please wait.", server);
+            }
+
+            if (online)
+            {
+                notifyAdmin?.Invoke(adminId, $"[{server}] Server is back online and accepting connections. Restart complete.", server);
+                return;
+            }
+        }
+
+        notifyAdmin?.Invoke(adminId, $"[{server}] Server has been offline for 15 minutes and has not finished starting. Please investigate manually.", server);
+    }
+
+    private static async Task<bool> IsServerOnlineAsync(string server, RustOpsApiClient api)
+    {
+        try
+        {
+            using var health = await api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", CancellationToken.None);
+            var root = health.RootElement;
+            var state = ExtractState(root);
+            return state.Equals("running", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("online", StringComparison.OrdinalIgnoreCase) ||
+                   state.Equals("healthy", StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    private static async Task<bool> IsProcessUpAsync(string server, RustOpsApiClient api)
+    {
+        try
+        {
+            using var health = await api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/health", CancellationToken.None);
+            var root = health.RootElement;
+            var state = ExtractState(root);
+            return !string.Equals(state, "offline", StringComparison.OrdinalIgnoreCase) &&
+                   !string.Equals(state, "unknown", StringComparison.OrdinalIgnoreCase) &&
+                   !string.IsNullOrWhiteSpace(state);
+        }
+        catch { return false; }
+    }
+
+    private static string ExtractState(JsonElement root)
+    {
+        if (root.TryGetProperty("status", out var statusNode) &&
+            statusNode.ValueKind == JsonValueKind.Object &&
+            statusNode.TryGetProperty("state", out var nested))
+            return nested.GetString() ?? string.Empty;
+        return root.TryGetProperty("state", out var s) ? s.GetString() ?? string.Empty : string.Empty;
+    }
+
+    private static int? ParseRestartSeconds(string message)
+    {
+        // Patterns: "restart in 300 seconds", "restart 300s", "restart in 5 minutes", "restart 5min"
+        var minuteMatch = Regex.Match(message, @"restart\s+(?:in\s+)?(\d+)\s*(?:minute|min|m)\b", RegexOptions.IgnoreCase);
+        if (minuteMatch.Success && int.TryParse(minuteMatch.Groups[1].Value, out var mins))
+            return mins * 60;
+
+        var secondMatch = Regex.Match(message, @"restart\s+(?:in\s+)?(\d+)\s*(?:second|sec|s)?\b", RegexOptions.IgnoreCase);
+        if (secondMatch.Success && int.TryParse(secondMatch.Groups[1].Value, out var secs) && secs > 0)
+            return secs;
+
+        return null;
+    }
+
+    // Returns null when the message doesn't match a known operation — caller must handle.
+    private static string? ResolveEndpoint(string message)
     {
         if (message.Contains("kill")) return "/servers/{server}/kill";
         if (message.Contains("stop")) return "/servers/{server}/stop";
-        if (message.Contains("restart")) return "/servers/{server}/restart";
         if (message.Contains("update")) return "/servers/{server}/update";
-        return "/servers/{server}/start";
+        if (message.Contains("start")) return "/servers/{server}/start";
+        return null;
+    }
+
+    // Extracts any number from the message, preferring minute-scaled values.
+    private static int? TryExtractAnyNumber(string message)
+    {
+        var minMatch = Regex.Match(message, @"(\d+)\s*(?:minute|min)\b", RegexOptions.IgnoreCase);
+        if (minMatch.Success && int.TryParse(minMatch.Groups[1].Value, out var mins) && mins > 0)
+            return mins * 60;
+
+        var numMatch = Regex.Match(message, @"\b(\d+)\b");
+        if (numMatch.Success && int.TryParse(numMatch.Groups[1].Value, out var n) && n > 0)
+            return n;
+
+        return null;
     }
 }
 
 internal sealed class RustRconToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
-    private readonly RconRollingLogMonitor _rconLogMonitor = new();
+    private readonly NeoCortexStore _memory;
+    private readonly Core.Contracts.CommandExecutionSettings _cmdSettings;
 
-    public RustRconToolHandler(RustOpsApiClient api)
+    public RustRconToolHandler(RustOpsApiClient api, NeoCortexStore? memory = null, Core.Contracts.CommandExecutionSettings? cmdSettings = null)
     {
         _api = api;
+        _memory = memory ?? new NeoCortexStore("data/NeoCortex", "data/agent-state.json");
+        _cmdSettings = cmdSettings ?? new Core.Contracts.CommandExecutionSettings();
     }
 
     public string Name => "rust.rcon.command";
@@ -106,97 +436,146 @@ internal sealed class RustRconToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for RCON commands.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.RconCommand, knownServers, allowAllServers: false),
+                null, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
+        }
+
+        // If the admin asks for the live console/rolling log, return the RCON snapshot.
+        var msgLower = context.Message.ToLowerInvariant();
+        if (msgLower.Contains("console") || msgLower.Contains("rolling log") || msgLower.Contains("show log"))
+        {
+            var log = RustDirectRconHelper.GetRollingLog(server);
+            if (log.Count == 0)
+                return new ToolExecutionResult(true, $"No RCON console lines captured yet for {server}. The rolling log populates once the first RCON command is sent to that server.", server, false);
+            var preview = string.Join('\n', log.TakeLast(40));
+            return new ToolExecutionResult(true, $"RCON console ({log.Count} lines, last 40):\n{TruncateOutput(preview, 1200)}", server, false);
         }
 
         var command = context.Route.Slots.CommandText;
         if (string.IsNullOrWhiteSpace(command))
-        {
             command = ExtractCommand(context.Message);
-        }
 
         if (string.IsNullOrWhiteSpace(command))
+            return new ToolExecutionResult(false, "Which command should I run? Quote it or say 'run status'.", server, false, "clarification_required");
+
+        // Normalize: take only the first token for policy checks (e.g. "oxide.reload MyPlugin" → "oxide.reload")
+        var commandRoot = command.Split(' ', 2)[0].ToLowerInvariant();
+        var policyCheck = CheckCommandPolicy(commandRoot);
+        if (policyCheck is not null)
+            return new ToolExecutionResult(false, policyCheck, server, false, "policy_blocked");
+
+        string reply;
+        bool succeeded;
+        try
         {
-            return new ToolExecutionResult(false, "Command text is required.", server, false, "clarification_required");
+            var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
+            if (!string.IsNullOrWhiteSpace(directReply))
+            {
+                reply = $"RCON {server}: {TruncateOutput(directReply)}";
+                succeeded = true;
+            }
+            else
+            {
+                using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
+                var root = response.RootElement;
+                var apiReply = root.TryGetProperty("directReply", out var replyNode) ? replyNode.ToString() : "sent";
+                reply = $"RCON {server}: {TruncateOutput(apiReply)}";
+                succeeded = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            reply = $"Command failed on {server}: {ex.Message}";
+            succeeded = false;
         }
 
-        var directReply = await TryExecuteDirectRconAsync(server, command, cancellationToken);
-        if (!string.IsNullOrWhiteSpace(directReply))
+        RecordCommandOutcome(commandRoot, succeeded);
+        return new ToolExecutionResult(succeeded, reply, server, succeeded);
+    }
+
+    private string? CheckCommandPolicy(string commandRoot)
+    {
+        if (_cmdSettings.FreeMode)
+            return null;
+
+        var policy = _memory.LoadCommandPolicy();
+
+        if (policy.Commands.TryGetValue(commandRoot, out var record))
         {
-            return new ToolExecutionResult(true, $"RCON on {server}: {directReply}", server, true);
+            if (record.RequiresApproval)
+                return $"'{commandRoot}' has caused failures before and requires explicit admin approval to run.";
+            if (record.AutoAllowed)
+                return null;
         }
 
-        using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/command/exec", new { command }, cancellationToken);
-        var root = response.RootElement;
-        var apiReply = root.TryGetProperty("directReply", out var replyNode) ? replyNode.ToString() : "command sent";
-        return new ToolExecutionResult(true, $"RCON on {server}: {apiReply}", server, true, Payload: root.ToString());
+        // Check static allowList
+        if (_cmdSettings.AllowList.Any(prefix => commandRoot.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            return null;
+
+        return $"'{commandRoot}' is not on the allowed list. Run it via direct RCON, or say 'allow {commandRoot}' to add it.";
+    }
+
+    private void RecordCommandOutcome(string commandRoot, bool succeeded)
+    {
+        try
+        {
+            var policy = _memory.LoadCommandPolicy();
+            if (!policy.Commands.TryGetValue(commandRoot, out var record))
+            {
+                record = new CommandRecord { Command = commandRoot };
+                policy.Commands[commandRoot] = record;
+            }
+
+            record.LastUsedUtc = DateTime.UtcNow;
+            if (succeeded)
+            {
+                record.SuccessCount++;
+                if (record.SuccessCount >= _cmdSettings.AutoAllowAfterSuccesses && !record.RequiresApproval)
+                    record.AutoAllowed = true;
+            }
+            else
+            {
+                record.FailCount++;
+                if (record.FailCount >= _cmdSettings.RequireApprovalAfterFailures)
+                    record.RequiresApproval = true;
+            }
+
+            _memory.SaveCommandPolicy(policy);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureException(ex, "Failed to record command policy outcome.", "agent.policy");
+        }
+    }
+
+    private static string TruncateOutput(string output, int maxChars = 800)
+    {
+        output = output.Trim();
+        return output.Length > maxChars ? output[..maxChars] + "…" : output;
     }
 
     private static string ExtractCommand(string message)
     {
         var quoted = Regex.Match(message, "\"(?<cmd>.+?)\"");
         if (quoted.Success)
-        {
             return quoted.Groups["cmd"].Value.Trim();
-        }
 
         var lowered = message.ToLowerInvariant();
-        var markers = new[] { "command", "rcon", "run", "execute", "send" };
-        foreach (var marker in markers)
+        foreach (var marker in new[] { "command", "rcon", "run", "execute", "send" })
         {
             var idx = lowered.IndexOf(marker, StringComparison.Ordinal);
-            if (idx < 0)
-            {
-                continue;
-            }
-
+            if (idx < 0) continue;
             var candidate = message[(idx + marker.Length)..].Trim(' ', ':', '"', '\'', '.');
             if (!string.IsNullOrWhiteSpace(candidate))
-            {
                 return candidate;
-            }
         }
 
         return string.Empty;
-    }
-
-    private async Task<string?> TryExecuteDirectRconAsync(string server, string command, CancellationToken cancellationToken)
-    {
-        try
-        {
-            var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
-            var configPath = Path.Combine(configRoot, $"{server}.json");
-            if (!File.Exists(configPath))
-            {
-                return null;
-            }
-
-            using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
-            var root = cfg.RootElement;
-            var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
-                ? portNode.GetInt32()
-                : 0;
-            var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
-                ? passwordNode.GetString()
-                : null;
-
-            if (port <= 0 || string.IsNullOrWhiteSpace(password))
-            {
-                return null;
-            }
-
-            var encodedPassword = Uri.EscapeDataString(password);
-            var uri = new Uri($"ws://127.0.0.1:{port}/{encodedPassword}");
-
-            await using IRconClient client = new RustRconClient();
-            _rconLogMonitor.Attach(client);
-            await client.ConnectAsync(uri, password, cancellationToken);
-            return await client.SendCommandAsync(command, cancellationToken);
-        }
-        catch
-        {
-            return null;
-        }
     }
 }
 
@@ -217,7 +596,28 @@ internal sealed class RustPlayerLookupToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for player lookup.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.PlayerLookup, knownServers, allowAllServers: false),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
+        }
+
+        var command = context.Message.Contains("ban", StringComparison.OrdinalIgnoreCase)
+            ? "bans"
+            : "playerlist";
+        var directReply = await RustDirectRconHelper.TryExecuteAsync(server, command, cancellationToken);
+        if (!string.IsNullOrWhiteSpace(directReply))
+        {
+            var payload = TryExtractStructuredReply(directReply);
+            if (!string.IsNullOrWhiteSpace(payload))
+            {
+                return new ToolExecutionResult(true, payload, server, false, Payload: payload);
+            }
         }
 
         var endpoint = context.Message.Contains("ban", StringComparison.OrdinalIgnoreCase)
@@ -226,6 +626,22 @@ internal sealed class RustPlayerLookupToolHandler : IToolHandler
 
         using var response = await _api.GetAsync(endpoint, cancellationToken);
         return new ToolExecutionResult(true, response.RootElement.ToString(), server, false, Payload: response.RootElement.ToString());
+    }
+
+    private static string? TryExtractStructuredReply(string reply)
+    {
+        var start = reply.IndexOf('{');
+        var end = reply.LastIndexOf('}');
+        if (start >= 0 && end > start)
+        {
+            return reply[start..(end + 1)];
+        }
+
+        start = reply.IndexOf('[');
+        end = reply.LastIndexOf(']');
+        return start >= 0 && end > start
+            ? reply[start..(end + 1)]
+            : null;
     }
 }
 
@@ -248,7 +664,15 @@ internal sealed class RustLogsToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for log inspection.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.StatusCheck, knownServers, allowAllServers: true),
+                null,
+                false,
+                "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
         using var logs = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/logs/tail?lines=120", cancellationToken);
@@ -301,9 +725,10 @@ internal sealed class RustLogsToolHandler : IToolHandler
 
     private static int ScoreImportance(string line, IEnumerable<string> dynamicRules)
     {
-        if (line.Contains("exception") || line.Contains("failed") || line.Contains("error")) return 3;
-        if (line.Contains("warn") || line.Contains("disconnect")) return 2;
-        if (dynamicRules.Any(rule => line.Contains(rule, StringComparison.OrdinalIgnoreCase))) return 2;
+        var normalizedLine = line.ToLowerInvariant();
+        if (normalizedLine.Contains("exception") || normalizedLine.Contains("failed") || normalizedLine.Contains("error")) return 3;
+        if (normalizedLine.Contains("warn") || normalizedLine.Contains("disconnect")) return 2;
+        if (dynamicRules.Any(rule => normalizedLine.Contains(rule, StringComparison.OrdinalIgnoreCase))) return 2;
         return 1;
     }
 }
@@ -311,11 +736,17 @@ internal sealed class RustLogsToolHandler : IToolHandler
 internal sealed class RustPluginToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
-    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(12) };
+    private readonly Core.Contracts.PluginUpdateSettings _settings;
+    private static readonly HttpClient _http = new(new HttpClientHandler { AllowAutoRedirect = true })
+    {
+        Timeout = TimeSpan.FromSeconds(15),
+        DefaultRequestHeaders = { { "User-Agent", "RustOpsAgent/1.0 (server-ops-bot)" } }
+    };
 
-    public RustPluginToolHandler(RustOpsApiClient api)
+    public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null)
     {
         _api = api;
+        _settings = settings ?? new Core.Contracts.PluginUpdateSettings();
     }
 
     public string Name => "rust.plugins.verify";
@@ -326,69 +757,181 @@ internal sealed class RustPluginToolHandler : IToolHandler
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
-            return new ToolExecutionResult(false, "Server name is required for plugin checks.", null, false, "clarification_required");
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.StatusCheck, knownServers, allowAllServers: true),
+                null, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
         }
 
-        using var validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
+        var msgLow = context.Message.ToLowerInvariant();
+        var wantsCompileCheck = msgLow.Contains("error") || msgLow.Contains("fail") || msgLow.Contains("compile")
+                                || msgLow.Contains("issue") || msgLow.Contains("broken") || msgLow.Contains("check");
+        var wantsInstall = msgLow.Contains("install") || msgLow.Contains("update") || msgLow.Contains("download");
 
-        var updateMessages = new List<string>();
-        if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
+        // --- Step 1: RCON oxide.plugins for live compile status --------------------------------
+        if (wantsCompileCheck)
         {
-            foreach (var plugin in plugins.EnumerateArray().Take(12))
+            var rconOutput = await RustDirectRconHelper.TryExecuteAsync(server, "oxide.plugins", cancellationToken);
+            if (!string.IsNullOrWhiteSpace(rconOutput))
             {
-                var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
-                var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
-                var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
-                var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
-                if (string.IsNullOrWhiteSpace(query))
+                var lines = rconOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                var failed = lines.Where(l => l.Contains("failed to compile", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (failed.Count > 0)
                 {
-                    continue;
+                    return new ToolExecutionResult(true,
+                        $"[{server}] {failed.Count} plugin(s) failed to compile:\n{string.Join('\n', failed)}",
+                        server, false);
                 }
 
-                var escaped = Uri.EscapeDataString(query);
-                var url = $"https://umod.org/plugins/search.json?query={escaped}&page=1&sort=title&sortdir=asc&filter=rust";
-                try
-                {
-                    using var stream = await _http.GetStreamAsync(url, cancellationToken);
-                    using var responseDoc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
-                    if (!responseDoc.RootElement.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Array || data.GetArrayLength() == 0)
-                    {
-                        updateMessages.Add($"{query}: non-uMod or not found (informational)");
-                        continue;
-                    }
-
-                    var latest = data[0].TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
-                    if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
-                    {
-                        updateMessages.Add($"{query}: up to date");
-                    }
-                    else
-                    {
-                        updateMessages.Add($"{query}: update {pluginVersion ?? "unknown"} -> {latest}");
-                    }
-                }
-                catch
-                {
-                    updateMessages.Add($"{query}: update check unavailable");
-                }
+                var totalLoaded = lines.Count(l => l.TrimStart().StartsWith('[') || Regex.IsMatch(l, @"^\s*\w.*\(\d+ms\)"));
+                var summary = $"[{server}] All plugins loaded OK ({totalLoaded} reported). No compile errors.";
+                if (!wantsInstall)
+                    return new ToolExecutionResult(true, summary, server, false);
             }
         }
 
-        var summary = updateMessages.Count > 0
-            ? string.Join(" | ", updateMessages.Take(8))
-            : "No plugin update metadata available.";
+        // --- Step 2: oxide/validate for file-level info + uMod version check ----------------
+        JsonDocument? validate = null;
+        try
+        {
+            validate = await _api.GetAsync($"/servers/{Uri.EscapeDataString(server)}/oxide/validate", cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            return new ToolExecutionResult(false,
+                $"Could not reach oxide/validate for {server}: {ex.Message}",
+                server, false, "api_error");
+        }
 
-        return new ToolExecutionResult(true, $"Plugin validation for {server} complete. {summary}", server, false);
+        using (validate)
+        {
+            var updateMessages = new List<string>();
+            var pendingDownloads = new List<(string slug, string latestVersion, string downloadUrl)>();
+
+            if (validate.RootElement.TryGetProperty("plugins", out var plugins) && plugins.ValueKind == JsonValueKind.Array)
+            {
+                // Show any file-level issues from the validator
+                var fileIssues = plugins.EnumerateArray()
+                    .Where(p => p.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
+                    .Select(p => $"{(p.TryGetProperty("pluginName", out var n) ? n.GetString() : "?")}: {(p.TryGetProperty("message", out var m) ? m.GetString() : "validation error")}")
+                    .ToList();
+
+                foreach (var plugin in plugins.EnumerateArray().Take(20))
+                {
+                    var pluginName = plugin.TryGetProperty("pluginName", out var nameNode) ? nameNode.GetString() : null;
+                    var pluginSlug = plugin.TryGetProperty("pluginSlug", out var slugNode) ? slugNode.GetString() : null;
+                    var pluginVersion = plugin.TryGetProperty("pluginVersion", out var versionNode) ? versionNode.GetString() : null;
+                    var query = !string.IsNullOrWhiteSpace(pluginSlug) ? pluginSlug : pluginName;
+                    if (string.IsNullOrWhiteSpace(query)) continue;
+
+                    var searchUrl = string.Format(_settings.SearchUrlTemplate, Uri.EscapeDataString(query), _settings.SearchFilter);
+                    try
+                    {
+                        using var httpResponse = await _http.GetAsync(searchUrl, cancellationToken);
+                        if (!httpResponse.IsSuccessStatusCode)
+                        {
+                            updateMessages.Add($"{query}: uMod returned {(int)httpResponse.StatusCode}");
+                            continue;
+                        }
+
+                        using var responseDoc = await JsonDocument.ParseAsync(
+                            await httpResponse.Content.ReadAsStreamAsync(cancellationToken), cancellationToken: cancellationToken);
+
+                        if (!responseDoc.RootElement.TryGetProperty("data", out var data)
+                            || data.ValueKind != JsonValueKind.Array
+                            || data.GetArrayLength() == 0)
+                        {
+                            updateMessages.Add($"{query}: not found on uMod");
+                            continue;
+                        }
+
+                        var entry = data[0];
+                        var latest = entry.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+                        var downloadUrl = entry.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
+
+                        if (string.IsNullOrWhiteSpace(latest) || string.Equals(latest, pluginVersion, StringComparison.OrdinalIgnoreCase))
+                            updateMessages.Add($"{query}: up to date ({pluginVersion ?? "?"})");
+                        else
+                        {
+                            updateMessages.Add($"{query}: {pluginVersion ?? "?"} → {latest}");
+                            if (!string.IsNullOrWhiteSpace(downloadUrl))
+                                pendingDownloads.Add((query, latest, downloadUrl));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        updateMessages.Add($"{query}: check failed ({ex.Message.Split('\n')[0]})");
+                    }
+                }
+
+                if (fileIssues.Count > 0)
+                    updateMessages.Insert(0, $"FILE ISSUES: {string.Join(" | ", fileIssues)}");
+            }
+
+            var versionSummary = updateMessages.Count > 0
+                ? string.Join(" | ", updateMessages)
+                : "No plugin files found at the configured oxide path.";
+
+            if (wantsInstall && _settings.DownloadEnabled && pendingDownloads.Count > 0)
+            {
+                var staged = await StageDownloadsAsync(server, pendingDownloads, cancellationToken);
+                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{staged}", server, false);
+            }
+
+            var actionHint = pendingDownloads.Count > 0 && _settings.DownloadEnabled
+                ? $" ({pendingDownloads.Count} update(s) available — say 'install updates' to apply)"
+                : string.Empty;
+
+            return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}", server, false);
+        }
+    }
+
+    private async Task<string> StageDownloadsAsync(
+        string server,
+        IReadOnlyList<(string slug, string version, string url)> downloads,
+        CancellationToken cancellationToken)
+    {
+        Directory.CreateDirectory(_settings.StagingPath);
+        var staged = new List<string>();
+        var failed = new List<string>();
+
+        foreach (var (slug, version, url) in downloads)
+        {
+            try
+            {
+                var fileName = $"{slug}.cs";
+                var dest = Path.Combine(_settings.StagingPath, fileName);
+                var bytes = await _http.GetByteArrayAsync(url, cancellationToken);
+                await File.WriteAllBytesAsync(dest, bytes, cancellationToken);
+                staged.Add($"{slug} v{version}");
+                Console.WriteLine($"[plugins] Staged {fileName} ({bytes.Length} bytes)");
+            }
+            catch (Exception ex)
+            {
+                failed.Add(slug);
+                Console.WriteLine($"[plugins] Download failed for {slug}: {ex.Message}");
+            }
+        }
+
+        var result = staged.Count > 0 ? $"Staged: {string.Join(", ", staged)}." : string.Empty;
+        if (failed.Count > 0)
+            result += $" Failed: {string.Join(", ", failed)}.";
+        return result.Trim();
     }
 }
 
 internal sealed class RustNetworkToolHandler : IToolHandler
 {
     private readonly RustOpsApiClient _api;
+    private readonly IReadOnlyList<string> _trackedInterfaces;
 
-    public RustNetworkToolHandler(RustOpsApiClient api)
+    public RustNetworkToolHandler(RustOpsApiClient api, IReadOnlyList<string>? trackedInterfaces = null)
     {
         _api = api;
+        _trackedInterfaces = trackedInterfaces ?? new[] { "eth0", "wt1", "wg1" };
     }
 
     public string Name => "rust.network.inspect";
@@ -404,10 +947,8 @@ internal sealed class RustNetworkToolHandler : IToolHandler
             foreach (var item in interfaces.EnumerateArray())
             {
                 var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
-                if (name is not ("eth0" or "wt1" or "wg1"))
-                {
+                if (name is null || !_trackedInterfaces.Contains(name, StringComparer.OrdinalIgnoreCase))
                     continue;
-                }
 
                 var rx = item.TryGetProperty("rxRateMiBps", out var rxNode) ? rxNode.ToString() : "0";
                 var tx = item.TryGetProperty("txRateMiBps", out var txNode) ? txNode.ToString() : "0";
@@ -415,8 +956,9 @@ internal sealed class RustNetworkToolHandler : IToolHandler
             }
         }
 
+        var ifaceList = string.Join(", ", _trackedInterfaces);
         var message = selected.Count == 0
-            ? "No matching interfaces (eth0, wt1, wg1) were available in current network sample."
+            ? $"No tracked interfaces ({ifaceList}) found in current network sample."
             : string.Join(" | ", selected);
 
         return new ToolExecutionResult(true, message);
@@ -427,26 +969,53 @@ internal static class RustToolHelper
 {
     public static async Task<string?> ResolveServerAsync(RustOpsApiClient api, ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        if (!string.IsNullOrWhiteSpace(context.Route.Slots.ServerName))
-            return context.Route.Slots.ServerName;
-
-        if (ShouldUseLastServer(context.Message) && !string.IsNullOrWhiteSpace(context.SelectionState.LastServerName))
-            return context.SelectionState.LastServerName;
-
         var knownServers = await GetKnownServersAsync(api, cancellationToken);
-        if (knownServers.Count == 0)
-            return context.SelectionState.LastServerName;
+        var scope = ResolveServerScope(
+            context,
+            knownServers,
+            allowPluralDefaultAll: false);
+        return scope.Servers.Count == 1
+            ? scope.Servers[0]
+            : null;
+    }
 
-        var lowered = context.Message.ToLowerInvariant();
-        foreach (var server in knownServers)
+    public static ScopeResolution ResolveServerScope(
+        ToolExecutionContext context,
+        IReadOnlyList<string> knownServers,
+        bool allowPluralDefaultAll)
+    {
+        return ServerScopeResolver.Resolve(
+            context.Message,
+            knownServers,
+            context.SelectionState,
+            context.Route.Slots.ScopeKind,
+            context.Route.Slots.ServerNames,
+            context.Route.Slots.ServerName,
+            allowPluralDefaultAll,
+            allowLastScopeFallback: true);
+    }
+
+    public static string BuildScopeClarificationQuestion(
+        AdminIntentType intent,
+        IReadOnlyList<string> knownServers,
+        bool allowAllServers)
+    {
+        var known = knownServers.Count == 0
+            ? "No configured servers are currently available."
+            : $"Known servers: {string.Join(", ", knownServers)}.";
+
+        if (!allowAllServers)
         {
-            if (lowered.Contains(server.ToLowerInvariant(), StringComparison.Ordinal))
+            return intent switch
             {
-                return server;
-            }
+                AdminIntentType.ServerControl => $"Which single server should I target? {known}",
+                AdminIntentType.RconCommand => $"Which server should receive this command? {known}",
+                AdminIntentType.PlayerLookup => $"Which server should I query for players? {known}",
+                _ => $"Which server should I use? {known}"
+            };
         }
 
-        return knownServers.Count == 1 ? knownServers[0] : context.SelectionState.LastServerName;
+        return $"Which server should I check? You can name one server or say 'all servers'. {known}";
     }
 
     public static async Task<List<string>> GetKnownServersAsync(RustOpsApiClient api, CancellationToken cancellationToken)
@@ -454,26 +1023,177 @@ internal static class RustToolHelper
         try
         {
             using var list = await api.GetAsync("/servers", cancellationToken);
-            return list.RootElement.ValueKind == JsonValueKind.Array
-                ? list.RootElement.EnumerateArray()
-                    .Where(node => node.ValueKind == JsonValueKind.String)
-                    .Select(node => node.GetString())
-                    .Where(name => !string.IsNullOrWhiteSpace(name))
-                    .Select(name => name!)
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
-                    .ToList()
-                : new List<string>();
+            var knownServers = ParseKnownServers(list.RootElement).ToList();
+            if (knownServers.Count > 0)
+            {
+                return knownServers;
+            }
+
+            using var summary = await api.GetAsync("/servers/summary", cancellationToken);
+            return ParseSummaryServers(summary.RootElement).ToList();
         }
-        catch
+        catch (Exception ex)
         {
+            RustOpsSentry.CaptureException(
+                ex,
+                "Failed to retrieve known server list from API.",
+                "agent.api");
             return new List<string>();
         }
     }
 
-    private static bool ShouldUseLastServer(string message)
+    internal static IReadOnlyList<string> ParseKnownServers(JsonElement root)
     {
-        var lowered = message.ToLowerInvariant();
-        return lowered.Contains("that one") || lowered.Contains("same server") || lowered.Contains("again") || lowered.Contains("it ");
+        if (root.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        var names = new List<string>();
+        foreach (var node in root.EnumerateArray())
+        {
+            if (node.ValueKind == JsonValueKind.String)
+            {
+                var value = node.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    names.Add(value.Trim());
+                }
+                continue;
+            }
+
+            if (node.ValueKind == JsonValueKind.Object &&
+                node.TryGetProperty("name", out var nameNode) &&
+                nameNode.ValueKind == JsonValueKind.String)
+            {
+                var value = nameNode.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    names.Add(value.Trim());
+                }
+            }
+        }
+
+        return names
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static IReadOnlyList<string> ParseSummaryServers(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Array)
+        {
+            return Array.Empty<string>();
+        }
+
+        return root.EnumerateArray()
+            .Where(node => node.ValueKind == JsonValueKind.Object &&
+                           node.TryGetProperty("name", out var nameNode) &&
+                           nameNode.ValueKind == JsonValueKind.String)
+            .Select(node => node.GetProperty("name").GetString())
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Select(name => name!.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+}
+
+internal static class RustDirectRconHelper
+{
+    private static readonly ConcurrentDictionary<string, PersistentRconSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
+
+    public static IReadOnlyList<string> GetRollingLog(string server)
+    {
+        if (Sessions.TryGetValue(server, out var session))
+            return session.Snapshot();
+        return Array.Empty<string>();
+    }
+
+    public static async Task<string?> TryExecuteAsync(string server, string command, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var connection = LoadConnection(server);
+            if (connection is null)
+            {
+                return null;
+            }
+
+            var session = GetOrCreateSession(server, connection.Value.Uri, connection.Value.Password);
+            return await session.SendCommandAsync(command, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureMessage(
+                $"Direct RCON failed for '{server}'.",
+                "agent.rcon",
+                SentryLevel.Warning,
+                extras: new Dictionary<string, object?>
+                {
+                    ["server"] = server,
+                    ["command"] = command,
+                    ["exception"] = ex.Message
+                });
+            return null;
+        }
+    }
+
+    private static PersistentRconSession GetOrCreateSession(string server, Uri uri, string password)
+    {
+        while (true)
+        {
+            if (Sessions.TryGetValue(server, out var existing))
+            {
+                if (existing.Matches(uri, password))
+                {
+                    return existing;
+                }
+
+                if (Sessions.TryRemove(server, out var stale))
+                {
+                    _ = stale.DisposeAsync().AsTask();
+                }
+            }
+
+            var created = new PersistentRconSession(uri, password);
+            if (Sessions.TryAdd(server, created))
+            {
+                return created;
+            }
+
+            _ = created.DisposeAsync().AsTask();
+        }
+    }
+
+    private static (Uri Uri, string Password)? LoadConnection(string server)
+    {
+        var configRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
+        var configPath = Path.Combine(configRoot, $"{server}.json");
+        if (!File.Exists(configPath))
+        {
+            return null;
+        }
+
+        using var cfg = JsonDocument.Parse(File.ReadAllText(configPath));
+        var root = cfg.RootElement;
+        var host = root.TryGetProperty("rcon.ip", out var ipNode) && ipNode.ValueKind == JsonValueKind.String
+            ? ipNode.GetString() ?? "127.0.0.1"
+            : "127.0.0.1";
+        var port = root.TryGetProperty("rcon.port", out var portNode) && portNode.ValueKind == JsonValueKind.Number
+            ? portNode.GetInt32()
+            : 0;
+        var password = root.TryGetProperty("rcon.password", out var passwordNode) && passwordNode.ValueKind == JsonValueKind.String
+            ? passwordNode.GetString()
+            : null;
+
+        if (port <= 0 || string.IsNullOrWhiteSpace(password))
+        {
+            return null;
+        }
+
+        var encodedPassword = Uri.EscapeDataString(password);
+        return (new Uri($"ws://{host}:{port}/{encodedPassword}"), password);
     }
 }

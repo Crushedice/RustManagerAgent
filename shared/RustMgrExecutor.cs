@@ -93,7 +93,17 @@ internal sealed class RustMgrExecutor
         }
         catch (Exception ex)
         {
-            SentrySdk.CaptureException(ex);
+            RustOpsSentry.CaptureException(
+                ex,
+                $"rustmgr '{action}' execution failed.",
+                "rustmgr",
+                tags: new Dictionary<string, string?> { ["rustmgr.action"] = action },
+                extras: new Dictionary<string, object?>
+                {
+                    ["arguments"] = args.ToArray(),
+                    ["workingDirectory"] = ResolveWorkingDirectory(),
+                    ["rustMgrPath"] = _rustMgrPath
+                });
             return new CommandExecutionResult
             {
                 Ok = false,
@@ -219,7 +229,7 @@ internal sealed class RustMgrExecutor
         };
     }
 
-    public async Task<bool?> WaitForExpectedServerStateAsync(string server, string operation, int attempts = 5, int delaySeconds = 2)
+    public async Task<bool?> WaitForExpectedServerStateAsync(string server, string operation)
     {
         var verification = await VerifyExpectedServerStateAsync(server, operation);
         return verification?.ReachedExpectedState;

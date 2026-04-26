@@ -6,15 +6,17 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/rust-manager/agent/RustOpsAgent
-ExecStart=/usr/bin/dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll /opt/rust-manager/agent/RustOpsAgent/agentsettings.json
+ExecStart=/usr/bin/dotnet /opt/rust-manager/agent/RustOpsAgent/RustOpsAgent.dll --config /opt/rust-manager/agent/RustOpsAgent/agentsettings.json
 Restart=always
 RestartSec=5
 User=rustmgr
 Group=rustmgr
-EnvironmentFile=-/opt/rust-manager/config/rustops.env
+EnvironmentFile=-/opt/rust-manager/config.env
 Environment=HOME=/opt/rust-manager
 Environment=DOTNET_CLI_HOME=/opt/rust-manager
 Environment=TMPDIR=/tmp
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

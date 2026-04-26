@@ -13,8 +13,13 @@ internal sealed class NeoCortexStore : IEvolutionStore
     private readonly string _logsPath;
     private readonly string _evolutionPath;
     private readonly string _policyPath;
+    private readonly string _commandPolicyPath;
     private readonly string _cachePath;
     private readonly string _migrationMarkerPath;
+    private readonly string _consolePath;
+    private readonly string _playerChatPath;
+    private readonly string _classifierPath;
+    private readonly SemaphoreSlim _incidentWriteLock = new(1, 1);
 
     public NeoCortexStore(string root, string legacyStatePath)
     {
@@ -25,8 +30,12 @@ internal sealed class NeoCortexStore : IEvolutionStore
         _logsPath = Path.Combine(root, "logs", "log-knowledge.json");
         _evolutionPath = Path.Combine(root, "evolution", "incidents.jsonl");
         _policyPath = Path.Combine(root, "policy", "ignore-feedback.json");
+        _commandPolicyPath = Path.Combine(root, "policy", "command-policy.json");
         _cachePath = Path.Combine(root, "cache", "domain-cache.json");
         _migrationMarkerPath = Path.Combine(root, ".migration-complete");
+        _consolePath = Path.Combine(root, "console", "monitor.json");
+        _playerChatPath = Path.Combine(root, "chat", "knowledge.json");
+        _classifierPath = Path.Combine(root, "classifier", "knowledge.json");
 
         Directory.CreateDirectory(Path.GetDirectoryName(_operationsPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_selectionPath)!);
@@ -34,6 +43,9 @@ internal sealed class NeoCortexStore : IEvolutionStore
         Directory.CreateDirectory(Path.GetDirectoryName(_evolutionPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_policyPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(_cachePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_consolePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_classifierPath)!);
     }
 
     public void EnsureMigrated()
@@ -120,11 +132,11 @@ internal sealed class NeoCortexStore : IEvolutionStore
             }
         }
 
-        SaveJson(_operationsPath, active);
-        SaveJson(_selectionPath, selection);
-        SaveJson(_logsPath, logs);
-        SaveJson(_policyPath, policy);
-        SaveJson(_cachePath, cache);
+        if (!File.Exists(_operationsPath)) SaveJson(_operationsPath, active);
+        if (!File.Exists(_selectionPath)) SaveJson(_selectionPath, selection);
+        if (!File.Exists(_logsPath)) SaveJson(_logsPath, logs);
+        if (!File.Exists(_policyPath)) SaveJson(_policyPath, policy);
+        if (!File.Exists(_cachePath)) SaveJson(_cachePath, cache);
         if (!File.Exists(_evolutionPath))
         {
             File.WriteAllText(_evolutionPath, string.Empty);
@@ -137,18 +149,71 @@ internal sealed class NeoCortexStore : IEvolutionStore
     public SelectionSessionState LoadSelection() => LoadJson(_selectionPath, new SelectionSessionState());
     public LogKnowledgeState LoadLogs() => LoadJson(_logsPath, new LogKnowledgeState());
     public IgnoreFeedbackState LoadIgnoreFeedback() => LoadJson(_policyPath, new IgnoreFeedbackState());
+    public CommandPolicyState LoadCommandPolicy() => LoadJson(_commandPolicyPath, new CommandPolicyState());
     public DomainCacheState LoadCache() => LoadJson(_cachePath, new DomainCacheState());
 
     public void SaveOperations(ActiveOperationalState state) => SaveJson(_operationsPath, state);
     public void SaveSelection(SelectionSessionState state) => SaveJson(_selectionPath, state);
     public void SaveLogs(LogKnowledgeState state) => SaveJson(_logsPath, state);
     public void SaveIgnoreFeedback(IgnoreFeedbackState state) => SaveJson(_policyPath, state);
+    public void SaveCommandPolicy(CommandPolicyState state) => SaveJson(_commandPolicyPath, state);
     public void SaveCache(DomainCacheState state) => SaveJson(_cachePath, state);
+
+    public ConsoleMonitorState LoadConsoleMonitor() => LoadJson(_consolePath, new ConsoleMonitorState());
+    public void SaveConsoleMonitor(ConsoleMonitorState state) => SaveJson(_consolePath, state);
+
+    public PlayerChatKnowledge LoadPlayerChat() => LoadJson(_playerChatPath, new PlayerChatKnowledge());
+    public void SavePlayerChat(PlayerChatKnowledge knowledge) => SaveJson(_playerChatPath, knowledge);
+
+    public ClassifierKnowledgeState LoadClassifierKnowledge() => LoadJson(_classifierPath, new ClassifierKnowledgeState());
+    public void SaveClassifierKnowledge(ClassifierKnowledgeState state) => SaveJson(_classifierPath, state);
+
+    /// <summary>
+    /// Moves all current log entries to a dated digest file and resets RecentEntries.
+    /// Called once per UTC day to prevent unbounded log accumulation.
+    /// Keeps the last 7 daily digest files.
+    /// </summary>
+    public void ArchiveAndResetLogs(string isoDate)
+    {
+        var logs = LoadLogs();
+        if (logs.RecentEntries.Count > 0)
+        {
+            var digestDir = Path.Combine(_root, "logs", "digests");
+            Directory.CreateDirectory(digestDir);
+            var digestPath = Path.Combine(digestDir, $"{isoDate}.jsonl");
+            var lines = logs.RecentEntries.Select(e => JsonSerializer.Serialize(e, JsonlOptions));
+            File.AppendAllLines(digestPath, lines);
+
+            // Prune digests older than 7 days
+            foreach (var old in Directory.GetFiles(digestDir, "*.jsonl").OrderByDescending(f => f).Skip(7))
+                try { File.Delete(old); } catch { /* ignore prune failures */ }
+        }
+
+        logs.RecentEntries.Clear();
+        logs.LastDigestDateUtc = DateTime.UtcNow;
+        SaveLogs(logs);
+    }
+
+    // Compact (non-indented) options for JSONL — one object per line is required.
+    private static readonly JsonSerializerOptions JsonlOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = false
+    };
 
     public async Task RecordIncidentAsync(EvolutionIncidentRecord incident, CancellationToken cancellationToken)
     {
-        var line = JsonSerializer.Serialize(incident, JsonDefaults.Default) + Environment.NewLine;
-        await File.AppendAllTextAsync(_evolutionPath, line, Encoding.UTF8, cancellationToken);
+        var line = JsonSerializer.Serialize(incident, JsonlOptions) + "\n";
+        await _incidentWriteLock.WaitAsync(cancellationToken);
+        try
+        {
+            await File.AppendAllTextAsync(_evolutionPath, line, Encoding.UTF8, cancellationToken);
+        }
+        finally
+        {
+            _incidentWriteLock.Release();
+        }
     }
 
     public async Task<EvolutionReviewResult> ReviewAsync(CancellationToken cancellationToken)
@@ -162,13 +227,19 @@ internal sealed class NeoCortexStore : IEvolutionStore
         var lines = await File.ReadAllLinesAsync(_evolutionPath, cancellationToken);
         foreach (var line in lines.Where(static l => !string.IsNullOrWhiteSpace(l)))
         {
+            // Skip obviously malformed JSONL lines — partial writes, leftover braces, etc.
+            var trimmed = line.TrimStart();
+            if (trimmed.Length == 0 || trimmed[0] != '{')
+                continue;
+
             EvolutionIncidentRecord? record;
             try
             {
-                record = JsonSerializer.Deserialize<EvolutionIncidentRecord>(line, JsonDefaults.Default);
+                record = JsonSerializer.Deserialize<EvolutionIncidentRecord>(trimmed, JsonDefaults.Default);
             }
             catch
             {
+                // Silently skip malformed lines — corrupt entries are non-recoverable.
                 continue;
             }
 
@@ -207,6 +278,8 @@ internal sealed class NeoCortexStore : IEvolutionStore
         if (!File.Exists(_policyPath)) SaveJson(_policyPath, new IgnoreFeedbackState());
         if (!File.Exists(_cachePath)) SaveJson(_cachePath, new DomainCacheState());
         if (!File.Exists(_evolutionPath)) File.WriteAllText(_evolutionPath, string.Empty);
+        Directory.CreateDirectory(Path.GetDirectoryName(_consolePath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
     }
 
     private static T LoadJson<T>(string path, T fallback)
