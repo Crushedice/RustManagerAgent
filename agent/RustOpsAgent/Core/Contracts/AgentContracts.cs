@@ -30,7 +30,9 @@ internal sealed record AdminIntentSlots(
     string? TimeRange,
     string? Severity,
     ServerScopeKind ScopeKind = ServerScopeKind.Unspecified,
-    IReadOnlyList<string>? ServerNames = null);
+    IReadOnlyList<string>? ServerNames = null,
+    string? ConfigKey = null,
+    string? ConfigValue = null);
 
 internal sealed record AdminIntentRoute(
     AdminIntentType Intent,

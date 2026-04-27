@@ -15,6 +15,36 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private static readonly string[] AllowedExtensions = { ".cfg", ".json", ".txt", ".ini", ".env" };
 
+    // Canonical rustmgr JSON config file keys — these live in the config JSON file, not runtime RCON.
+    internal static readonly Dictionary<string, string> ServerConfigKeyAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["worldsize"] = "server.worldsize",
+        ["world size"] = "server.worldsize",
+        ["seed"] = "server.seed",
+        ["maxplayers"] = "server.maxplayers",
+        ["max players"] = "server.maxplayers",
+        ["hostname"] = "server.hostname",
+        ["server name"] = "server.hostname",
+        ["identity"] = "server.identity",
+        ["rcon port"] = "rcon.port",
+        ["rcon password"] = "rcon.password",
+        ["app port"] = "app.port",
+        ["server port"] = "server.port",
+        ["serverdir"] = "serverDir",
+        ["server dir"] = "serverDir",
+        ["logfile"] = "logFile",
+        ["log file"] = "logFile",
+        ["additionalargs"] = "additionalArgs",
+        ["additional args"] = "additionalArgs"
+    };
+
+    private static readonly HashSet<string> ServerNameStopWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "your", "the", "this", "that", "my", "our", "their", "its",
+        "a", "an", "any", "some", "server", "servers", "config", "file",
+        "plugin", "oxide"
+    };
+
     public RustFileEditToolHandler(RustOpsApiClient api, IGitOpsService gitOps, GitOpsSettings gitOpsSettings)
     {
         _api = api;
@@ -28,10 +58,14 @@ internal sealed class RustFileEditToolHandler : IToolHandler
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
         var lowered = context.Message.ToLowerInvariant();
-        if (LooksLikeServerConfigRequest(lowered))
-        {
+
+        // Plugin config must be checked first to prevent the server config alias matcher from
+        // stealing messages like "show plugin config for <server>" that contain alias keywords.
+        if (LooksLikePluginConfigRequest(lowered))
+            return await HandlePluginConfigAsync(context, cancellationToken);
+
+        if (LooksLikeServerConfigRequest(lowered) || LooksLikeServerConfigValueQuery(lowered, isPluginRequest: false))
             return await HandleServerConfigAsync(context, cancellationToken);
-        }
 
         var filePath = ExtractFilePath(context.Message);
         if (string.IsNullOrWhiteSpace(filePath))
@@ -58,22 +92,16 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
         var isReadRequest = IsReadRequest(context.Message);
         if (isReadRequest)
-        {
             return await ReadFileAsync(fullPath, filePath, cancellationToken);
-        }
 
         if (!_gitOpsSettings.Enabled)
-        {
             return new ToolExecutionResult(false, "File editing requires GitOps to be enabled (gitOps.enabled=true in config).", null, false, "not_configured");
-        }
 
         var editContent = ExtractEditContent(context.Message);
         if (string.IsNullOrWhiteSpace(editContent))
         {
             if (!File.Exists(fullPath))
-            {
                 return new ToolExecutionResult(false, $"File not found: {filePath}. Check the path and try again.", null, false, "file_not_found");
-            }
 
             var currentContent = await File.ReadAllTextAsync(fullPath, cancellationToken);
             var preview = currentContent.Length > 800 ? currentContent[..800] + "\n...(truncated)" : currentContent;
@@ -88,9 +116,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
     private async Task<ToolExecutionResult> ReadFileAsync(string fullPath, string filePath, CancellationToken cancellationToken)
     {
         if (!File.Exists(fullPath))
-        {
             return new ToolExecutionResult(false, $"File not found: {filePath}.", null, false, "file_not_found");
-        }
 
         var content = await File.ReadAllTextAsync(fullPath, cancellationToken);
         var preview = content.Length > 1000 ? content[..1000] + "\n...(truncated)" : content;
@@ -162,14 +188,12 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private static string? ExtractFilePath(string message)
     {
-        // Match common config file patterns
         var match = Regex.Match(message,
             @"(?:show|read|view|open|edit|modify|update|change|set)\s+(?:the\s+)?(?:file\s+)?(?<path>[a-zA-Z0-9_./-]+\.(?:cfg|json|txt|ini|env))",
             RegexOptions.IgnoreCase);
         if (match.Success)
             return match.Groups["path"].Value.Trim();
 
-        // Quoted path
         var quoted = Regex.Match(message, "\"(?<path>[^\"]+\\.(?:cfg|json|txt|ini|env))\"", RegexOptions.IgnoreCase);
         if (quoted.Success)
             return quoted.Groups["path"].Value.Trim();
@@ -179,12 +203,10 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private static string? ExtractEditContent(string message)
     {
-        // Look for content in a code block
         var block = Regex.Match(message, @"```[a-z]*\n(?<content>[\s\S]+?)```", RegexOptions.IgnoreCase);
         if (block.Success)
             return block.Groups["content"].Value.Trim();
 
-        // Look for "set to: ..." or "content: ..."
         var setTo = Regex.Match(message, @"(?:set to|replace with|content):?\s*(?<content>.+)$",
             RegexOptions.IgnoreCase | RegexOptions.Singleline);
         if (setTo.Success)
@@ -193,18 +215,16 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         return null;
     }
 
-    private static string SanitizePath(string path)
-    {
-        return new string(path.Where(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_').ToArray());
-    }
+    private static string SanitizePath(string path) =>
+        new string(path.Where(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_').ToArray());
+
+    // ── Server config handler ──────────────────────────────────────────────────
 
     private async Task<ToolExecutionResult> HandleServerConfigAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
         var server = context.Route.Slots.ServerName;
         if (string.IsNullOrWhiteSpace(server))
-        {
             server = ExtractServerNameFromMessage(context.Message);
-        }
 
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -212,9 +232,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             return new ToolExecutionResult(
                 false,
                 RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.FileEdit, knownServers, allowAllServers: false),
-                null,
-                false,
-                "clarification_required");
+                null, false, "clarification_required");
         }
 
         var configPath = ResolveServerConfigPath(server);
@@ -223,47 +241,71 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             return new ToolExecutionResult(
                 false,
                 $"Server config not found for '{server}'. Expected path: {BuildExpectedConfigPath(server)}",
-                server,
-                false,
-                "file_not_found");
+                server, false, "file_not_found");
         }
 
         var canonicalServer = Path.GetFileNameWithoutExtension(configPath);
-        var mutation = TryExtractConfigMutation(context.Message, canonicalServer);
-        if (mutation is null || IsReadRequest(context.Message))
-        {
-            var raw = await File.ReadAllTextAsync(configPath, cancellationToken);
-            using var doc = JsonDocument.Parse(raw);
-            var pretty = JsonSerializer.Serialize(doc.RootElement, new JsonSerializerOptions { WriteIndented = true });
-            var serverRoot = BuildExpectedServerRootPath(canonicalServer);
-            var header = $"{canonicalServer} server config ({configPath}). Server runtime root: {serverRoot}";
-            var fullMessage = $"{header}\n\n```json\n{pretty}\n```";
-
-            return new ToolExecutionResult(
-                true,
-                fullMessage,
-                canonicalServer,
-                true,
-                Payload: pretty);
-        }
-
         var currentRaw = await File.ReadAllTextAsync(configPath, cancellationToken);
         var configNode = JsonNode.Parse(currentRaw) as JsonObject;
         if (configNode is null)
-        {
             return new ToolExecutionResult(false, $"Could not parse config for '{canonicalServer}'.", canonicalServer, false, "parse_error");
+
+        // Prefer LLM-extracted slots when available (avoids re-parsing the raw message).
+        var slotKey = context.Route.Slots.ConfigKey;
+        var slotValue = context.Route.Slots.ConfigValue;
+
+        ConfigMutationResult? mutation = null;
+        if (!string.IsNullOrWhiteSpace(slotKey) && !string.IsNullOrWhiteSpace(slotValue) && !IsReadRequest(context.Message))
+        {
+            // Bug #1 fix: resolve alias on the key before writing
+            var resolvedKey = ResolveConfigKeyAlias(slotKey);
+            mutation = new ConfigMutationResult(resolvedKey, ParseJsonValue(slotValue), slotValue);
+        }
+        else
+        {
+            mutation = TryExtractConfigMutation(context.Message, canonicalServer);
         }
 
-        ApplyConfigMutation(configNode, mutation.Value.Key, mutation.Value.ValueNode);
-        var prettyUpdated = configNode.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(configPath, prettyUpdated, cancellationToken);
+        if (mutation is not null && !IsReadRequest(context.Message))
+        {
+            ApplyConfigMutation(configNode, mutation.Key, mutation.ValueNode);
+            var prettyUpdated = configNode.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(configPath, prettyUpdated, cancellationToken);
 
+            return new ToolExecutionResult(
+                true,
+                $"Updated {canonicalServer} config at {configPath}: set `{mutation.Key}` to `{mutation.DisplayValue}`. Server runtime root: {BuildExpectedServerRootPath(canonicalServer)}\n```json\n{prettyUpdated}\n```",
+                canonicalServer, true,
+                Payload: prettyUpdated);
+        }
+
+        // Key lookup — prefer LLM slot, fall back to regex
+        var lookupKey = !string.IsNullOrWhiteSpace(slotKey) ? slotKey : TryExtractConfigLookupKey(context.Message, includeAliases: true);
+        if (!string.IsNullOrWhiteSpace(lookupKey))
+        {
+            if (TryReadConfigValue(configNode, lookupKey!, out var resolvedKey, out var valueNode))
+            {
+                var renderedValue = RenderJsonValue(valueNode);
+                return new ToolExecutionResult(
+                    true,
+                    $"{canonicalServer} config `{resolvedKey}` = `{renderedValue}` (from {configPath}).",
+                    canonicalServer, false,
+                    Payload: new { key = resolvedKey, value = renderedValue, configPath });
+            }
+
+            return new ToolExecutionResult(
+                false,
+                $"Key `{lookupKey}` was not found in {canonicalServer} config ({configPath}).",
+                canonicalServer, false, "key_not_found");
+        }
+
+        var pretty = configNode.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var serverRoot = BuildExpectedServerRootPath(canonicalServer);
         return new ToolExecutionResult(
             true,
-            $"Updated {canonicalServer} config at {configPath}: set `{mutation.Value.Key}` to `{mutation.Value.DisplayValue}`. Server runtime root: {BuildExpectedServerRootPath(canonicalServer)}\n```json\n{prettyUpdated}\n```",
-            canonicalServer,
-            true,
-            Payload: prettyUpdated);
+            $"{canonicalServer} server config ({configPath}). Server runtime root: {serverRoot}\n\n```json\n{pretty}\n```",
+            canonicalServer, true,
+            Payload: pretty);
     }
 
     private static bool LooksLikeServerConfigRequest(string lowered)
@@ -282,16 +324,257 @@ internal sealed class RustFileEditToolHandler : IToolHandler
                lowered.Contains("open", StringComparison.Ordinal);
     }
 
+    // Bug #2 fix: guard with isPluginRequest so plugin messages don't match on shared alias keywords.
+    private static bool LooksLikeServerConfigValueQuery(string lowered, bool isPluginRequest)
+    {
+        if (isPluginRequest)
+            return false;
+
+        var asksValue =
+            lowered.Contains("what is", StringComparison.Ordinal) ||
+            lowered.Contains("what's", StringComparison.Ordinal) ||
+            lowered.Contains("value", StringComparison.Ordinal) ||
+            lowered.Contains("get ", StringComparison.Ordinal) ||
+            lowered.Contains("show ", StringComparison.Ordinal) ||
+            lowered.Contains("read ", StringComparison.Ordinal);
+        if (!asksValue)
+            return false;
+
+        return ServerConfigKeyAliases.Keys.Any(alias => lowered.Contains(alias, StringComparison.Ordinal));
+    }
+
+    private static bool LooksLikePluginConfigRequest(string lowered)
+    {
+        if (lowered.Contains("oxide/config", StringComparison.Ordinal) || lowered.Contains(@"oxide\config", StringComparison.Ordinal))
+            return true;
+
+        return lowered.Contains("plugin", StringComparison.Ordinal) && lowered.Contains("config", StringComparison.Ordinal);
+    }
+
     private static string? ExtractServerNameFromMessage(string message)
     {
         var match = Regex.Match(
             message,
-            @"\b(?:for|on|from)\s+(?<server>[A-Za-z0-9][A-Za-z0-9._-]{1,})\b(?:\s+server)?",
+            @"\b(?:for|on|from|of|in)\s+(?<server>[A-Za-z0-9][A-Za-z0-9._-]{1,})\b(?:\s+server)?",
             RegexOptions.IgnoreCase);
-        return match.Success ? match.Groups["server"].Value.Trim() : null;
+        if (!match.Success)
+            return null;
+
+        var server = match.Groups["server"].Value.Trim();
+        return ServerNameStopWords.Contains(server) ? null : server;
     }
 
-    private static (string Key, JsonNode? ValueNode, string DisplayValue)? TryExtractConfigMutation(string message, string? serverName)
+    // ── Plugin config handler ──────────────────────────────────────────────────
+
+    private async Task<ToolExecutionResult> HandlePluginConfigAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        var server = context.Route.Slots.ServerName;
+        if (string.IsNullOrWhiteSpace(server))
+            server = ExtractServerNameFromMessage(context.Message);
+
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+            return new ToolExecutionResult(
+                false,
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.FileEdit, knownServers, allowAllServers: false),
+                null, false, "clarification_required");
+        }
+
+        var configPath = ResolveServerConfigPath(server);
+        if (configPath is null || !File.Exists(configPath))
+        {
+            return new ToolExecutionResult(
+                false,
+                $"Server config not found for '{server}' — cannot locate the oxide config directory. Expected path: {BuildExpectedConfigPath(server)}",
+                server, false, "file_not_found");
+        }
+
+        var serverRaw = await File.ReadAllTextAsync(configPath, cancellationToken);
+        var serverConfig = JsonNode.Parse(serverRaw) as JsonObject;
+        if (serverConfig is null)
+            return new ToolExecutionResult(false, $"Could not parse config for '{server}'.", server, false, "parse_error");
+
+        var configDirs = ResolveOxideConfigDirectories(serverConfig);
+        if (configDirs.Count == 0)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"No oxide config directory found for '{server}'. Checked serverDir/logFile-derived oxide paths.",
+                server, false, "file_not_found");
+        }
+
+        var pluginName = ExtractPluginNameFromMessage(context.Message);
+        if (string.IsNullOrWhiteSpace(pluginName))
+        {
+            var available = ListPluginConfigNames(configDirs);
+            var suffix = available.Count == 0 ? "none found" : string.Join(", ", available.Take(20));
+            return new ToolExecutionResult(
+                false,
+                $"Which plugin config should I use on {server}? Available: {suffix}.",
+                server, false, "clarification_required");
+        }
+
+        var pluginPath = ResolvePluginConfigPath(configDirs, pluginName);
+        if (string.IsNullOrWhiteSpace(pluginPath) || !File.Exists(pluginPath))
+        {
+            return new ToolExecutionResult(
+                false,
+                $"Plugin config '{pluginName}' not found for {server}.",
+                server, false, "file_not_found");
+        }
+
+        var pluginRaw = await File.ReadAllTextAsync(pluginPath, cancellationToken);
+        var pluginConfig = JsonNode.Parse(pluginRaw) as JsonObject;
+        if (pluginConfig is null)
+            return new ToolExecutionResult(false, $"Could not parse plugin config '{pluginName}' at {pluginPath}.", server, false, "parse_error");
+
+        var mutation = TryExtractConfigMutation(context.Message, server);
+        if (mutation is not null && !IsReadRequest(context.Message))
+        {
+            ApplyConfigMutation(pluginConfig, mutation.Key, mutation.ValueNode);
+            var prettyUpdated = pluginConfig.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            await File.WriteAllTextAsync(pluginPath, prettyUpdated, cancellationToken);
+            return new ToolExecutionResult(
+                true,
+                $"Updated plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}: set `{mutation.Key}` to `{mutation.DisplayValue}`.\n```json\n{prettyUpdated}\n```",
+                server, true,
+                Payload: prettyUpdated);
+        }
+
+        var key = TryExtractConfigLookupKey(context.Message, includeAliases: false);
+        if (!string.IsNullOrWhiteSpace(key))
+        {
+            if (TryReadConfigValue(pluginConfig, key!, out var resolvedKey, out var valueNode))
+            {
+                var renderedValue = RenderJsonValue(valueNode);
+                return new ToolExecutionResult(
+                    true,
+                    $"Plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}: `{resolvedKey}` = `{renderedValue}`.",
+                    server, false,
+                    Payload: new { key = resolvedKey, value = renderedValue, pluginPath });
+            }
+
+            return new ToolExecutionResult(
+                false,
+                $"Key `{key}` was not found in plugin config `{Path.GetFileNameWithoutExtension(pluginPath)}` on {server}.",
+                server, false, "key_not_found");
+        }
+
+        var pretty = pluginConfig.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        return new ToolExecutionResult(
+            true,
+            $"{Path.GetFileNameWithoutExtension(pluginPath)} plugin config ({pluginPath}).\n```json\n{pretty}\n```",
+            server, true,
+            Payload: pretty);
+    }
+
+    // ── Config key/value helpers ───────────────────────────────────────────────
+
+    // Bug #1 fix: aliases are now resolved here so both the read and write paths go through the same resolver.
+    private static string ResolveConfigKeyAlias(string key) =>
+        ServerConfigKeyAliases.TryGetValue(key, out var canonical) ? canonical : key;
+
+    internal static string? TryExtractConfigLookupKey(string message, bool includeAliases)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return null;
+
+        var explicitKey = Regex.Match(message, @"\b(?<key>(?:server|rcon|app)\.[A-Za-z0-9_.-]+)\b", RegexOptions.IgnoreCase);
+        if (explicitKey.Success)
+            return explicitKey.Groups["key"].Value.Trim();
+
+        if (includeAliases)
+        {
+            var lowered = message.ToLowerInvariant();
+            foreach (var alias in ServerConfigKeyAliases.OrderByDescending(item => item.Key.Length))
+            {
+                if (lowered.Contains(alias.Key, StringComparison.Ordinal))
+                    return alias.Value;
+            }
+        }
+
+        var genericKey = Regex.Match(
+            message,
+            @"\b(?:value of|what(?:'s| is)|show|get|read)\s+(?:the\s+)?(?<key>[A-Za-z0-9_.-]+)",
+            RegexOptions.IgnoreCase);
+        if (genericKey.Success)
+        {
+            var candidate = genericKey.Groups["key"].Value.Trim();
+            if (!string.Equals(candidate, "server", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(candidate, "config", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(candidate, "plugin", StringComparison.OrdinalIgnoreCase))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    internal static bool TryReadConfigValue(JsonObject config, string key, out string resolvedKey, out JsonNode? valueNode)
+    {
+        resolvedKey = key;
+        valueNode = null;
+        if (string.IsNullOrWhiteSpace(key))
+            return false;
+
+        if (TryGetObjectValue(config, key, out resolvedKey, out valueNode))
+            return true;
+
+        var segments = key.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length < 2)
+            return false;
+
+        JsonNode? current = config;
+        var resolvedParts = new List<string>();
+        foreach (var segment in segments)
+        {
+            if (current is not JsonObject currentObj)
+                return false;
+
+            if (!TryGetObjectValue(currentObj, segment, out var matchedKey, out var nextNode))
+                return false;
+
+            resolvedParts.Add(matchedKey);
+            current = nextNode;
+        }
+
+        resolvedKey = string.Join('.', resolvedParts);
+        valueNode = current;
+        return true;
+    }
+
+    private static bool TryGetObjectValue(JsonObject obj, string key, out string matchedKey, out JsonNode? value)
+    {
+        foreach (var item in obj)
+        {
+            if (string.Equals(item.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                matchedKey = item.Key;
+                value = item.Value;
+                return true;
+            }
+        }
+
+        matchedKey = key;
+        value = null;
+        return false;
+    }
+
+    private static string RenderJsonValue(JsonNode? value)
+    {
+        if (value is null)
+            return "null";
+
+        if (value is JsonValue jsonValue && jsonValue.TryGetValue<string>(out var str))
+            return str;
+
+        return value.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+    }
+
+    // Bug #1 fix: TryExtractConfigMutation now resolves aliases before returning the key.
+    private static ConfigMutationResult? TryExtractConfigMutation(string message, string? serverName)
     {
         var setMatch = Regex.Match(
             message,
@@ -300,39 +583,16 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         if (!setMatch.Success)
             return null;
 
-        var key = setMatch.Groups["key"].Value.Trim();
+        var rawKey = setMatch.Groups["key"].Value.Trim();
         var valueText = setMatch.Groups["value"].Value.Trim().TrimEnd('.', ';');
-        valueText = StripTrailingServerQualifier(valueText, serverName);
-        if (string.IsNullOrWhiteSpace(key) || string.IsNullOrWhiteSpace(valueText))
+        valueText = RustToolHelper.StripTrailingServerQualifier(valueText, serverName);
+        if (string.IsNullOrWhiteSpace(rawKey) || string.IsNullOrWhiteSpace(valueText))
             return null;
 
+        // Resolve alias so "set worldsize to 3500" writes to "server.worldsize", not a new "worldsize" key.
+        var resolvedKey = ResolveConfigKeyAlias(rawKey);
         var valueNode = ParseJsonValue(valueText);
-        var display = valueNode?.ToJsonString() ?? "null";
-        return (key, valueNode, display);
-    }
-
-    private static string StripTrailingServerQualifier(string valueText, string? serverName)
-    {
-        if (string.IsNullOrWhiteSpace(valueText))
-            return valueText;
-
-        var result = valueText;
-        if (!string.IsNullOrWhiteSpace(serverName))
-        {
-            var escapedServer = Regex.Escape(serverName);
-            result = Regex.Replace(
-                result,
-                $@"\s+(?:on|for)\s+{escapedServer}(?:\s+server)?\s*$",
-                string.Empty,
-                RegexOptions.IgnoreCase);
-        }
-
-        result = Regex.Replace(
-            result,
-            @"\s+(?:on|for)\s+[A-Za-z0-9._-]+(?:\s+server)?\s*$",
-            string.Empty,
-            RegexOptions.IgnoreCase);
-        return result.Trim();
+        return new ConfigMutationResult(resolvedKey, valueNode, valueNode?.ToJsonString() ?? "null");
     }
 
     private static JsonNode? ParseJsonValue(string raw)
@@ -362,9 +622,8 @@ internal sealed class RustFileEditToolHandler : IToolHandler
 
     private static void ApplyConfigMutation(JsonObject config, string key, JsonNode? value)
     {
-        // rustmgr config commonly uses dotted keys as literal properties (e.g., "server.maxplayers"),
-        // so prefer direct assignment. If that key does not already exist and nested object path exists,
-        // update nested path instead.
+        // rustmgr config commonly uses dotted keys as literal properties (e.g. "server.maxplayers"),
+        // so prefer direct assignment. If that key does not exist, try nested path.
         if (config.ContainsKey(key))
         {
             config[key] = value;
@@ -372,9 +631,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         }
 
         if (key.Contains('.') && TryAssignNested(config, key, value))
-        {
             return;
-        }
 
         config[key] = value;
     }
@@ -389,10 +646,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         for (var i = 0; i < segments.Length - 1; i++)
         {
             if (current[segments[i]] is not JsonObject next)
-            {
                 return false;
-            }
-
             current = next;
         }
 
@@ -400,39 +654,157 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         return true;
     }
 
-    private static string BuildExpectedConfigPath(string server)
+    // ── Plugin config helpers ──────────────────────────────────────────────────
+
+    private static string? ExtractPluginNameFromMessage(string message)
+    {
+        var pathMatch = Regex.Match(
+            message,
+            @"oxide[\\/]+config[\\/]+(?<plugin>[A-Za-z0-9._-]+)\.json",
+            RegexOptions.IgnoreCase);
+        if (pathMatch.Success)
+            return pathMatch.Groups["plugin"].Value.Trim();
+
+        foreach (var pattern in new[]
+        {
+            @"\bplugin\s+(?<plugin>[A-Za-z0-9._-]+)\s+config\b",
+            @"\b(?<plugin>[A-Za-z0-9._-]+)\s+plugin\s+config\b",
+            @"\bconfig\s+for\s+(?<plugin>[A-Za-z0-9._-]+)\b"
+        })
+        {
+            var match = Regex.Match(message, pattern, RegexOptions.IgnoreCase);
+            if (match.Success)
+                return match.Groups["plugin"].Value.Trim();
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyList<string> ResolveOxideConfigDirectories(JsonObject serverConfig)
+    {
+        var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var serverDir = ReadJsonString(serverConfig, "serverDir");
+        if (!string.IsNullOrWhiteSpace(serverDir))
+            dirs.Add(Path.Combine(serverDir, "oxide", "config"));
+
+        var logFile = ReadJsonString(serverConfig, "logFile");
+        if (!string.IsNullOrWhiteSpace(logFile))
+        {
+            var logPath = Path.IsPathRooted(logFile)
+                ? logFile
+                : !string.IsNullOrWhiteSpace(serverDir)
+                    ? Path.Combine(serverDir, logFile)
+                    : logFile;
+
+            var logDir = Path.GetDirectoryName(logPath);
+            if (!string.IsNullOrWhiteSpace(logDir))
+                dirs.Add(Path.Combine(logDir, "oxide", "config"));
+        }
+
+        return dirs.Where(Directory.Exists).ToList();
+    }
+
+    private static string? ReadJsonString(JsonObject obj, string key)
+    {
+        if (!TryGetObjectValue(obj, key, out _, out var node) || node is null)
+            return null;
+
+        return node switch
+        {
+            JsonValue value when value.TryGetValue<string>(out var str) => str,
+            _ => node.ToString()
+        };
+    }
+
+    private static IReadOnlyList<string> ListPluginConfigNames(IReadOnlyList<string> configDirs) =>
+        configDirs
+            .Where(Directory.Exists)
+            .SelectMany(dir => Directory.EnumerateFiles(dir, "*.json", SearchOption.AllDirectories))
+            .Select(path => Path.GetFileNameWithoutExtension(path))
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    private static string? ResolvePluginConfigPath(IReadOnlyList<string> configDirs, string pluginName)
+    {
+        foreach (var dir in configDirs.Where(Directory.Exists))
+        {
+            var direct = Path.Combine(dir, $"{pluginName}.json");
+            if (File.Exists(direct))
+                return direct;
+
+            var match = Directory
+                .EnumerateFiles(dir, "*.json", SearchOption.AllDirectories)
+                .FirstOrDefault(path =>
+                    string.Equals(
+                        Path.GetFileNameWithoutExtension(path),
+                        pluginName,
+                        StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(match))
+                return match;
+        }
+
+        return null;
+    }
+
+    // ── Path resolution ────────────────────────────────────────────────────────
+
+    private string BuildExpectedConfigPath(string server)
     {
         var configRoot = ResolveConfigRootPath();
         return Path.Combine(configRoot, $"{server}.json");
     }
 
-    private static string? ResolveServerConfigPath(string server)
+    // Bug #5 fix: returns null when no file is found rather than a non-null phantom path.
+    private string? ResolveServerConfigPath(string server)
     {
-        var configRoot = ResolveConfigRootPath();
-        var directPath = Path.Combine(configRoot, $"{server}.json");
-        if (File.Exists(directPath))
-            return directPath;
+        foreach (var configRoot in EnumerateConfigRoots())
+        {
+            var directPath = Path.Combine(configRoot, $"{server}.json");
+            if (File.Exists(directPath))
+                return directPath;
 
-        if (!Directory.Exists(configRoot))
-            return directPath;
+            if (!Directory.Exists(configRoot))
+                continue;
 
-        var match = Directory
-            .EnumerateFiles(configRoot, "*.json", SearchOption.TopDirectoryOnly)
-            .FirstOrDefault(path =>
-                string.Equals(
-                    Path.GetFileNameWithoutExtension(path),
-                    server,
-                    StringComparison.OrdinalIgnoreCase));
+            var match = Directory
+                .EnumerateFiles(configRoot, "*.json", SearchOption.TopDirectoryOnly)
+                .FirstOrDefault(path =>
+                    string.Equals(
+                        Path.GetFileNameWithoutExtension(path),
+                        server,
+                        StringComparison.OrdinalIgnoreCase));
+            if (!string.IsNullOrWhiteSpace(match))
+                return match;
+        }
 
-        return match ?? directPath;
+        return null;
     }
 
-    private static string ResolveConfigRootPath()
+    private string ResolveConfigRootPath()
     {
         var envRoot = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG");
-        return string.IsNullOrWhiteSpace(envRoot)
-            ? "/opt/rust-manager/config"
-            : envRoot.Trim();
+        if (!string.IsNullOrWhiteSpace(envRoot))
+            return envRoot.Trim();
+
+        var repoRoot = _gitOpsSettings.RepoPath;
+        if (!string.IsNullOrWhiteSpace(repoRoot) && Directory.Exists(repoRoot))
+            return repoRoot;
+
+        return "/opt/rust-manager/config";
+    }
+
+    private IReadOnlyList<string> EnumerateConfigRoots()
+    {
+        var roots = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CatalogPathHelper.AddWithParents(roots, Environment.GetEnvironmentVariable("RUSTMGR_CONFIG"));
+        CatalogPathHelper.AddWithParents(roots, _gitOpsSettings.RepoPath);
+        CatalogPathHelper.AddWithParents(roots, Directory.GetCurrentDirectory());
+        CatalogPathHelper.AddWithParents(roots, AppContext.BaseDirectory);
+        CatalogPathHelper.AddWithParents(roots, "/opt/rust-manager/config", maxDepth: 1);
+        return roots.ToList();
     }
 
     private static string BuildExpectedServerRootPath(string server)
@@ -441,4 +813,8 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         var root = string.IsNullOrWhiteSpace(envRoot) ? "/srv/rust" : envRoot.Trim();
         return Path.Combine(root, server);
     }
+
+    // ── Internal result type ───────────────────────────────────────────────────
+
+    private sealed record ConfigMutationResult(string Key, JsonNode? ValueNode, string DisplayValue);
 }

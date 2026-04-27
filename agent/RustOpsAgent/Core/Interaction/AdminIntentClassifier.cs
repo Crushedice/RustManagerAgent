@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Microsoft.SemanticKernel;
@@ -12,6 +12,17 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
     private readonly Kernel? _kernel;
     private readonly LlmSettings _settings;
     private readonly NeoCortexStore? _neoCortex;
+
+    // Config file keys live in the rustmgr JSON config and are edited via file_edit.
+    // Everything else that looks like a dotted identifier is a live RCON convar.
+    private static readonly HashSet<string> ConfigFileKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "server.worldsize", "server.seed", "server.maxplayers", "server.hostname",
+        "server.port", "server.identity",
+        "rcon.port", "rcon.password", "rcon.ip",
+        "app.port",
+        "serverdir", "logfile", "additionalargs"
+    };
 
     public AdminIntentClassifier(Kernel? kernel, LlmSettings? settings = null, NeoCortexStore? neoCortex = null)
     {
@@ -27,55 +38,9 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         CancellationToken cancellationToken)
     {
         if (_kernel is null)
-        {
             return HeuristicFallback(message, state, knownServers, "heuristic_no_kernel", false, false);
-        }
 
-        var prompt = $$"""
-{{BuildSystemPrefix()}}{{BuildLearnedRulesSection()}}
-Return strict JSON only with keys:
-intent, confidence, needsClarification, clarificationQuestion, targetRef, slots
-
-intent enum:
-chat, server_control, player_lookup, rcon_command, file_edit, status_check, troubleshooting, clarification, server_management
-
-targetRef enum:
-rust.server.control, rust.player.lookup, rust.rcon.command, rust.file.edit, rust.status.check, rust.logs.inspect, rust.plugins.verify, rust.network.inspect, rust.chat.reply, rust.server.management
-
-slots object keys:
-serverName, serverNames, scopeKind, playerName, commandText, timeRange, severity
-
-scopeKind enum:
-unspecified, single, all, subset
-
-Rules:
-- Interpret all/every/all N/all servers as scopeKind=all.
-- Preserve previous intent on correction follow-ups unless user clearly switches tasks.
-- For plural status/health questions with no explicit server names, default to all configured servers.
-- "compile errors", "compile", "compilation", "plugin errors", "cs errors", "plugin issues", "oxide issues", "umod issues" → intent=troubleshooting, targetRef=rust.plugins.verify. NEVER treat "compile" as a server name.
-- Words like "issue", "issues", "problem", "problems" when paired with "plugin", "oxide", or "umod" → intent=troubleshooting, targetRef=rust.plugins.verify.
-- When the request is to execute/run/send an RCON command or any raw server command (e.g. "run say Hello", "execute status", "rcon say X") → intent=rcon_command, targetRef=rust.rcon.command, put the command text in slots.commandText. NEVER use server_control for this.
-- Requests to show/read/view/open server config JSON (e.g. "show serverconfig for cotton", "open cotton config", "read cotton.json") or change config keys/values (e.g. "set server.maxplayers to 200 on cotton") → intent=file_edit, targetRef=rust.file.edit.
-- server_control is ONLY for lifecycle actions: start, stop, restart, kill, update, wipe on RUST GAME SERVERS.
-- When the request is to add, register, remove, delete, or edit a server connection (remote or local) — e.g. "add remote server", "register server at 1.2.3.4", "remove Cotton from the list", "provision a new server", "update rcon credentials for X" → intent=server_management, targetRef=rust.server.management. Put the server name in slots.serverName and the RCON IP in slots.commandText if provided.
-- CRITICAL: Requests about git operations, pulling code, rebuilding the agent, or building the codebase (e.g. "pull from main", "can you rebuild?", "git pull", "build the agent") are ALWAYS → intent=chat, targetRef=rust.chat.reply. These are about the AGENT SOFTWARE, not the Rust game servers. NEVER classify these as server_control or troubleshooting. The agent does not control game server builds — it only manages their lifecycle (start/stop/restart/wipe).
-
-Conversation context:
-lastServer={{state.LastServerName ?? ""}}
-lastIntent={{state.LastIntent ?? ""}}
-lastScopeKind={{state.LastScopeKind}}
-lastResolvedServers={{string.Join(", ", state.LastResolvedServers)}}
-lastCommand={{state.LastCommandText ?? ""}}
-pendingClarificationIntent={{state.PendingClarification?.Intent ?? ""}}
-pendingClarificationQuestion={{state.PendingClarification?.Question ?? ""}}
-lastUserSummary={{state.LastUserMessageSummary ?? ""}}
-
-Known servers:
-{{string.Join(", ", knownServers)}}
-
-Admin message:
-{{message}}
-""";
+        var prompt = BuildPrompt(message, state, knownServers);
 
         string raw;
         try
@@ -90,9 +55,7 @@ Admin message:
 
         var json = TryExtractJson(raw);
         if (json is null)
-        {
             return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_parse_failure", true, false);
-        }
 
         try
         {
@@ -100,12 +63,13 @@ Admin message:
             var root = doc.RootElement;
             var lowered = message.ToLowerInvariant();
 
-            var intentText = root.TryGetProperty("intent", out var intentNode) ? intentNode.GetString() ?? "clarification" : "clarification";
+            var intentText = root.TryGetProperty("intent", out var intentNode)
+                ? intentNode.GetString() ?? "clarification"
+                : "clarification";
             var intent = ParseIntent(intentText);
+
             if (ShouldPromoteToStatusIntent(intent, lowered))
-            {
                 intent = AdminIntentType.StatusCheck;
-            }
 
             var correctionFollowUp = IsCorrectionFollowUp(lowered);
             if (correctionFollowUp &&
@@ -128,6 +92,8 @@ Admin message:
             string? commandText = null;
             string? timeRange = null;
             string? severity = null;
+            string? configKey = null;
+            string? configValue = null;
             var scopeKind = ServerScopeKind.Unspecified;
             List<string>? serverNames = null;
 
@@ -138,6 +104,8 @@ Admin message:
                 commandText = slots.TryGetProperty("commandText", out var cn) ? cn.GetString() : null;
                 timeRange = slots.TryGetProperty("timeRange", out var tn) ? tn.GetString() : null;
                 severity = slots.TryGetProperty("severity", out var sv) ? sv.GetString() : null;
+                configKey = slots.TryGetProperty("configKey", out var ck) ? ck.GetString() : null;
+                configValue = slots.TryGetProperty("configValue", out var cv) ? cv.GetString() : null;
                 scopeKind = slots.TryGetProperty("scopeKind", out var scopeNode)
                     ? ParseScopeKind(scopeNode.GetString())
                     : ServerScopeKind.Unspecified;
@@ -156,18 +124,12 @@ Admin message:
             }
 
             if (string.IsNullOrWhiteSpace(serverName))
-            {
                 serverName = ExtractServerHint(message);
-            }
 
             var allowPluralDefaultAll = intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting;
             var scope = ServerScopeResolver.Resolve(
-                message,
-                knownServers,
-                state,
-                scopeKind,
-                serverNames,
-                serverName,
+                message, knownServers, state,
+                scopeKind, serverNames, serverName,
                 allowPluralDefaultAll: allowPluralDefaultAll,
                 allowLastScopeFallback: true);
 
@@ -176,11 +138,12 @@ Admin message:
             scopeKind = scope.ScopeKind;
 
             targetRef = NormalizeTargetRef(targetRef) ?? InferTargetRef(intent, lowered);
-            var needsClarification = llmNeedsClarification || (RequiresServerScope(intent) && scope.RequiresClarification);
-            if (!scope.RequiresClarification)
-            {
-                needsClarification = false;
-            }
+
+            // Bug #3 fix: LLM's needsClarification is respected only when it also provides a
+            // clarification question (avoids false-positive blocking when scope is already resolved).
+            var scopeNeedsClarification = RequiresServerScope(intent) && scope.RequiresClarification;
+            var needsClarification = scopeNeedsClarification
+                || (llmNeedsClarification && !scopeNeedsClarification && !string.IsNullOrWhiteSpace(clarification));
 
             clarification = needsClarification
                 ? BuildClarificationQuestion(intent, knownServers, clarification)
@@ -188,7 +151,7 @@ Admin message:
 
             return new AdminIntentRoute(
                 intent,
-                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames),
+                new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames, configKey, configValue),
                 Math.Clamp(confidence, 0.0, 1.0),
                 needsClarification,
                 clarification,
@@ -201,6 +164,119 @@ Admin message:
         {
             return HeuristicFallback(message, state, knownServers, "heuristic_after_llm_json_error", true, false);
         }
+    }
+
+    // Static template — no C# interpolation, so braces in JSON examples are unambiguous.
+    private const string PromptTemplate =
+        "You are classifying admin messages for a Rust game server operations agent.\n" +
+        "Return ONLY strict JSON — no markdown, no explanation, nothing else.\n\n" +
+        "Required JSON keys: intent, confidence, needsClarification, clarificationQuestion, targetRef, slots\n\n" +
+        "══ INTENT VALUES ══\n" +
+        "chat              General conversation, questions about the agent, git/build/code operations\n" +
+        "server_control    Rust game server lifecycle ONLY: start, stop, restart, kill, update, wipe\n" +
+        "player_lookup     Player lists, ban lists, kick queries\n" +
+        "rcon_command      Live RCON commands sent to a running server; server convars get/set/explain\n" +
+        "file_edit         Read or edit rustmgr JSON config files; query or change a config file key\n" +
+        "status_check      Server health, online/offline, network interfaces, logs overview\n" +
+        "troubleshooting   Plugin errors, oxide/umod issues, compile failures, crash investigation\n" +
+        "server_management Add, remove, register, provision server connections; update RCON credentials\n" +
+        "clarification     Cannot determine intent\n\n" +
+        "══ TARGETREF VALUES ══\n" +
+        "rust.server.control   rust.player.lookup    rust.rcon.command    rust.file.edit\n" +
+        "rust.status.check     rust.logs.inspect     rust.plugins.verify  rust.network.inspect\n" +
+        "rust.chat.reply       rust.server.management\n\n" +
+        "══ SLOTS ══\n" +
+        "serverName   string  – single server (match from Known servers list when possible)\n" +
+        "serverNames  array   – multiple server names\n" +
+        "scopeKind    enum    – unspecified | single | all | subset\n" +
+        "playerName   string\n" +
+        "commandText  string  – raw RCON command text; or RCON IP when registering a server\n" +
+        "configKey    string  – specific JSON config key being read or changed (e.g. server.maxplayers)\n" +
+        "configValue  string  – new value for a config key mutation (e.g. \"200\", \"true\")\n" +
+        "timeRange    string\n" +
+        "severity     string\n\n" +
+        "══ ROUTING RULES ══\n\n" +
+        "1. CONVAR vs CONFIG FILE — the most important distinction:\n" +
+        "   Config file keys are a FIXED SET stored in rustmgr JSON files:\n" +
+        "     server.worldsize  server.seed  server.maxplayers  server.hostname\n" +
+        "     server.port  server.identity  rcon.port  rcon.password  rcon.ip\n" +
+        "     app.port  serverDir  logFile  additionalArgs\n" +
+        "   Aliases for config keys: worldsize, seed, maxplayers, hostname, serverdir, logfile\n" +
+        "   -> intent=file_edit, targetRef=rust.file.edit\n" +
+        "   -> put the key in slots.configKey, the new value (if any) in slots.configValue\n\n" +
+        "   All OTHER dotted identifiers (ai.move, decay.scale, fps.limit, env.time, server.fps,\n" +
+        "   craft.instant, etc.) are RCON convars — live runtime variables.\n" +
+        "   -> intent=rcon_command, targetRef=rust.rcon.command\n" +
+        "   -> put the identifier (and any value) in slots.commandText\n\n" +
+        "2. server_control is ONLY for lifecycle: start, stop, restart, kill, update, wipe.\n" +
+        "   NEVER use server_control for raw commands, convars, or config changes.\n\n" +
+        "3. rcon_command for any message with: \"rcon\", \"run\", \"execute\", \"send command\", quoted\n" +
+        "   command text, \"what does X.Y do\", \"explain X.Y\", \"get X.Y on server\", \"set X.Y to V\"\n" +
+        "   where X.Y is NOT in the config file key list above.\n\n" +
+        "4. troubleshooting + rust.plugins.verify for: \"compile error/s\", \"plugin error/s\",\n" +
+        "   \"oxide issue/s\", \"umod issue/s\", \"cs error/s\". NEVER treat \"compile\" as a server name.\n\n" +
+        "5. status_check + rust.network.inspect for: \"network\", \"throughput\", \"latency\",\n" +
+        "   \"bandwidth\", \"eth0\", \"wg0\", \"wg1\", \"wt1\", \"interface\".\n\n" +
+        "6. status_check + rust.logs.inspect for: \"log/s\", \"exception\", \"traceback\", \"crash log\".\n\n" +
+        "7. server_management for: add/register/remove/delete/provision a server, update RCON\n" +
+        "   credentials, \"edit server connection\". serverName and commandText (=RCON IP) go in slots.\n\n" +
+        "8. chat for: git operations, pull, rebuild, build, questions about the agent software itself.\n" +
+        "   CRITICAL: \"git pull\", \"rebuild the agent\", \"can you pull?\" -> ALWAYS intent=chat.\n\n" +
+        "9. scopeKind=all when admin says \"all servers\", \"every server\", \"all N servers\".\n" +
+        "   For general status/health questions with NO specific server name, default scopeKind=all.\n\n" +
+        "10. Correction follow-ups (\"no\", \"actually\", \"I meant\"): preserve previous intent unless\n" +
+        "    the message contains an unambiguous new intent signal.\n\n" +
+        "══ EXAMPLES ══\n" +
+        "\"set ai.move false on cotton\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"ai.move false\", slots.serverName=\"cotton\"\n\n" +
+        "\"set maxplayers to 200 on cotton\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.maxplayers\", slots.configValue=\"200\", slots.serverName=\"cotton\"\n\n" +
+        "\"what does ai.move do\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"ai.move\"\n\n" +
+        "\"what's the worldsize on monthly\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.serverName=\"monthly\"\n\n" +
+        "\"show cotton config\" / \"open cotton.json\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.serverName=\"cotton\"\n\n" +
+        "\"compile errors on monthly\"\n" +
+        "  -> intent=troubleshooting, targetRef=rust.plugins.verify, slots.serverName=\"monthly\"\n\n" +
+        "\"restart cotton in 5 minutes\"\n" +
+        "  -> intent=server_control, targetRef=rust.server.control, slots.serverName=\"cotton\"\n\n" +
+        "\"run status on cotton\" / \"rcon say Hello on cotton\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"status\", slots.serverName=\"cotton\"\n\n" +
+        "\"git pull\" / \"rebuild the agent\" / \"can you pull from main?\"\n" +
+        "  -> intent=chat, targetRef=rust.chat.reply\n\n" +
+        "\"add remote server MyServer at 1.2.3.4:28016 password abc\"\n" +
+        "  -> intent=server_management, targetRef=rust.server.management, slots.serverName=\"MyServer\", slots.commandText=\"1.2.3.4\"\n";
+
+    private string BuildPrompt(string message, ConversationSelectionState state, IReadOnlyList<string> knownServers)
+    {
+        var sb = new StringBuilder();
+
+        var systemPrefix = BuildSystemPrefix();
+        if (!string.IsNullOrWhiteSpace(systemPrefix))
+            sb.AppendLine(systemPrefix);
+
+        var learnedRules = BuildLearnedRulesSection();
+        if (!string.IsNullOrWhiteSpace(learnedRules))
+            sb.AppendLine(learnedRules);
+
+        sb.Append(PromptTemplate);
+        sb.AppendLine();
+        sb.AppendLine("══ CONVERSATION CONTEXT ══");
+        sb.AppendLine($"lastServer={state.LastServerName ?? string.Empty}");
+        sb.AppendLine($"lastIntent={state.LastIntent ?? string.Empty}");
+        sb.AppendLine($"lastScopeKind={state.LastScopeKind}");
+        sb.AppendLine($"lastResolvedServers={string.Join(", ", state.LastResolvedServers)}");
+        sb.AppendLine($"lastCommand={state.LastCommandText ?? string.Empty}");
+        sb.AppendLine($"pendingClarificationIntent={state.PendingClarification?.Intent ?? string.Empty}");
+        sb.AppendLine($"pendingClarificationQuestion={state.PendingClarification?.Question ?? string.Empty}");
+        sb.AppendLine($"lastUserSummary={state.LastUserMessageSummary ?? string.Empty}");
+        sb.AppendLine();
+        sb.AppendLine($"Known servers: {string.Join(", ", knownServers)}");
+        sb.AppendLine();
+        sb.Append($"Admin message: {message}");
+
+        return sb.ToString();
     }
 
     private static AdminIntentRoute HeuristicFallback(
@@ -224,12 +300,8 @@ Admin message:
 
         var hintedServer = ExtractServerHint(message);
         var scope = ServerScopeResolver.Resolve(
-            message,
-            knownServers,
-            state,
-            ServerScopeKind.Unspecified,
-            null,
-            hintedServer,
+            message, knownServers, state,
+            ServerScopeKind.Unspecified, null, hintedServer,
             allowPluralDefaultAll: intent is AdminIntentType.StatusCheck or AdminIntentType.Troubleshooting,
             allowLastScopeFallback: true);
 
@@ -256,7 +328,9 @@ Admin message:
             lowered.Contains("new server") || lowered.Contains("update rcon") || lowered.Contains("edit server") ||
             lowered.Contains("rcon credential") || lowered.Contains("connect server"))
             return AdminIntentType.ServerManagement;
-        if (LooksLikeFileOrConfigIntent(lowered))
+        if (LooksLikeServerVariableIntent(lowered))
+            return AdminIntentType.RconCommand;
+        if (LooksLikeFileOrConfigIntent(lowered) || LooksLikeServerConfigValueIntent(lowered))
             return AdminIntentType.FileEdit;
         if (lowered.Contains("pull") || lowered.Contains("git") || lowered.Contains("rebuild") || lowered.Contains("build"))
             return AdminIntentType.Chat;
@@ -264,7 +338,7 @@ Admin message:
             return AdminIntentType.StatusCheck;
         if (lowered.Contains("plugin") || lowered.Contains("umod") || lowered.Contains("oxide") || lowered.Contains("compile") || lowered.Contains("compilation"))
             return AdminIntentType.Troubleshooting;
-        if (lowered.Contains("restart") || lowered.Contains("start") || lowered.Contains("stop") || lowered.Contains("kill") || lowered.Contains("update"))
+        if (lowered.Contains("restart") || lowered.Contains("wipe") || IsLifecycleVerb(lowered))
             return AdminIntentType.ServerControl;
         if (lowered.Contains("player") || lowered.Contains("ban"))
             return AdminIntentType.PlayerLookup;
@@ -277,12 +351,16 @@ Admin message:
         return AdminIntentType.Chat;
     }
 
+    // Standalone lifecycle verbs — only match when NOT part of "update rcon" etc.
+    private static bool IsLifecycleVerb(string lowered) =>
+        (lowered.Contains("start ") || lowered.Contains(" start") || lowered == "start") ||
+        (lowered.Contains("stop ") || lowered.Contains(" stop") || lowered == "stop") ||
+        lowered.Contains("kill ");
+
     private static bool ShouldPromoteToStatusIntent(AdminIntentType intent, string loweredMessage)
     {
         if (intent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
-        {
             return false;
-        }
 
         return loweredMessage.Contains("online", StringComparison.Ordinal) &&
                loweredMessage.Contains("server", StringComparison.Ordinal);
@@ -291,20 +369,24 @@ Admin message:
     private static bool HasExplicitIntentSignal(string loweredMessage) =>
         loweredMessage.Contains("restart", StringComparison.Ordinal) ||
         loweredMessage.Contains("start ", StringComparison.Ordinal) ||
-        loweredMessage.Contains("stop", StringComparison.Ordinal) ||
-        loweredMessage.Contains("kill", StringComparison.Ordinal) ||
-        loweredMessage.Contains("update", StringComparison.Ordinal) ||
+        loweredMessage.Contains("stop ", StringComparison.Ordinal) ||
+        loweredMessage.Contains("kill ", StringComparison.Ordinal) ||
+        loweredMessage.Contains("wipe ", StringComparison.Ordinal) ||
         loweredMessage.Contains("player", StringComparison.Ordinal) ||
         loweredMessage.Contains("ban", StringComparison.Ordinal) ||
         loweredMessage.Contains("rcon", StringComparison.Ordinal) ||
         loweredMessage.Contains("command", StringComparison.Ordinal) ||
+        loweredMessage.Contains("convar", StringComparison.Ordinal) ||
+        loweredMessage.Contains("variable", StringComparison.Ordinal) ||
         loweredMessage.Contains("pull", StringComparison.Ordinal) ||
         loweredMessage.Contains("rebuild", StringComparison.Ordinal) ||
         loweredMessage.Contains("build", StringComparison.Ordinal) ||
         loweredMessage.Contains("git", StringComparison.Ordinal) ||
         loweredMessage.Contains("compile", StringComparison.Ordinal) ||
         loweredMessage.Contains("serverconfig", StringComparison.Ordinal) ||
-        loweredMessage.Contains("server config", StringComparison.Ordinal);
+        loweredMessage.Contains("server config", StringComparison.Ordinal) ||
+        LooksLikeServerVariableIntent(loweredMessage) ||
+        LooksLikeServerConfigValueIntent(loweredMessage);
 
     private static bool IsCorrectionFollowUp(string loweredMessage) =>
         loweredMessage.StartsWith("no ", StringComparison.Ordinal) ||
@@ -317,15 +399,11 @@ Admin message:
     {
         intent = AdminIntentType.Chat;
         if (string.IsNullOrWhiteSpace(intentText))
-        {
             return false;
-        }
 
         var normalized = intentText.Trim();
         if (Enum.TryParse(normalized, true, out intent))
-        {
             return true;
-        }
 
         intent = ParseIntent(normalized.Replace(" ", "_", StringComparison.Ordinal));
         return intent != AdminIntentType.Clarification || normalized.Contains("clarification", StringComparison.OrdinalIgnoreCase);
@@ -338,14 +416,12 @@ Admin message:
             AdminIntentType.RconCommand or
             AdminIntentType.StatusCheck or
             AdminIntentType.Troubleshooting;
-        // ServerManagement does NOT require a pre-resolved server scope — it defines its own
+        // FileEdit and ServerManagement handle their own scope internally.
 
     private static string BuildClarificationQuestion(AdminIntentType intent, IReadOnlyList<string> knownServers, string? preferredQuestion)
     {
         if (!string.IsNullOrWhiteSpace(preferredQuestion))
-        {
             return preferredQuestion.Trim();
-        }
 
         var known = knownServers.Count == 0
             ? "No configured servers are currently available."
@@ -356,6 +432,7 @@ Admin message:
             AdminIntentType.ServerControl => $"Which single server should I target? {known}",
             AdminIntentType.PlayerLookup => $"Which server should I query for players? {known}",
             AdminIntentType.RconCommand => $"Which server should receive the RCON command? {known}",
+            AdminIntentType.FileEdit => $"Which server's config should I access? {known}",
             _ => $"Which server should I check? You can name one server or say 'all servers'. {known}"
         };
     }
@@ -375,21 +452,17 @@ Admin message:
 
     private static string InferDiagnosticsTarget(string loweredMessage)
     {
-        if (loweredMessage.Contains("network") || loweredMessage.Contains("latency") || loweredMessage.Contains("throughput") || loweredMessage.Contains("eth0") || loweredMessage.Contains("wg1") || loweredMessage.Contains("wt1"))
-        {
+        if (loweredMessage.Contains("network") || loweredMessage.Contains("latency") || loweredMessage.Contains("throughput") ||
+            loweredMessage.Contains("eth0") || loweredMessage.Contains("wg1") || loweredMessage.Contains("wt1"))
             return "rust.network.inspect";
-        }
 
         if (loweredMessage.Contains("compile") || loweredMessage.Contains("compilation") ||
             loweredMessage.Contains("plugin") || loweredMessage.Contains("umod") || loweredMessage.Contains("oxide"))
-        {
             return "rust.plugins.verify";
-        }
 
-        if (loweredMessage.Contains("log") || loweredMessage.Contains("error") || loweredMessage.Contains("exception") || loweredMessage.Contains("fail"))
-        {
+        if (loweredMessage.Contains("log") || loweredMessage.Contains("error") ||
+            loweredMessage.Contains("exception") || loweredMessage.Contains("fail"))
             return "rust.logs.inspect";
-        }
 
         return "rust.status.check";
     }
@@ -397,9 +470,7 @@ Admin message:
     private static string? NormalizeTargetRef(string? targetRef)
     {
         if (string.IsNullOrWhiteSpace(targetRef))
-        {
             return null;
-        }
 
         return targetRef.Trim().ToLowerInvariant() switch
         {
@@ -419,26 +490,91 @@ Admin message:
 
     private static bool LooksLikeFileOrConfigIntent(string lowered)
     {
-        var mentionsConfig = lowered.Contains("config", StringComparison.Ordinal) ||
-                             lowered.Contains("serverconfig", StringComparison.Ordinal) ||
-                             lowered.Contains(".json", StringComparison.Ordinal) ||
-                             lowered.Contains(".cfg", StringComparison.Ordinal);
+        var mentionsConfig =
+            lowered.Contains("config", StringComparison.Ordinal) ||
+            lowered.Contains("serverconfig", StringComparison.Ordinal) ||
+            lowered.Contains(".json", StringComparison.Ordinal) ||
+            lowered.Contains(".cfg", StringComparison.Ordinal);
 
-        var readVerb = lowered.Contains("show", StringComparison.Ordinal) ||
-                       lowered.Contains("read", StringComparison.Ordinal) ||
-                       lowered.Contains("view", StringComparison.Ordinal) ||
-                       lowered.Contains("open", StringComparison.Ordinal) ||
-                       lowered.Contains("display", StringComparison.Ordinal) ||
-                       lowered.Contains("contents", StringComparison.Ordinal) ||
-                       lowered.Contains("print", StringComparison.Ordinal);
+        var readVerb =
+            lowered.Contains("show", StringComparison.Ordinal) ||
+            lowered.Contains("read", StringComparison.Ordinal) ||
+            lowered.Contains("view", StringComparison.Ordinal) ||
+            lowered.Contains("open", StringComparison.Ordinal) ||
+            lowered.Contains("display", StringComparison.Ordinal) ||
+            lowered.Contains("contents", StringComparison.Ordinal) ||
+            lowered.Contains("print", StringComparison.Ordinal);
 
-        var editVerb = lowered.Contains("set ", StringComparison.Ordinal) ||
-                       lowered.Contains("change ", StringComparison.Ordinal) ||
-                       lowered.Contains("update ", StringComparison.Ordinal) ||
-                       lowered.Contains("edit ", StringComparison.Ordinal) ||
-                       lowered.Contains("modify ", StringComparison.Ordinal);
+        var editVerb =
+            lowered.Contains("set ", StringComparison.Ordinal) ||
+            lowered.Contains("change ", StringComparison.Ordinal) ||
+            lowered.Contains("update ", StringComparison.Ordinal) ||
+            lowered.Contains("edit ", StringComparison.Ordinal) ||
+            lowered.Contains("modify ", StringComparison.Ordinal);
 
         return mentionsConfig && (readVerb || editVerb);
+    }
+
+    private static bool LooksLikeServerVariableIntent(string lowered)
+    {
+        var hasDottedIdentifier = Regex.IsMatch(lowered, @"\b[a-z][a-z0-9_-]*\.[a-z0-9_.-]+\b", RegexOptions.IgnoreCase);
+        if (!hasDottedIdentifier)
+            return false;
+
+        // Don't classify config file keys as convars
+        if (ConfigFileKeys.Any(k => lowered.Contains(k, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        return
+            lowered.Contains("what does", StringComparison.Ordinal) ||
+            lowered.Contains("description", StringComparison.Ordinal) ||
+            lowered.Contains("explain", StringComparison.Ordinal) ||
+            lowered.Contains("value", StringComparison.Ordinal) ||
+            lowered.Contains("current", StringComparison.Ordinal) ||
+            lowered.Contains("fetch", StringComparison.Ordinal) ||
+            lowered.Contains("get ", StringComparison.Ordinal) ||
+            lowered.Contains("read ", StringComparison.Ordinal) ||
+            lowered.Contains("what is", StringComparison.Ordinal) ||
+            lowered.Contains("set ", StringComparison.Ordinal) ||
+            lowered.Contains("change ", StringComparison.Ordinal) ||
+            lowered.Contains("update ", StringComparison.Ordinal) ||
+            lowered.Contains("server variable", StringComparison.Ordinal) ||
+            lowered.Contains("convar", StringComparison.Ordinal);
+    }
+
+    private static bool LooksLikeServerConfigValueIntent(string lowered)
+    {
+        var mentionsServerOrConfig =
+            lowered.Contains(" server", StringComparison.Ordinal) ||
+            lowered.Contains("servers", StringComparison.Ordinal) ||
+            lowered.Contains("config", StringComparison.Ordinal);
+        if (!mentionsServerOrConfig)
+            return false;
+
+        var asksValue =
+            lowered.Contains("what is", StringComparison.Ordinal) ||
+            lowered.Contains("what's", StringComparison.Ordinal) ||
+            lowered.Contains("whats", StringComparison.Ordinal) ||
+            lowered.Contains("value", StringComparison.Ordinal) ||
+            lowered.Contains("show", StringComparison.Ordinal) ||
+            lowered.Contains("get ", StringComparison.Ordinal) ||
+            lowered.Contains("read ", StringComparison.Ordinal);
+        if (!asksValue)
+            return false;
+
+        return
+            lowered.Contains("worldsize", StringComparison.Ordinal) ||
+            lowered.Contains("world size", StringComparison.Ordinal) ||
+            lowered.Contains("maxplayers", StringComparison.Ordinal) ||
+            lowered.Contains("max players", StringComparison.Ordinal) ||
+            lowered.Contains("hostname", StringComparison.Ordinal) ||
+            lowered.Contains("server name", StringComparison.Ordinal) ||
+            lowered.Contains("server.seed", StringComparison.Ordinal) ||
+            lowered.Contains("seed", StringComparison.Ordinal) ||
+            lowered.Contains("rcon.port", StringComparison.Ordinal) ||
+            lowered.Contains("rcon.password", StringComparison.Ordinal) ||
+            lowered.Contains("app.port", StringComparison.Ordinal) ||
+            lowered.Contains("server.port", StringComparison.Ordinal);
     }
 
     private static ServerScopeKind ParseScopeKind(string? value) => value?.Trim().ToLowerInvariant() switch
@@ -467,10 +603,7 @@ Admin message:
         var start = raw.IndexOf('{');
         var end = raw.LastIndexOf('}');
         if (start < 0 || end <= start)
-        {
             return null;
-        }
-
         return raw[start..(end + 1)];
     }
 
@@ -515,9 +648,7 @@ Admin message:
     private string BuildSystemPrefix()
     {
         if (!_settings.UseChatSystemPrompt || string.IsNullOrWhiteSpace(_settings.ChatSystemPrompt))
-        {
             return string.Empty;
-        }
 
         return $"System guidance:\n{_settings.ChatSystemPrompt!.Trim()}\n\n";
     }

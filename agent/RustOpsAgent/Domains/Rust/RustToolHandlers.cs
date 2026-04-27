@@ -414,12 +414,18 @@ internal sealed class RustRconToolHandler : IToolHandler
     private readonly RustOpsApiClient _api;
     private readonly NeoCortexStore _memory;
     private readonly Core.Contracts.CommandExecutionSettings _cmdSettings;
+    private readonly ServerKnowledgeCatalog _knowledge;
 
-    public RustRconToolHandler(RustOpsApiClient api, NeoCortexStore? memory = null, Core.Contracts.CommandExecutionSettings? cmdSettings = null)
+    public RustRconToolHandler(
+        RustOpsApiClient api,
+        NeoCortexStore? memory = null,
+        Core.Contracts.CommandExecutionSettings? cmdSettings = null,
+        ServerKnowledgeCatalog? knowledge = null)
     {
         _api = api;
         _memory = memory ?? new NeoCortexStore("data/NeoCortex", "data/agent-state.json");
         _cmdSettings = cmdSettings ?? new Core.Contracts.CommandExecutionSettings();
+        _knowledge = knowledge ?? new ServerKnowledgeCatalog();
     }
 
     public string Name => "rust.rcon.command";
@@ -427,6 +433,16 @@ internal sealed class RustRconToolHandler : IToolHandler
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
+        var knowledgeIntent = ParseKnowledgeIntent(context.Message);
+        if (knowledgeIntent.Operation == KnowledgeOperation.Explain)
+        {
+            var explanation = BuildKnowledgeExplanation(knowledgeIntent);
+            if (!string.IsNullOrWhiteSpace(explanation))
+            {
+                return new ToolExecutionResult(true, explanation);
+            }
+        }
+
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
         if (string.IsNullOrWhiteSpace(server))
         {
@@ -450,18 +466,37 @@ internal sealed class RustRconToolHandler : IToolHandler
             return new ToolExecutionResult(true, $"RCON console ({log.Count} lines, last 40):\n{TruncateOutput(preview, 1200)}", server, false);
         }
 
-        var command = context.Route.Slots.CommandText;
-        if (string.IsNullOrWhiteSpace(command))
-            command = ExtractCommandFromMessage(context.Message);
+        var bypassPolicy = false;
+        string? command;
+        if (knowledgeIntent.Operation == KnowledgeOperation.GetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
+        {
+            command = knowledgeIntent.EntryName;
+            bypassPolicy = knowledgeIntent.VariableDefinition is not null;
+        }
+        else if (knowledgeIntent.Operation == KnowledgeOperation.SetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
+        {
+            var value = RustToolHelper.StripTrailingServerQualifier(knowledgeIntent.Value ?? string.Empty, server);
+            command = $"{knowledgeIntent.EntryName} {value}".Trim();
+            bypassPolicy = knowledgeIntent.VariableDefinition is not null;
+        }
+        else
+        {
+            command = context.Route.Slots.CommandText;
+            if (string.IsNullOrWhiteSpace(command))
+                command = ExtractCommandFromMessage(context.Message);
+        }
 
         if (string.IsNullOrWhiteSpace(command))
             return new ToolExecutionResult(false, "Which command should I run? Quote it or say 'run status'.", server, false, "clarification_required");
 
         // Normalize: take only the first token for policy checks (e.g. "oxide.reload MyPlugin" → "oxide.reload")
         var commandRoot = command.Split(' ', 2)[0].ToLowerInvariant();
-        var policyCheck = CheckCommandPolicy(commandRoot);
-        if (policyCheck is not null)
-            return new ToolExecutionResult(false, policyCheck, server, false, "policy_blocked");
+        if (!bypassPolicy)
+        {
+            var policyCheck = CheckCommandPolicy(commandRoot);
+            if (policyCheck is not null)
+                return new ToolExecutionResult(false, policyCheck, server, false, "policy_blocked");
+        }
 
         string reply;
         bool succeeded;
@@ -491,8 +526,126 @@ internal sealed class RustRconToolHandler : IToolHandler
             succeeded = false;
         }
 
+        if (succeeded && knowledgeIntent.Operation == KnowledgeOperation.GetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
+        {
+            reply = $"Current `{knowledgeIntent.EntryName}` on {server}: {reply}";
+        }
+        else if (succeeded && knowledgeIntent.Operation == KnowledgeOperation.SetVariable && !string.IsNullOrWhiteSpace(knowledgeIntent.EntryName))
+        {
+            reply = $"Updated `{knowledgeIntent.EntryName}` on {server}. {reply}";
+        }
+
         RecordCommandOutcome(commandRoot, succeeded);
         return new ToolExecutionResult(succeeded, reply, server, succeeded);
+    }
+
+    private string? BuildKnowledgeExplanation(KnowledgeIntent intent)
+    {
+        if (intent.VariableDefinition is not null)
+        {
+            var def = intent.VariableDefinition;
+            var description = string.IsNullOrWhiteSpace(def.Description)
+                ? "No description available in catalog."
+                : def.Description;
+            var defaultValue = string.IsNullOrWhiteSpace(def.DefaultValue) ? "unknown" : def.DefaultValue;
+            var typeLabel = string.IsNullOrWhiteSpace(def.DefaultType) ? string.Empty : $" ({def.DefaultType})";
+            var generated = def.Generated ? "yes" : "no";
+            return $"`{def.Name}`: {description} Default: `{defaultValue}`{typeLabel}. Generated on startup: {generated}.";
+        }
+
+        if (intent.CommandDefinition is not null)
+        {
+            var def = intent.CommandDefinition;
+            var description = string.IsNullOrWhiteSpace(def.Description)
+                ? "No description available in catalog."
+                : def.Description;
+            var riskLabel = string.IsNullOrWhiteSpace(def.RiskLevel) ? string.Empty : $" Risk: {def.RiskLevel}.";
+            var generated = def.Generated ? "yes" : "no";
+            return $"`{def.Name}`: {description}{riskLabel} Generated marker: {generated}.";
+        }
+
+        if (!string.IsNullOrWhiteSpace(intent.EntryName))
+        {
+            var snapshot = _knowledge.GetSnapshot();
+            return $"I don't have `{intent.EntryName}` in my command/variable catalogs yet. Catalog files: variables `{snapshot.VariablesPath ?? "not found"}`, commands `{snapshot.CommandsPath ?? "not found"}`.";
+        }
+
+        return null;
+    }
+
+    private KnowledgeIntent ParseKnowledgeIntent(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        var snapshot = _knowledge.GetSnapshot();
+
+        var setMatch = Regex.Match(
+            message,
+            @"\b(?:set|change|update)\s+(?<name>[A-Za-z][A-Za-z0-9._-]+)\s*(?:to|=)\s*(?<value>.+)$",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        if (setMatch.Success)
+        {
+            var setName = ServerKnowledgeCatalog.NormalizeName(setMatch.Groups["name"].Value);
+            var setValue = setMatch.Groups["value"].Value.Trim().TrimEnd('.', ';');
+            snapshot.Variables.TryGetValue(setName ?? string.Empty, out var setVariable);
+            return new KnowledgeIntent(
+                KnowledgeOperation.SetVariable,
+                setName,
+                setValue,
+                setVariable,
+                null);
+        }
+
+        var mentioned = _knowledge.FindMentionedEntry(message);
+        var entryName = mentioned?.Name;
+        if (string.IsNullOrWhiteSpace(entryName))
+        {
+            var fallbackMatch = Regex.Match(message, @"\b[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z0-9_.-]+\b");
+            if (fallbackMatch.Success)
+            {
+                entryName = ServerKnowledgeCatalog.NormalizeName(fallbackMatch.Value);
+            }
+        }
+        ServerVariableDefinition? variable = null;
+        ServerCommandDefinition? command = null;
+
+        if (!string.IsNullOrWhiteSpace(entryName))
+        {
+            _knowledge.TryGetVariable(entryName, out variable);
+            _knowledge.TryGetCommand(entryName, out command);
+        }
+
+        var wantsDescription =
+            lowered.Contains("what does", StringComparison.Ordinal) ||
+            lowered.Contains("description of", StringComparison.Ordinal) ||
+            lowered.Contains("explain ", StringComparison.Ordinal) ||
+            (lowered.Contains(" do", StringComparison.Ordinal) && !lowered.Contains("how do", StringComparison.Ordinal));
+
+        var wantsValue =
+            lowered.Contains("value of", StringComparison.Ordinal) ||
+            lowered.Contains("current value", StringComparison.Ordinal) ||
+            lowered.Contains("get ", StringComparison.Ordinal) ||
+            lowered.Contains("fetch", StringComparison.Ordinal) ||
+            lowered.Contains("read ", StringComparison.Ordinal) ||
+            ((lowered.Contains("what is", StringComparison.Ordinal) ||
+              lowered.Contains("what's", StringComparison.Ordinal) ||
+              lowered.Contains("whats", StringComparison.Ordinal)) && !wantsDescription);
+
+        if (wantsDescription && !string.IsNullOrWhiteSpace(entryName))
+        {
+            return new KnowledgeIntent(KnowledgeOperation.Explain, entryName, null, variable, command);
+        }
+
+        if (wantsValue && !string.IsNullOrWhiteSpace(entryName))
+        {
+            if (command is not null && variable is null)
+            {
+                return new KnowledgeIntent(KnowledgeOperation.Explain, entryName, null, null, command);
+            }
+
+            return new KnowledgeIntent(KnowledgeOperation.GetVariable, entryName, null, variable, command);
+        }
+
+        return KnowledgeIntent.None;
     }
 
     private string? CheckCommandPolicy(string commandRoot)
@@ -658,6 +811,25 @@ internal sealed class RustRconToolHandler : IToolHandler
         }
 
         return string.Empty;
+    }
+
+    private enum KnowledgeOperation
+    {
+        None,
+        Explain,
+        GetVariable,
+        SetVariable
+    }
+
+    private sealed record KnowledgeIntent(
+        KnowledgeOperation Operation,
+        string? EntryName,
+        string? Value,
+        ServerVariableDefinition? VariableDefinition,
+        ServerCommandDefinition? CommandDefinition)
+    {
+        public static KnowledgeIntent None { get; } =
+            new(KnowledgeOperation.None, null, null, null, null);
     }
 }
 
@@ -1300,11 +1472,39 @@ internal static class RustToolHelper
                 AdminIntentType.ServerControl => $"Which single server should I target? {known}",
                 AdminIntentType.RconCommand => $"Which server should receive this command? {known}",
                 AdminIntentType.PlayerLookup => $"Which server should I query for players? {known}",
+                AdminIntentType.FileEdit => $"Which server's config should I access? {known}",
                 _ => $"Which server should I use? {known}"
             };
         }
 
         return $"Which server should I check? You can name one server or say 'all servers'. {known}";
+    }
+
+    // Strips a trailing "on <server>" or "for <server>" qualifier from a value string extracted
+    // from natural language (e.g. "200 on cotton" → "200").
+    public static string StripTrailingServerQualifier(string valueText, string? serverName)
+    {
+        if (string.IsNullOrWhiteSpace(valueText))
+            return valueText;
+
+        var result = valueText.Trim();
+        if (!string.IsNullOrWhiteSpace(serverName))
+        {
+            var escapedServer = Regex.Escape(serverName);
+            result = Regex.Replace(
+                result,
+                $@"\s+(?:on|for)\s+{escapedServer}(?:\s+server)?\s*$",
+                string.Empty,
+                RegexOptions.IgnoreCase);
+        }
+
+        result = Regex.Replace(
+            result,
+            @"\s+(?:on|for)\s+[A-Za-z0-9._-]+(?:\s+server)?\s*$",
+            string.Empty,
+            RegexOptions.IgnoreCase);
+
+        return result.Trim();
     }
 
     public static async Task<List<string>> GetKnownServersAsync(RustOpsApiClient api, CancellationToken cancellationToken)
