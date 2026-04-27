@@ -15,8 +15,9 @@ internal sealed class GitOpsService : IGitOpsService
 
     public async Task<string> EnsureAgentBranchAsync(string slug, CancellationToken cancellationToken)
     {
-        var branch = $"agent/{DateTime.UtcNow:yyyyMMdd}-{SanitizeSlug(slug)}";
+        const string branch = "agent-updates";
         await RunGitAsync($"checkout -B {branch}", cancellationToken);
+        await RunGitAsync($"pull --rebase {_settings.RemoteName} main", cancellationToken);
         return branch;
     }
 
@@ -28,11 +29,14 @@ internal sealed class GitOpsService : IGitOpsService
 
     public async Task PushAsync(string branchName, CancellationToken cancellationToken)
     {
+        var isAgentBranch = string.Equals(branchName, "agent-updates", StringComparison.OrdinalIgnoreCase) ||
+                            branchName.StartsWith("agent/", StringComparison.OrdinalIgnoreCase);
+
         if (string.Equals(branchName, "main", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(branchName, "master", StringComparison.OrdinalIgnoreCase) ||
-            !branchName.StartsWith("agent/", StringComparison.OrdinalIgnoreCase))
+            !isAgentBranch)
         {
-            throw new InvalidOperationException("Direct push to non-agent branches is blocked. Use agent/* only.");
+            throw new InvalidOperationException("Direct push to non-agent branches is blocked. Use 'agent-updates' or 'agent/*' only.");
         }
 
         await RunGitAsync($"push -u {_settings.RemoteName} {branchName}", cancellationToken);
@@ -40,9 +44,12 @@ internal sealed class GitOpsService : IGitOpsService
 
     public async Task<string> CreatePrAsync(string branchName, string title, string body, CancellationToken cancellationToken)
     {
-        if (!branchName.StartsWith("agent/", StringComparison.OrdinalIgnoreCase))
+        var isAgentBranch = string.Equals(branchName, "agent-updates", StringComparison.OrdinalIgnoreCase) ||
+                            branchName.StartsWith("agent/", StringComparison.OrdinalIgnoreCase);
+
+        if (!isAgentBranch)
         {
-            throw new InvalidOperationException("PR branch must be under agent/*.");
+            throw new InvalidOperationException("PR branch must be 'agent-updates' or under 'agent/*'.");
         }
 
         var cmd = $"pr create --base {_settings.BaseBranch} --head {branchName} --title \"{Escape(title)}\" --body \"{Escape(body)}\"";
@@ -119,12 +126,6 @@ internal sealed class GitOpsService : IGitOpsService
         }
 
         return string.IsNullOrWhiteSpace(stdOut) ? "ok" : stdOut.Trim();
-    }
-
-    private static string SanitizeSlug(string value)
-    {
-        var safe = new string(value.ToLowerInvariant().Where(ch => char.IsLetterOrDigit(ch) || ch is '-' or '_').ToArray());
-        return string.IsNullOrWhiteSpace(safe) ? "update" : safe;
     }
 
     private static string Escape(string value) => value.Replace("\\", "\\\\").Replace("\"", "\\\"");
