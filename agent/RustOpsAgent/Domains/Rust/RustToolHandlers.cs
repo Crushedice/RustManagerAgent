@@ -166,6 +166,8 @@ internal sealed class RustStatusToolHandler : IToolHandler
 
 internal sealed class RustServerControlToolHandler : IToolHandler
 {
+    private const int DefaultRestartCountdownSeconds = 120;
+
     private readonly RustOpsApiClient _api;
     private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
 
@@ -191,8 +193,9 @@ internal sealed class RustServerControlToolHandler : IToolHandler
             !string.IsNullOrWhiteSpace(context.SelectionState.LastServerName))
         {
             var secs = TryExtractAnyNumber(message);
-            if (secs.HasValue)
-                return await ExecuteRestartAsync(context, context.SelectionState.LastServerName, secs.Value, cancellationToken);
+            var pendingServer = await RustToolHelper.ResolveKnownServerNameAsync(_api, context.SelectionState.LastServerName, cancellationToken);
+            if (secs.HasValue && !string.IsNullOrWhiteSpace(pendingServer))
+                return await ExecuteRestartAsync(context, pendingServer, secs.Value, cancellationToken);
         }
 
         var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
@@ -227,17 +230,8 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 
     private async Task<ToolExecutionResult> HandleRestartAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
     {
-        var seconds = ParseRestartSeconds(context.Message);
-        if (seconds is null)
-        {
-            return new ToolExecutionResult(
-                false,
-                $"How many seconds should the countdown be before {server} restarts? (e.g., say 'restart {server} in 300 seconds')",
-                server, false, "clarification_required",
-                SelectedServers: context.SelectionState.LastResolvedServers,
-                ScopeKind: ServerScopeKind.Single);
-        }
-        return await ExecuteRestartAsync(context, server, seconds.Value, cancellationToken);
+        var seconds = ParseRestartSeconds(context.Message) ?? DefaultRestartCountdownSeconds;
+        return await ExecuteRestartAsync(context, server, seconds, cancellationToken);
     }
 
     private async Task<ToolExecutionResult> ExecuteRestartAsync(ToolExecutionContext context, string server, int seconds, CancellationToken cancellationToken)
@@ -1245,9 +1239,33 @@ internal static class RustToolHelper
             context,
             knownServers,
             allowPluralDefaultAll: false);
-        return scope.Servers.Count == 1
-            ? scope.Servers[0]
-            : null;
+        if (scope.Servers.Count != 1)
+        {
+            return null;
+        }
+
+        return ResolveKnownServerName(scope.Servers[0], knownServers);
+    }
+
+    public static async Task<string?> ResolveKnownServerNameAsync(RustOpsApiClient api, string? server, CancellationToken cancellationToken)
+    {
+        var knownServers = await GetKnownServersAsync(api, cancellationToken);
+        return ResolveKnownServerName(server, knownServers);
+    }
+
+    private static string? ResolveKnownServerName(string? server, IReadOnlyList<string> knownServers)
+    {
+        if (string.IsNullOrWhiteSpace(server))
+        {
+            return null;
+        }
+
+        if (knownServers.Count == 0)
+        {
+            return server.Trim();
+        }
+
+        return ServerScopeResolver.MatchKnownServer(server, knownServers);
     }
 
     public static ScopeResolution ResolveServerScope(
