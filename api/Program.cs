@@ -916,7 +916,7 @@ app.MapPost("/servers/{server}/start", async (string server) =>
     if (LoadServerConfig(server) is null)
         return Results.BadRequest(new ApiError("missing_config", $"No config found for '{server}'."));
 
-    var result = await rustMgr.ExecuteLifecycleAsync(server, "start");
+    var result = await ExecRustMgrAsync("start", server);
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
@@ -929,7 +929,7 @@ app.MapPost("/servers/{server}/stop", async (string server) =>
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result = await rustMgr.ExecuteLifecycleAsync(server, "stop");
+    var result = await ExecRustMgrAsync("stop", server);
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
@@ -945,7 +945,7 @@ app.MapPost("/servers/{server}/restart", async (string server) =>
     if (LoadServerConfig(server) is null)
         return Results.BadRequest(new ApiError("missing_config", $"No config found for '{server}'."));
 
-    var result = await rustMgr.ExecuteLifecycleAsync(server, "restart");
+    var result = await ExecRustMgrAsync("restart", server);
     return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
 });
 
