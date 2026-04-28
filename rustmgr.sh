@@ -13,7 +13,7 @@ RUST_APP_ID="${RUST_APP_ID:-258550}"
 
 QUERY_TIMEOUT_SECONDS="${QUERY_TIMEOUT_SECONDS:-8}"
 STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-30}"
-START_WAIT_SECONDS="${START_WAIT_SECONDS:-15}"
+START_WAIT_SECONDS="${START_WAIT_SECONDS:-45}"
 RESTART_LOOP_DELAY_SECONDS="${RESTART_LOOP_DELAY_SECONDS:-5}"
 
 mkdir -p "$CONFIG_DIR" "$GENERATED_DIR" "$RUNTIME_DIR"
@@ -805,13 +805,17 @@ start_one() {
     tmux new-session -d -s "$(session_name "$server")" "bash -lc $(shell_escape "$runner_path")"
 
     waited=0
+    detected_pid=""
     while (( waited < START_WAIT_SECONDS )); do
         pid="$(server_pid "$server" || true)"
         if [[ -n "$pid" ]]; then
-            sleep 4
+            if [[ -z "$detected_pid" ]]; then
+                detected_pid="$pid"
+            fi
+            sleep 3
             local final_pid
             final_pid="$(server_pid "$server" || true)"
-            if [[ -n "$final_pid" ]]; then
+            if [[ -n "$final_pid" ]] && [[ "$final_pid" == "$detected_pid" ]]; then
                 echo "started $server"
                 return 0
             fi
