@@ -14,7 +14,10 @@ internal enum MemoryRecordType
     ServerState,
     ToolObservation,
     Reflection,
-    PluginSummary
+    PluginSummary,
+    Exception,
+    ServerConvar,
+    ServerCommand
 }
 
 internal enum MemoryScope
@@ -39,7 +42,9 @@ internal enum MemorySource
     AiGeneratedImport,
     FailedAttempt,
     VerifiedFact,
-    PluginSummary
+    PluginSummary,
+    LogClassifier,
+    ServerCatalog
 }
 
 internal enum MemoryApprovalState

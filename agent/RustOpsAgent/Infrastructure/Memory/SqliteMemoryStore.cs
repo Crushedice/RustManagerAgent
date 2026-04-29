@@ -144,8 +144,11 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
             var importance = Math.Clamp(candidate.Importance, 0.0, 1.0);
             var scopeBoost = request.Scope is not null && request.Scope == candidate.Scope ? 0.1 : 0.0;
             var typeBoost = candidate.Type is MemoryRecordType.Fix or MemoryRecordType.Procedure ? 0.08 :
+                candidate.Type is MemoryRecordType.ServerConvar or MemoryRecordType.ServerCommand ? 0.06 :
+                candidate.Type == MemoryRecordType.Exception ? 0.04 :
                 candidate.Type == MemoryRecordType.Failure ? -0.04 : 0.0;
             var sourceBoost = candidate.Source is MemorySource.VerifiedFact ? 0.12 :
+                candidate.Source is MemorySource.ServerCatalog or MemorySource.PluginSummary ? 0.1 :
                 candidate.Source is MemorySource.ManualImport or MemorySource.SeededImport ? 0.08 : 0.0;
             var verifiedBoost = candidate.LastVerifiedUtc.HasValue
                 ? Math.Clamp(Math.Exp(Math.Max(0, (now - candidate.LastVerifiedUtc.Value).TotalDays) / -90.0), 0.0, 1.0) * 0.08

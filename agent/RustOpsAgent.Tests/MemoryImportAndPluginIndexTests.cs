@@ -210,6 +210,31 @@ public class MemoryImportAndPluginIndexTests
         Assert.DoesNotContain("raw source", result.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task RustChatToolHandler_Imports_Server_Catalog_With_Specific_Memory_Types()
+    {
+        var root = TempRoot();
+        var variablesPath = Path.Combine(root, "ServerVariables.agent-readable.jsonl");
+        var commandsPath = Path.Combine(root, "ServerCommands.agent-readable.jsonl");
+        await File.WriteAllTextAsync(variablesPath, """
+        {"convar":"server.pve","generated_on_start":true,"default_raw":"False","default_type":"boolean","description":"Enables PvE mode"}
+        """);
+        await File.WriteAllTextAsync(commandsPath, """
+        {"command":"server.readcfg","generated_command_metadata":true,"description":"Reads and executes server config files","risk_level_inferred":"safe","tags":["config"]}
+        """);
+
+        var (service, _, _) = MakeMemory(root);
+        var knowledge = new ServerKnowledgeCatalog(variablesPath, commandsPath);
+        var handler = new RustChatToolHandler(MakeNeoCortex(root), service, knowledge: knowledge);
+
+        var result = await ExecuteChatCommandAsync(handler, "memory import server catalog");
+        var records = await service.ListRecentAsync(10, CancellationToken.None);
+
+        Assert.True(result.Success);
+        Assert.Contains(records, record => record.Type == MemoryRecordType.ServerConvar && record.Source == MemorySource.ServerCatalog && record.Summary.Contains("server.pve", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(records, record => record.Type == MemoryRecordType.ServerCommand && record.Source == MemorySource.ServerCatalog && record.Summary.Contains("server.readcfg", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static (SemanticMemoryService Service, IInspectableMemoryStore Store, MemorySettings Settings) MakeMemory(string root)
     {
         var settings = new MemorySettings

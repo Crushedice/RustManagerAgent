@@ -602,6 +602,74 @@ public class SemanticMemoryTests
     }
 
     [Fact]
+    public async Task RecordServerFact_Reclassifies_Exception_Log_And_Drops_Unrelated_Console_Noise()
+    {
+        var root = TempRoot();
+        var service = MakeService(root, new FakeEmbeddingProvider());
+        var detail = """
+        Server: sandbox
+        Log: [Empty Low FPS] Server is no longer empty, setting FPS limit to 30
+        Calling 'OnPlayerConnected' on 'WelcomePanel v3.2.21' took 533ms [GARBAGE COLLECT]
+        Wave ddso dorf with steamid 76561198778952007 joined from ip 80.138.130.74:62953
+        	NetworkId 76561198778952007 is 4663253 (Wave ddso dorf)
+        MySql handle raised an exception (MySqlException: Unable to connect to any of the specified MySQL hosts.)
+          at MySqlConnector.Core.ServerSession.OpenTcpSocketAsync (MySqlConnector.Core.ConnectionSettings cs) [0x0066e] in <dbba0abc564f4cbc913b724e430f6d9b>:0
+          at MySqlConnector.Core.ServerSession.ConnectAsync (MySqlConnector.Core.ConnectionSettings cs) [0x0023a] in <dbba0abc564f4cbc913b724e430f6d9b>:0
+        """;
+
+        await service.RecordServerFactAsync(
+            "sandbox",
+            "[sandbox] server log sample",
+            detail,
+            new[] { "log", "high-importance", "sandbox" },
+            CancellationToken.None);
+
+        var record = Assert.Single(await service.ListRecentAsync(10, CancellationToken.None));
+        Assert.Equal(MemoryRecordType.Exception, record.Type);
+        Assert.Equal(MemorySource.LogClassifier, record.Source);
+        Assert.Equal(MemoryApprovalState.Active, record.ApprovalState);
+        Assert.Contains("MySqlException", record.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("joined from ip", record.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("76561198778952007", record.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("80.138.130.74", record.Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task RecordServerFact_Skips_Mundane_Console_Log()
+    {
+        var root = TempRoot();
+        var service = MakeService(root, new FakeEmbeddingProvider());
+
+        await service.RecordServerFactAsync(
+            "sandbox",
+            "[sandbox] player joined",
+            "Server: sandbox\nLog: Player with steamid 76561198778952007 joined from ip 80.138.130.74:62953\nNetworkId 76561198778952007 is 4663253",
+            new[] { "log", "high-importance", "sandbox" },
+            CancellationToken.None);
+
+        Assert.Empty(await service.ListRecentAsync(10, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RecordServerFact_Puts_Ambiguous_Log_Findings_In_Pending_Approval()
+    {
+        var root = TempRoot();
+        var service = MakeService(root, new FakeEmbeddingProvider());
+
+        await service.RecordServerFactAsync(
+            "sandbox",
+            "[sandbox] warning line",
+            "Server: sandbox\nLog: Warning: plugin response took longer than expected",
+            new[] { "log", "high-importance", "sandbox" },
+            CancellationToken.None);
+
+        var pending = Assert.Single(await service.ListPendingAsync(10, CancellationToken.None));
+        Assert.Equal(MemoryRecordType.ToolObservation, pending.Type);
+        Assert.Equal(MemoryApprovalState.Pending, pending.ApprovalState);
+        Assert.True(pending.Confidence < 0.82);
+    }
+
+    [Fact]
     public async Task AgentRuntime_Skips_Search_And_Write_When_Memory_Disabled()
     {
         var root = TempRoot();

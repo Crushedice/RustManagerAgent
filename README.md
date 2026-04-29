@@ -232,12 +232,28 @@ The Steam/admin chat path also exposes memory inspection and maintenance command
 Seed curated knowledge with:
 
 - `/memory import <folderPath>` to recursively import `.md`, `.txt`, and `.json` files.
+- `/memory import server catalog [limit N] [dry-run]` to import the local Rust server convar and server command catalogs into semantic memory.
+- `/memory import convar catalog [limit N] [dry-run]` as an alias for the same server catalog import.
 - `/memory pending` to list imports awaiting approval.
 - `/memory approve <id>` or `/memory reject <id>` to control activation.
 - `/memory search <query>` to search active semantic memory.
 - `/memory forget <id>` to delete a record.
 
 Trusted manual seed folders such as `knowledge/verified` can become active immediately. AI-generated seed folders such as `knowledge/ai-generated` default to pending unless imported with `--trusted`. Normal agent recall ignores pending and rejected memory records.
+
+Server catalog imports read `ServerVariables.agent-readable.jsonl` and `ServerCommands.agent-readable.jsonl` by default. Override those paths with `RUSTOPS_SERVER_VARIABLES_PATH` and `RUSTOPS_SERVER_COMMANDS_PATH` if the files live elsewhere.
+
+Example server convar JSONL row:
+
+```json
+{"convar":"server.pve","generated_on_start":true,"default_raw":"False","default_type":"boolean","description":"Enables PvE mode - players cannot damage other players."}
+```
+
+Example server command JSONL row:
+
+```json
+{"command":"server.readcfg","generated_command_metadata":true,"description":"Reads and executes serverauto.cfg then server.cfg from the server cfg folder.","risk_level_inferred":"safe","tags":["config","server"]}
+```
 
 ## Plugin Reference Index
 
@@ -255,6 +271,26 @@ Admin commands:
 ```
 
 Existing plugin verification/update checks also refresh the plugin reference index for the checked server and write only a compact `PluginSummary` semantic memory.
+
+Plugin indexing reads the live plugin `.cs` paths returned by `/servers/{server}/oxide/validate`. A minimal plugin source that produces index entries looks like:
+
+```csharp
+[Info("Kits", "Facepunch", "1.2.3")]
+[Description("Kit menu")]
+class Kits : RustPlugin
+{
+    [ChatCommand("kit")]
+    void KitCommand(BasePlayer player, string command, string[] args) {}
+
+    [ConsoleCommand("inventory.give")]
+    void Give(ConsoleSystem.Arg arg) {}
+
+    void Init()
+    {
+        permission.RegisterPermission("kits.admin", this);
+    }
+}
+```
 
 ## Verification Status
 

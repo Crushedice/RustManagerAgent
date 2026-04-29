@@ -507,8 +507,8 @@ internal sealed class RustChatToolHandler : IToolHandler
         var snapshot = _knowledge.GetSnapshot();
         var variables = snapshot.Variables.Values.OrderBy(variable => variable.Name, StringComparer.OrdinalIgnoreCase).ToList();
         var commands = snapshot.Commands.Values.OrderBy(command => command.Name, StringComparer.OrdinalIgnoreCase).ToList();
-        var entries = variables.Select(variable => (summary: $"Rust server convar: {variable.Name}", text: BuildVariableMemoryText(variable), tags: new[] { "server-catalog", "convar", variable.Name.ToLowerInvariant() }))
-            .Concat(commands.Select(command => (summary: $"Rust server command: {command.Name}", text: BuildCommandMemoryText(command), tags: new[] { "server-catalog", "command", command.Name.ToLowerInvariant() })))
+        var entries = variables.Select(variable => (type: MemoryRecordType.ServerConvar, summary: $"Rust server convar: {variable.Name}", text: BuildVariableMemoryText(variable), tags: new[] { "server-catalog", "convar", variable.Name.ToLowerInvariant() }))
+            .Concat(commands.Select(command => (type: MemoryRecordType.ServerCommand, summary: $"Rust server command: {command.Name}", text: BuildCommandMemoryText(command), tags: new[] { "server-catalog", "command", command.Name.ToLowerInvariant() })))
             .Take(limit ?? int.MaxValue)
             .ToList();
 
@@ -530,9 +530,9 @@ internal sealed class RustChatToolHandler : IToolHandler
             attempted++;
             await _semanticMemory.AddManualMemoryAsync(new ManualMemoryInput
             {
-                Type = MemoryRecordType.Fact,
+                Type = entry.type,
                 Scope = MemoryScope.Global,
-                Source = MemorySource.ManualImport,
+                Source = MemorySource.ServerCatalog,
                 Summary = entry.summary,
                 Text = entry.text,
                 Tags = entry.tags.ToList(),

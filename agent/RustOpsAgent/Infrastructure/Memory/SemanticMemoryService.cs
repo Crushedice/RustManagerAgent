@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.RegularExpressions;
 using RustOpsAgent.Core.Contracts;
 
 namespace RustOpsAgent.Infrastructure.Memory;
@@ -43,7 +44,11 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
                 MemoryRecordType.Failure,
                 MemoryRecordType.Fact,
                 MemoryRecordType.ServerState,
-                MemoryRecordType.Reflection
+                MemoryRecordType.Reflection,
+                MemoryRecordType.Exception,
+                MemoryRecordType.ServerConvar,
+                MemoryRecordType.ServerCommand,
+                MemoryRecordType.PluginSummary
             },
             "planning",
             cancellationToken);
@@ -70,7 +75,11 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
                 MemoryRecordType.UserInstruction,
                 MemoryRecordType.ToolObservation,
                 MemoryRecordType.ServerState,
-                MemoryRecordType.Reflection
+                MemoryRecordType.Reflection,
+                MemoryRecordType.Exception,
+                MemoryRecordType.ServerConvar,
+                MemoryRecordType.ServerCommand,
+                MemoryRecordType.PluginSummary
             },
             "execution",
             cancellationToken);
@@ -105,6 +114,12 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
         var actionFingerprint = BuildActionFingerprint(context, result, server);
         var detail = BuildOutcomeDetail(context, result, server, actionFingerprint);
         var summary = BuildOutcomeSummary(context, result, server);
+
+        if (ShouldSkipActionOutcome(context, result, summary, detail))
+        {
+            LogDebug("write skipped: low-value action outcome");
+            return;
+        }
 
         if (IsTransientSuccessNoise(context, result, summary, detail))
         {
@@ -224,18 +239,30 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
             return;
         }
 
+        var serverFact = ClassifyServerFact(serverName, summary, detail, tags);
+        if (serverFact is null)
+        {
+            LogDebug("server fact skipped: low-value or noisy observation");
+            return;
+        }
+
         var record = new MemoryRecord
         {
-            Type = MemoryRecordType.ServerState,
-            Scope = MemoryScope.Server,
-            Source = MemorySource.ConfigScan,
-            Summary = TrimSingleLine(MemorySanitizer.Sanitize(summary), 160),
-            Text = MemorySanitizer.Sanitize(detail),
-            Tags = tags.Where(tag => !string.IsNullOrWhiteSpace(tag)).Select(tag => tag.Trim()).Append($"server:{serverName}").Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
-            RelatedEntityIds = new List<string> { serverName },
-            Importance = 0.72,
-            Confidence = 0.84,
-            ExpiryUtc = DateTime.UtcNow.AddDays(30)
+            Type = serverFact.Type,
+            Scope = serverFact.Scope,
+            Source = serverFact.Source,
+            ApprovalState = serverFact.ApprovalState,
+            Summary = serverFact.Summary,
+            Text = serverFact.Text,
+            Tags = serverFact.Tags,
+            RelatedEntityIds = serverFact.RelatedEntityIds,
+            Importance = serverFact.Importance,
+            Confidence = serverFact.Confidence,
+            ExpiryUtc = serverFact.ExpiryUtc,
+            Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["classifier"] = serverFact.Reason
+            }
         };
 
         await TryStoreRecordAsync(record, cancellationToken, allowMissingEmbeddings: false);
@@ -461,6 +488,13 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
                 .Where(entry => !string.IsNullOrWhiteSpace(entry.Key))
                 .ToDictionary(entry => entry.Key, entry => MemorySanitizer.Sanitize(entry.Value), StringComparer.OrdinalIgnoreCase);
 
+            var policyDisposition = ApplyMemoryWritePolicy(record);
+            if (policyDisposition is not null)
+            {
+                LogDebug($"write skipped: {policyDisposition}");
+                return policyDisposition.Value;
+            }
+
             if (_embeddingProvider is not null)
             {
                 record.Embedding = await _embeddingProvider.GenerateEmbeddingAsync(BuildEmbeddingText(record.Summary, record.Text), cancellationToken);
@@ -516,6 +550,33 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
         }
 
         return string.IsNullOrWhiteSpace(server) ? MemoryRecordType.ToolObservation : MemoryRecordType.ServerState;
+    }
+
+    private static bool ShouldSkipActionOutcome(ToolExecutionContext context, ToolExecutionResult result, string summary, string detail)
+    {
+        if (!result.Success)
+        {
+            return false;
+        }
+
+        if (result.MutatedState)
+        {
+            return false;
+        }
+
+        if (context.Route.Intent is AdminIntentType.Chat or AdminIntentType.Clarification)
+        {
+            return true;
+        }
+
+        if (context.Route.Intent is AdminIntentType.StatusCheck &&
+            !LooksLikeExceptionOrError(detail).HasSignal)
+        {
+            return true;
+        }
+
+        var combined = $"{summary}\n{detail}";
+        return LooksLikeMundaneConsoleNoise(combined);
     }
 
     private static MemoryScope ResolveOutcomeScope(ToolExecutionContext context, string? server)
@@ -812,11 +873,384 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
         return !MemorySanitizer.LooksUseful(summary, detail);
     }
 
+    private static MemoryImportDisposition? ApplyMemoryWritePolicy(MemoryRecord record)
+    {
+        if (!MemorySanitizer.LooksUseful(record.Summary, record.Text))
+        {
+            return MemoryImportDisposition.Skipped;
+        }
+
+        if (record.Type == MemoryRecordType.ServerState && LooksLikeRawConsoleOutput(record.Text))
+        {
+            var signal = LooksLikeExceptionOrError(record.Text);
+            if (signal.Confidence >= 0.78)
+            {
+                PromoteExceptionRecord(record, signal);
+            }
+            else if (LooksLikeMundaneConsoleNoise(record.Text))
+            {
+                return MemoryImportDisposition.Skipped;
+            }
+            else
+            {
+                record.Type = MemoryRecordType.ToolObservation;
+                record.Source = MemorySource.LogClassifier;
+                record.ApprovalState = MemoryApprovalState.Pending;
+                record.Confidence = Math.Min(record.Confidence, 0.68);
+                record.ExpiryUtc ??= DateTime.UtcNow.AddDays(14);
+                record.Metadata["approvalReason"] = "raw_console_output_requires_admin_review";
+            }
+        }
+
+        if (record.Type == MemoryRecordType.Exception)
+        {
+            var signal = LooksLikeExceptionOrError(record.Text);
+            if (!signal.HasSignal)
+            {
+                record.ApprovalState = MemoryApprovalState.Pending;
+                record.Confidence = Math.Min(record.Confidence, 0.68);
+                record.Metadata["approvalReason"] = "exception_classification_uncertain";
+            }
+            else if (record.Confidence < 0.82)
+            {
+                record.ApprovalState = MemoryApprovalState.Pending;
+                record.Metadata["approvalReason"] = "exception_confidence_below_auto_approval";
+            }
+        }
+
+        if (record.Type is MemoryRecordType.ServerConvar or MemoryRecordType.ServerCommand)
+        {
+            record.Scope = MemoryScope.Global;
+            if (record.Source == MemorySource.AgentAction || record.Source == MemorySource.AdminCommand)
+            {
+                record.Source = MemorySource.ServerCatalog;
+            }
+
+            record.ApprovalState = record.Confidence >= 0.9
+                ? MemoryApprovalState.Active
+                : MemoryApprovalState.Pending;
+        }
+
+        if (record.Type == MemoryRecordType.PluginSummary)
+        {
+            record.Source = MemorySource.PluginSummary;
+            record.ApprovalState = MemoryApprovalState.Active;
+        }
+
+        return null;
+    }
+
+    private static ServerFactClassification? ClassifyServerFact(
+        string serverName,
+        string summary,
+        string detail,
+        IReadOnlyList<string> inputTags)
+    {
+        var sanitizedSummary = TrimSingleLine(MemorySanitizer.Sanitize(summary), 180);
+        var sanitizedDetail = MemorySanitizer.Sanitize(detail);
+        var tags = inputTags
+            .Where(tag => !string.IsNullOrWhiteSpace(tag))
+            .Select(tag => tag.Trim())
+            .Append($"server:{serverName}")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var combined = $"{sanitizedSummary}\n{sanitizedDetail}";
+        var loweredTags = tags.Select(tag => tag.ToLowerInvariant()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (loweredTags.Contains("server-catalog") || loweredTags.Contains("server-knowledge"))
+        {
+            var isConvar = loweredTags.Contains("convar") || loweredTags.Contains("variable");
+            var isCommand = loweredTags.Contains("command");
+            if (isConvar || isCommand)
+            {
+                return new ServerFactClassification(
+                    isConvar ? MemoryRecordType.ServerConvar : MemoryRecordType.ServerCommand,
+                    MemoryScope.Global,
+                    MemorySource.ServerCatalog,
+                    MemoryApprovalState.Active,
+                    sanitizedSummary,
+                    sanitizedDetail,
+                    tags,
+                    BuildRelatedIds(serverName, tags),
+                    0.9,
+                    0.96,
+                    null,
+                    "server_catalog");
+            }
+        }
+
+        var signal = LooksLikeExceptionOrError(combined);
+        if (signal.HasSignal)
+        {
+            if (signal.Confidence < 0.78)
+            {
+                return new ServerFactClassification(
+                    MemoryRecordType.ToolObservation,
+                    MemoryScope.Server,
+                    MemorySource.LogClassifier,
+                    MemoryApprovalState.Pending,
+                    sanitizedSummary,
+                    TrimMultiline(sanitizedDetail, 1200),
+                    tags.Concat(new[] { "needs-admin-approval", signal.SignalTag }).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                    BuildRelatedIds(serverName, tags),
+                    0.5,
+                    signal.Confidence,
+                    DateTime.UtcNow.AddDays(14),
+                    "possible_error_needs_admin_approval");
+            }
+
+            var exceptionText = ExtractExceptionSnippet(sanitizedDetail);
+            return new ServerFactClassification(
+                MemoryRecordType.Exception,
+                MemoryScope.Server,
+                MemorySource.LogClassifier,
+                signal.Confidence >= 0.82 ? MemoryApprovalState.Active : MemoryApprovalState.Pending,
+                BuildExceptionSummary(serverName, sanitizedSummary, exceptionText),
+                exceptionText,
+                tags.Concat(new[] { "exception", signal.SignalTag }).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                BuildRelatedIds(serverName, tags),
+                signal.Confidence >= 0.82 ? 0.84 : 0.66,
+                signal.Confidence,
+                null,
+                signal.Confidence >= 0.82 ? "exception_high_confidence" : "exception_needs_admin_approval");
+        }
+
+        if (LooksLikeRawConsoleOutput(combined))
+        {
+            if (LooksLikeMundaneConsoleNoise(combined))
+            {
+                return null;
+            }
+
+            return new ServerFactClassification(
+                MemoryRecordType.ToolObservation,
+                MemoryScope.Server,
+                MemorySource.LogClassifier,
+                MemoryApprovalState.Pending,
+                sanitizedSummary,
+                TrimMultiline(sanitizedDetail, 1200),
+                tags.Append("needs-admin-approval").Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+                BuildRelatedIds(serverName, tags),
+                0.45,
+                0.62,
+                DateTime.UtcNow.AddDays(14),
+                "raw_log_uncertain_pending");
+        }
+
+        var source = loweredTags.Contains("config-scan")
+            ? MemorySource.ConfigScan
+            : loweredTags.Contains("logs") || loweredTags.Contains("log") || loweredTags.Contains("health-observation")
+                ? MemorySource.LogClassifier
+                : MemorySource.AgentAction;
+        var type = loweredTags.Contains("config") || loweredTags.Contains("status") || loweredTags.Contains("lifecycle")
+            ? MemoryRecordType.ServerState
+            : MemoryRecordType.ToolObservation;
+
+        return new ServerFactClassification(
+            type,
+            MemoryScope.Server,
+            source,
+            MemoryApprovalState.Active,
+            sanitizedSummary,
+            sanitizedDetail,
+            tags,
+            BuildRelatedIds(serverName, tags),
+            source == MemorySource.LogClassifier ? 0.62 : 0.72,
+            source == MemorySource.LogClassifier ? 0.78 : 0.84,
+            source == MemorySource.LogClassifier ? DateTime.UtcNow.AddDays(14) : DateTime.UtcNow.AddDays(30),
+            "server_fact");
+    }
+
+    private static void PromoteExceptionRecord(MemoryRecord record, ErrorSignal signal)
+    {
+        record.Type = MemoryRecordType.Exception;
+        record.Source = MemorySource.LogClassifier;
+        record.Text = ExtractExceptionSnippet(record.Text);
+        record.Summary = BuildExceptionSummary(
+            record.RelatedEntityIds.FirstOrDefault() ?? "server",
+            record.Summary,
+            record.Text);
+        record.Tags = record.Tags.Concat(new[] { "exception", signal.SignalTag }).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        record.Confidence = Math.Max(record.Confidence, signal.Confidence);
+        record.Importance = Math.Max(record.Importance, signal.Confidence >= 0.82 ? 0.84 : 0.66);
+        record.ApprovalState = signal.Confidence >= 0.82 ? MemoryApprovalState.Active : MemoryApprovalState.Pending;
+        if (record.ApprovalState == MemoryApprovalState.Pending)
+        {
+            record.Metadata["approvalReason"] = "exception_confidence_below_auto_approval";
+        }
+    }
+
+    private static List<string> BuildRelatedIds(string serverName, IEnumerable<string> tags)
+    {
+        return tags
+            .Concat(new[] { serverName })
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Select(id => id.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static string BuildExceptionSummary(string serverName, string fallbackSummary, string exceptionText)
+    {
+        var firstSignalLine = exceptionText
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault(line => LooksLikeExceptionOrError(line).HasSignal)
+            ?? fallbackSummary;
+        return TrimSingleLine($"Exception on {serverName}: {firstSignalLine}", 180);
+    }
+
+    private static string ExtractExceptionSnippet(string text)
+    {
+        var lines = text.Replace("\r\n", "\n").Split('\n', StringSplitOptions.TrimEntries);
+        var start = Array.FindIndex(lines, line => LooksLikeExceptionOrError(line).HasSignal);
+        if (start < 0)
+        {
+            return TrimMultiline(text, 1200);
+        }
+
+        var selected = new List<string>();
+        for (var i = start; i < lines.Length && selected.Count < 14; i++)
+        {
+            var line = lines[i];
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                if (selected.Count > 0)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
+            var isStackFrame = Regex.IsMatch(line, @"^\s*at\s+[\w\.`]+\.", RegexOptions.IgnoreCase);
+            var isContinuation = line.StartsWith("---", StringComparison.Ordinal) ||
+                                 line.StartsWith("Caused by", StringComparison.OrdinalIgnoreCase) ||
+                                 line.Contains(" in <", StringComparison.Ordinal);
+            if (selected.Count > 0 &&
+                !isStackFrame &&
+                !isContinuation &&
+                !LooksLikeExceptionOrError(line).HasSignal)
+            {
+                break;
+            }
+
+            selected.Add(line);
+        }
+
+        return TrimMultiline(string.Join('\n', selected), 1800);
+    }
+
+    private static ErrorSignal LooksLikeExceptionOrError(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return ErrorSignal.None;
+        }
+
+        var lowered = text.ToLowerInvariant();
+        var hasExceptionType = Regex.IsMatch(text, @"\b[A-Za-z_][A-Za-z0-9_.]*Exception\b", RegexOptions.IgnoreCase);
+        var hasStackFrame = Regex.IsMatch(text, @"(?m)^\s*at\s+[\w\.`]+\.", RegexOptions.IgnoreCase);
+        if (hasExceptionType && hasStackFrame)
+        {
+            return new ErrorSignal(true, 0.94, "exception-stack");
+        }
+
+        if (hasExceptionType || lowered.Contains("exception:", StringComparison.Ordinal))
+        {
+            return new ErrorSignal(true, 0.88, "exception");
+        }
+
+        if (lowered.Contains("failed to compile", StringComparison.Ordinal) ||
+            lowered.Contains("fatal", StringComparison.Ordinal) ||
+            lowered.Contains("crash", StringComparison.Ordinal))
+        {
+            return new ErrorSignal(true, 0.86, "error");
+        }
+
+        if (lowered.Contains("unable to connect", StringComparison.Ordinal) ||
+            lowered.Contains("access denied", StringComparison.Ordinal) ||
+            lowered.Contains("error:", StringComparison.Ordinal) ||
+            lowered.Contains("failed:", StringComparison.Ordinal))
+        {
+            return new ErrorSignal(true, 0.78, "possible-error");
+        }
+
+        if (lowered.Contains("warn", StringComparison.Ordinal) ||
+            lowered.Contains("disconnect", StringComparison.Ordinal))
+        {
+            return new ErrorSignal(true, 0.62, "warning");
+        }
+
+        return ErrorSignal.None;
+    }
+
+    private static bool LooksLikeRawConsoleOutput(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var lowered = text.ToLowerInvariant();
+        return lowered.Contains("\nlog:", StringComparison.Ordinal) ||
+               lowered.Contains("joined from ip", StringComparison.Ordinal) ||
+               lowered.Contains("networkid", StringComparison.Ordinal) ||
+               lowered.Contains("[chat]", StringComparison.Ordinal) ||
+               Regex.IsMatch(text, @"(?m)^\s*at\s+[\w\.`]+\.", RegexOptions.IgnoreCase);
+    }
+
+    private static bool LooksLikeMundaneConsoleNoise(string text)
+    {
+        var lowered = text.ToLowerInvariant();
+        if (LooksLikeExceptionOrError(text).Confidence >= 0.78)
+        {
+            return false;
+        }
+
+        var mundaneSignals = new[]
+        {
+            "joined from ip",
+            "networkid",
+            "calling 'onplayerconnected'",
+            "[garbage collect]",
+            "[empty low fps]",
+            "server is no longer empty",
+            "setting fps limit"
+        };
+
+        return mundaneSignals.Any(signal => lowered.Contains(signal, StringComparison.Ordinal));
+    }
+
+    private static string TrimMultiline(string? value, int maxLength)
+    {
+        var normalized = value?.Trim() ?? string.Empty;
+        return normalized.Length <= maxLength ? normalized : normalized[..Math.Max(0, maxLength - 3)] + "...";
+    }
+
     private void LogDebug(string message)
     {
         if (_settings.DebugLoggingEnabled)
         {
             Console.WriteLine($"[memory] {message}");
         }
+    }
+
+    private sealed record ServerFactClassification(
+        MemoryRecordType Type,
+        MemoryScope Scope,
+        MemorySource Source,
+        MemoryApprovalState ApprovalState,
+        string Summary,
+        string Text,
+        List<string> Tags,
+        List<string> RelatedEntityIds,
+        double Importance,
+        double Confidence,
+        DateTime? ExpiryUtc,
+        string Reason);
+
+    private readonly record struct ErrorSignal(bool HasSignal, double Confidence, string SignalTag)
+    {
+        public static ErrorSignal None => new(false, 0.0, string.Empty);
     }
 }

@@ -14,6 +14,15 @@ internal static partial class MemorySanitizer
         new(@"(?im)://[^/\s:@]+:([^@\s/]+)@", RegexOptions.Compiled)
     };
 
+    private static readonly Regex[] VolatileIdentityPatterns =
+    {
+        new(@"\bsteamid\s+\d{17}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new(@"\bNetworkId\s+\d{17}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase),
+        new(@"\b\d{17}\b", RegexOptions.Compiled),
+        new(@"\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b", RegexOptions.Compiled),
+        new(@"\b(?:\d{1,3}\.){3}\d{1,3}\b", RegexOptions.Compiled)
+    };
+
     public static string Sanitize(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -38,6 +47,24 @@ internal static partial class MemorySanitizer
                 }
 
                 return $"{match.Value[..(separatorIndex + 1)]} <redacted>";
+            });
+        }
+
+        foreach (var pattern in VolatileIdentityPatterns)
+        {
+            value = pattern.Replace(value, match =>
+            {
+                if (match.Value.StartsWith("steamid", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "steamid <redacted>";
+                }
+
+                if (match.Value.StartsWith("NetworkId", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "NetworkId <redacted>";
+                }
+
+                return "<redacted>";
             });
         }
 
