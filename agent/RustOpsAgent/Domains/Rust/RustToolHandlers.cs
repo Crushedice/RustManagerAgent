@@ -1133,7 +1133,7 @@ internal sealed class RustPluginToolHandler : IToolHandler
 
         using (updatesDoc)
         {
-            // Surface access_denied errors returned by the API instead of treating them as empty plugin list.
+            // Surface access_denied or path-not-found errors returned by the API.
             if (updatesDoc.RootElement.TryGetProperty("error", out var errNode) &&
                 string.Equals(errNode.GetString(), "access_denied", StringComparison.OrdinalIgnoreCase))
             {
@@ -1142,6 +1142,16 @@ internal sealed class RustPluginToolHandler : IToolHandler
                 return new ToolExecutionResult(false,
                     $"Plugin directory access denied for {server} at '{path}'. {note}",
                     server, false, "access_denied");
+            }
+
+            if (updatesDoc.RootElement.TryGetProperty("note", out var noteNode) &&
+                updatesDoc.RootElement.TryGetProperty("triedPaths", out var triedNode) &&
+                triedNode.ValueKind == JsonValueKind.Array)
+            {
+                var tried = triedNode.EnumerateArray().Select(p => p.GetString()).Where(p => p is not null).ToList();
+                return new ToolExecutionResult(false,
+                    $"Plugin directory not found for {server}. Paths tried: {string.Join(", ", tried)}. Set 'oxideDir' in the server config to override.",
+                    server, false, "plugins_not_found");
             }
 
             var updateMessages = new List<string>();

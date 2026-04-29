@@ -17,7 +17,7 @@ internal sealed class PluginService
     public object ValidateOxide(string server)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var roots = GetOxideRootCandidates(cfg);
+        var roots = GetOxideRootCandidates(cfg, server);
 
         string[] configFiles;
         string[] pluginFiles;
@@ -74,13 +74,14 @@ internal sealed class PluginService
     public async Task<object> CheckUpdatesAsync(string server, CancellationToken cancellationToken)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var pluginsDir = GetOxideRootCandidates(cfg)
+        var candidates = GetOxideRootCandidates(cfg, server)
             .Select(root => Path.Combine(root, "plugins"))
-            .FirstOrDefault(Directory.Exists);
+            .ToList();
+        var pluginsDir = candidates.FirstOrDefault(Directory.Exists);
 
         if (pluginsDir is null)
         {
-            return new { server, updates = Array.Empty<object>(), note = "plugins directory not found in any expected location" };
+            return new { server, updates = Array.Empty<object>(), note = "plugins directory not found in any expected location", triedPaths = candidates };
         }
 
         List<(string? Name, string? Version)> plugins;
@@ -93,7 +94,7 @@ internal sealed class PluginService
         }
         catch (UnauthorizedAccessException)
         {
-            return new { server, updates = Array.Empty<object>(), error = "access_denied", path = pluginsDir, note = $"Read permission denied for '{pluginsDir}'. Grant read access to the RustOps API service user for that directory." };
+            return new { server, updates = Array.Empty<object>(), error = "access_denied", path = pluginsDir, note = $"Read permission denied for '{pluginsDir}'. Grant read access to the RustOps API service user for that directory.", triedPaths = candidates };
         }
 
         var updates = new List<object>();
@@ -143,10 +144,10 @@ internal sealed class PluginService
     public async Task<object> InstallPluginAsync(string server, string pluginName, string downloadUrl, CancellationToken cancellationToken)
     {
         var cfg = _rust.LoadConfig(server) ?? throw new InvalidOperationException($"No config for {server}");
-        var pluginsDir = GetOxideRootCandidates(cfg)
+        var pluginsDir = GetOxideRootCandidates(cfg, server)
                              .Select(root => Path.Combine(root, "plugins"))
                              .FirstOrDefault(Directory.Exists)
-                         ?? Path.Combine(cfg.ServerDir, "oxide", "plugins");
+                         ?? Path.Combine(string.IsNullOrWhiteSpace(cfg.ServerDir) ? $"/srv/rust/{server}" : cfg.ServerDir, "oxide", "plugins");
         Directory.CreateDirectory(pluginsDir);
 
         // Sanitize the plugin name to a safe filename.
@@ -159,19 +160,26 @@ internal sealed class PluginService
         return new { server, plugin = pluginName, installed = true, bytes = bytes.Length };
     }
 
-    private static List<string> GetOxideRootCandidates(ServerConfig cfg)
+    // serverName is the filename-derived name (always known), used when cfg.Name is empty
+    // because LoadConfig returns raw JSON which may omit the "name" field.
+    private static List<string> GetOxideRootCandidates(ServerConfig cfg, string serverName)
     {
         // Explicit override takes priority — useful when oxide lives outside serverDir.
         if (!string.IsNullOrWhiteSpace(cfg.OxideDir))
             return new List<string> { cfg.OxideDir.TrimEnd('/') };
 
+        // Apply the same fallbacks the Program.cs normalizer applies so raw configs work.
+        var name      = string.IsNullOrWhiteSpace(cfg.Name)         ? serverName    : cfg.Name;
+        var identity  = string.IsNullOrWhiteSpace(cfg.ServerIdentity) ? name         : cfg.ServerIdentity;
+        var serverDir = string.IsNullOrWhiteSpace(cfg.ServerDir)    ? $"/srv/rust/{name}" : cfg.ServerDir;
+
         return new[]
         {
-            Path.Combine(cfg.ServerDir, "oxide"),
-            Path.Combine(cfg.ServerDir, cfg.ServerIdentity, "oxide"),
-            Path.Combine(cfg.ServerDir, "server", cfg.ServerIdentity, "oxide"),
-            Path.Combine("/srv/rust", cfg.Name, "oxide"),
-            Path.Combine("/srv/rust", cfg.ServerIdentity, "oxide"),
+            Path.Combine(serverDir, "oxide"),
+            Path.Combine(serverDir, identity, "oxide"),
+            Path.Combine(serverDir, "server", identity, "oxide"),
+            Path.Combine("/srv/rust", name, "oxide"),
+            Path.Combine("/srv/rust", identity, "oxide"),
         }
         .Where(p => !string.IsNullOrWhiteSpace(p))
         .Distinct(StringComparer.OrdinalIgnoreCase)
