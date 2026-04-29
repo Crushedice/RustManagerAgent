@@ -67,7 +67,8 @@ var semanticMemory = new SemanticMemoryService(
     embeddingProvider,
     config.Memory.StatePath,
     config.Memory.NeoCortexRoot);
-if (await TryHandleMemoryMaintenanceAsync(startup, semanticMemory))
+var memoryImport = new MemoryImportService(config.Memory, semanticMemory, semanticStore);
+if (await TryHandleMemoryMaintenanceAsync(startup, semanticMemory, memoryImport))
 {
     return 0;
 }
@@ -117,6 +118,8 @@ var effectiveComposeSettings = composeKernelConfigured ? config.LlmCompose : con
 
 var classifier = new AdminIntentClassifier(kernel, config.Llm, neoCortex, semanticMemory);
 using var apiClient = new RustOpsApiClient(config.Api);
+var pluginReferenceStore = new SqlitePluginReferenceIndexStore(config.PluginUpdates.ReferenceIndexDatabasePath);
+var pluginReferenceIndexer = new PluginReferenceIndexer(apiClient, pluginReferenceStore, semanticMemory);
 
 if (!string.Equals(config.GitOps.PushBranchPrefix, "agent/", StringComparison.OrdinalIgnoreCase))
 {
@@ -163,10 +166,10 @@ var handlers = new List<IToolHandler>
     new RustPlayerLookupToolHandler(apiClient),
     new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution, serverKnowledge, semanticMemory),
     new RustLogsToolHandler(apiClient, neoCortex, semanticMemory),
-    new RustPluginToolHandler(apiClient, config.PluginUpdates, semanticMemory),
+    new RustPluginToolHandler(apiClient, config.PluginUpdates, semanticMemory, pluginReferenceIndexer),
     new RustNetworkToolHandler(apiClient, config.Network.TrackedInterfaces),
     new RustFileEditToolHandler(apiClient, gitOps, config.GitOps, semanticMemory),
-    new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge),
+    new RustChatToolHandler(neoCortex, semanticMemory, autoPull, serverKnowledge, memoryImport, pluginReferenceIndexer),
     new RustServerManagementToolHandler(apiClient)
 };
 
@@ -330,6 +333,15 @@ static AgentStartupOptions ParseStartupOptions(string[] args)
             startup.MemoryCommand = "search";
             startup.MemorySearchQuery = args[++i];
         }
+        else if (string.Equals(args[i], "--memory-import", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+        {
+            startup.MemoryCommand = "import";
+            startup.MemoryImportFolder = args[++i];
+        }
+        else if (string.Equals(args[i], "--trusted", StringComparison.OrdinalIgnoreCase))
+        {
+            startup.Trusted = true;
+        }
         else if (string.Equals(args[i], "--dry-run", StringComparison.OrdinalIgnoreCase))
         {
             startup.DryRun = true;
@@ -339,7 +351,7 @@ static AgentStartupOptions ParseStartupOptions(string[] args)
     return startup;
 }
 
-static async Task<bool> TryHandleMemoryMaintenanceAsync(AgentStartupOptions startup, ISemanticMemoryService semanticMemory)
+static async Task<bool> TryHandleMemoryMaintenanceAsync(AgentStartupOptions startup, ISemanticMemoryService semanticMemory, IMemoryImportService memoryImport)
 {
     if (string.IsNullOrWhiteSpace(startup.MemoryCommand))
     {
@@ -375,6 +387,19 @@ static async Task<bool> TryHandleMemoryMaintenanceAsync(AgentStartupOptions star
                 Console.WriteLine($"[memory] {result.MemoryRecord.Id} [{result.MemoryRecord.Type}/{result.MemoryRecord.Scope}] {result.MemoryRecord.Summary} score={result.FinalScore:F2}");
             }
             return true;
+        case "import":
+            var report = await memoryImport.ImportFolderAsync(new MemoryImportOptions
+            {
+                FolderPath = startup.MemoryImportFolder ?? string.Empty,
+                Trusted = startup.Trusted,
+                DryRun = startup.DryRun
+            }, CancellationToken.None);
+            Console.WriteLine($"[memory] Import complete: {report.ToSummary()}");
+            foreach (var message in report.Messages.Take(10))
+            {
+                Console.WriteLine($"[memory] {message}");
+            }
+            return true;
         default:
             return false;
     }
@@ -385,5 +410,7 @@ internal sealed class AgentStartupOptions
     public string? ConfigPath { get; set; }
     public string? MemoryCommand { get; set; }
     public string? MemorySearchQuery { get; set; }
+    public string? MemoryImportFolder { get; set; }
     public bool DryRun { get; set; }
+    public bool Trusted { get; set; }
 }

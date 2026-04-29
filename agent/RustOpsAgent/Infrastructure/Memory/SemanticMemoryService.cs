@@ -283,11 +283,39 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
             RelatedEntityIds = input.RelatedEntityIds,
             Importance = input.Importance,
             Confidence = input.Confidence,
+            ApprovalState = input.ApprovalState,
+            Title = input.Title,
+            SourcePath = input.SourcePath,
+            SourceHash = input.SourceHash,
+            ChunkIndex = input.ChunkIndex,
+            Category = input.Category,
+            LastVerifiedUtc = input.LastVerifiedUtc,
             Metadata = input.Metadata
         };
 
         await TryStoreRecordAsync(record, cancellationToken, allowMissingEmbeddings: false);
         return record;
+    }
+
+    public Task<MemoryImportDisposition> ImportRecordAsync(MemoryRecord record, CancellationToken cancellationToken) =>
+        TryStoreRecordAsync(record, cancellationToken, allowMissingEmbeddings: false);
+
+    public Task<IReadOnlyList<MemoryRecord>> ListPendingAsync(int maxResults, CancellationToken cancellationToken) =>
+        _store.ListByApprovalStateAsync(MemoryApprovalState.Pending, maxResults, cancellationToken);
+
+    public async Task<bool> SetApprovalStateAsync(string id, MemoryApprovalState approvalState, CancellationToken cancellationToken)
+    {
+        var record = await _store.GetByIdAsync(id, cancellationToken);
+        if (record is null)
+        {
+            return false;
+        }
+
+        record.ApprovalState = approvalState;
+        record.UpdatedAtUtc = DateTime.UtcNow;
+        record.Normalize();
+        await _store.UpsertAsync(record, cancellationToken);
+        return true;
     }
 
     public async Task<int> RebuildEmbeddingsAsync(CancellationToken cancellationToken)
@@ -387,6 +415,7 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
                 RelatedEntityIds = relatedIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
                 MaxResults = maxResultsOverride ?? _settings.MaxRetrievedMemoriesPerStep,
                 MinSimilarity = minSimilarityOverride ?? _settings.SimilarityThreshold,
+                MinConfidence = _settings.MinimumRecallConfidence,
                 IncludeExpired = false
             };
 

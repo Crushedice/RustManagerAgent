@@ -22,6 +22,9 @@ internal sealed class NullMemoryStore : IInspectableMemoryStore
     public Task<IReadOnlyList<MemoryRecord>> ListRecentAsync(int maxResults, CancellationToken cancellationToken) =>
         Task.FromResult<IReadOnlyList<MemoryRecord>>(Array.Empty<MemoryRecord>());
 
+    public Task<IReadOnlyList<MemoryRecord>> ListByApprovalStateAsync(MemoryApprovalState approvalState, int maxResults, CancellationToken cancellationToken) =>
+        Task.FromResult<IReadOnlyList<MemoryRecord>>(Array.Empty<MemoryRecord>());
+
     public Task<IReadOnlyList<MemoryRecord>> GetAllAsync(CancellationToken cancellationToken) =>
         Task.FromResult<IReadOnlyList<MemoryRecord>>(Array.Empty<MemoryRecord>());
 

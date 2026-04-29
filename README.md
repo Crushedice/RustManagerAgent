@@ -222,11 +222,39 @@ dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\Ru
 dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-migrate --dry-run
 dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-stats
 dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-search "restart timeout"
+dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-import H:\RUSTICALANDPROJECTS\RusticalandOPS\knowledge\verified --trusted
 dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-rebuild-embeddings
 dotnet run --project H:\RUSTICALANDPROJECTS\RusticalandOPS\agent\RustOpsAgent\RustOpsAgent.csproj -- --memory-prune
 ```
 
 The Steam/admin chat path also exposes memory inspection and maintenance commands through `RustChatToolHandler`.
+
+Seed curated knowledge with:
+
+- `/memory import <folderPath>` to recursively import `.md`, `.txt`, and `.json` files.
+- `/memory pending` to list imports awaiting approval.
+- `/memory approve <id>` or `/memory reject <id>` to control activation.
+- `/memory search <query>` to search active semantic memory.
+- `/memory forget <id>` to delete a record.
+
+Trusted manual seed folders such as `knowledge/verified` can become active immediately. AI-generated seed folders such as `knowledge/ai-generated` default to pending unless imported with `--trusted`. Normal agent recall ignores pending and rejected memory records.
+
+## Plugin Reference Index
+
+Oxide/uMod plugin source is indexed separately from semantic memory. The index stores plugin metadata, commands, permissions, hooks, config keys, source path, and source hash in `pluginUpdates.referenceIndexDatabasePath`; raw source is kept in that reference database and is not imported into normal recall.
+
+Admin commands:
+
+```text
+/plugin-index refresh
+/plugin-index search <query>
+/plugin-index commands
+/plugin-index commands <pluginName>
+/plugin-index permissions <pluginName>
+/plugin-index hooks <pluginName>
+```
+
+Existing plugin verification/update checks also refresh the plugin reference index for the checked server and write only a compact `PluginSummary` semantic memory.
 
 ## Verification Status
 

@@ -1058,12 +1058,18 @@ internal sealed class RustPluginToolHandler : IToolHandler
     private readonly RustOpsApiClient _api;
     private readonly Core.Contracts.PluginUpdateSettings _settings;
     private readonly ISemanticMemoryService? _semanticMemory;
+    private readonly PluginReferenceIndexer? _pluginReferenceIndexer;
 
-    public RustPluginToolHandler(RustOpsApiClient api, Core.Contracts.PluginUpdateSettings? settings = null, ISemanticMemoryService? semanticMemory = null)
+    public RustPluginToolHandler(
+        RustOpsApiClient api,
+        Core.Contracts.PluginUpdateSettings? settings = null,
+        ISemanticMemoryService? semanticMemory = null,
+        PluginReferenceIndexer? pluginReferenceIndexer = null)
     {
         _api = api;
         _settings = settings ?? new Core.Contracts.PluginUpdateSettings();
         _semanticMemory = semanticMemory;
+        _pluginReferenceIndexer = pluginReferenceIndexer;
     }
 
     public string Name => "rust.plugins.verify";
@@ -1087,6 +1093,9 @@ internal sealed class RustPluginToolHandler : IToolHandler
         var wantsCompileCheck = msgLow.Contains("error") || msgLow.Contains("fail") || msgLow.Contains("compile")
                                 || msgLow.Contains("issue") || msgLow.Contains("broken") || msgLow.Contains("check");
         var wantsInstall = msgLow.Contains("install") || msgLow.Contains("update") || msgLow.Contains("download");
+        var indexReport = _pluginReferenceIndexer is null
+            ? null
+            : await _pluginReferenceIndexer.RefreshAsync(new[] { server }, cancellationToken);
 
         // --- Step 1: RCON oxide.plugins for live compile status --------------------------------
         if (wantsCompileCheck)
@@ -1114,7 +1123,10 @@ internal sealed class RustPluginToolHandler : IToolHandler
                 var totalLoaded = lines.Count(l => l.TrimStart().StartsWith('[') || Regex.IsMatch(l, @"^\s*\w.*\(\d+ms\)"));
                 var summary = $"[{server}] All plugins loaded OK ({totalLoaded} reported). No compile errors.";
                 if (!wantsInstall)
-                    return new ToolExecutionResult(true, summary, server, false);
+                {
+                    var indexSuffix = indexReport is null ? string.Empty : $" Plugin index: {indexReport.ToSummary()}.";
+                    return new ToolExecutionResult(true, summary + indexSuffix, server, false);
+                }
             }
         }
 
@@ -1221,14 +1233,16 @@ internal sealed class RustPluginToolHandler : IToolHandler
 
                 var installSummary = installed.Count > 0 ? $"Installed: {string.Join(", ", installed)}." : string.Empty;
                 if (failed.Count > 0) installSummary += $" Failed: {string.Join(", ", failed)}.";
-                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{installSummary.Trim()}", server, installed.Count > 0);
+                var indexSuffix = indexReport is null ? string.Empty : $"\nPlugin index: {indexReport.ToSummary()}.";
+                return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}\n{installSummary.Trim()}{indexSuffix}", server, installed.Count > 0);
             }
 
             var actionHint = pendingInstalls.Count > 0 && _settings.DownloadEnabled
                 ? $" ({pendingInstalls.Count} update(s) available — say 'install plugin updates' to apply)"
                 : string.Empty;
 
-            return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}", server, false);
+            var finalIndexSuffix = indexReport is null ? string.Empty : $" Plugin index: {indexReport.ToSummary()}.";
+            return new ToolExecutionResult(true, $"Plugin check for {server}: {versionSummary}{actionHint}{finalIndexSuffix}", server, false);
         }
     }
 

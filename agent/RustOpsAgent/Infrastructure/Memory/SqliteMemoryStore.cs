@@ -52,13 +52,15 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
             INSERT INTO memory_records (
                 id, type, scope, source, text, summary, tags_json, related_entity_ids_json,
                 created_at_utc, updated_at_utc, last_accessed_at_utc, access_count, importance,
-                confidence, expiry_utc, metadata_json, embedding_json, embedding_model, embedding_dimensions,
+                confidence, expiry_utc, approval_state, title, source_path, source_hash, chunk_index,
+                category, last_verified_utc, metadata_json, embedding_json, embedding_model, embedding_dimensions,
                 content_hash
             )
             VALUES (
                 $id, $type, $scope, $source, $text, $summary, $tags_json, $related_entity_ids_json,
                 $created_at_utc, $updated_at_utc, $last_accessed_at_utc, $access_count, $importance,
-                $confidence, $expiry_utc, $metadata_json, $embedding_json, $embedding_model, $embedding_dimensions,
+                $confidence, $expiry_utc, $approval_state, $title, $source_path, $source_hash, $chunk_index,
+                $category, $last_verified_utc, $metadata_json, $embedding_json, $embedding_model, $embedding_dimensions,
                 $content_hash
             )
             ON CONFLICT(content_hash) DO UPDATE SET
@@ -75,6 +77,13 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
                 importance = MAX(memory_records.importance, excluded.importance),
                 confidence = MAX(memory_records.confidence, excluded.confidence),
                 expiry_utc = excluded.expiry_utc,
+                approval_state = excluded.approval_state,
+                title = excluded.title,
+                source_path = excluded.source_path,
+                source_hash = excluded.source_hash,
+                chunk_index = excluded.chunk_index,
+                category = excluded.category,
+                last_verified_utc = COALESCE(excluded.last_verified_utc, memory_records.last_verified_utc),
                 metadata_json = excluded.metadata_json,
                 embedding_json = excluded.embedding_json,
                 embedding_model = excluded.embedding_model,
@@ -93,6 +102,13 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
                 importance = excluded.importance,
                 confidence = excluded.confidence,
                 expiry_utc = excluded.expiry_utc,
+                approval_state = excluded.approval_state,
+                title = excluded.title,
+                source_path = excluded.source_path,
+                source_hash = excluded.source_hash,
+                chunk_index = excluded.chunk_index,
+                category = excluded.category,
+                last_verified_utc = excluded.last_verified_utc,
                 metadata_json = excluded.metadata_json,
                 embedding_json = excluded.embedding_json,
                 embedding_model = excluded.embedding_model,
@@ -128,8 +144,15 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
             var importance = Math.Clamp(candidate.Importance, 0.0, 1.0);
             var scopeBoost = request.Scope is not null && request.Scope == candidate.Scope ? 0.1 : 0.0;
             var typeBoost = candidate.Type is MemoryRecordType.Fix or MemoryRecordType.Procedure ? 0.08 :
-                candidate.Type == MemoryRecordType.Failure ? 0.05 : 0.0;
-            var final = (similarity * 0.62) + (importance * 0.18) + (recency * 0.1) + scopeBoost + typeBoost;
+                candidate.Type == MemoryRecordType.Failure ? -0.04 : 0.0;
+            var sourceBoost = candidate.Source is MemorySource.VerifiedFact ? 0.12 :
+                candidate.Source is MemorySource.ManualImport or MemorySource.SeededImport ? 0.08 : 0.0;
+            var verifiedBoost = candidate.LastVerifiedUtc.HasValue
+                ? Math.Clamp(Math.Exp(Math.Max(0, (now - candidate.LastVerifiedUtc.Value).TotalDays) / -90.0), 0.0, 1.0) * 0.08
+                : 0.0;
+            var confidencePenalty = candidate.Confidence < 0.6 ? 0.08 : 0.0;
+            var final = (similarity * 0.58) + (importance * 0.16) + (recency * 0.08) + (candidate.Confidence * 0.08) +
+                        scopeBoost + typeBoost + sourceBoost + verifiedBoost - confidencePenalty;
 
             results.Add(new MemorySearchResult
             {
@@ -138,7 +161,7 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
                 RecencyScore = recency,
                 ImportanceScore = importance,
                 FinalScore = Math.Round(final, 4),
-                MatchReason = BuildMatchReason(request, candidate, similarity, scopeBoost, typeBoost)
+                MatchReason = BuildMatchReason(request, candidate, similarity, scopeBoost, typeBoost + sourceBoost)
             });
         }
 
@@ -236,7 +259,7 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         var stats = new MemoryDebugStats
         {
             TotalRecords = await ScalarAsync(connection, "SELECT COUNT(*) FROM memory_records;", cancellationToken),
-            ActiveRecords = await ScalarAsync(connection, "SELECT COUNT(*) FROM memory_records WHERE expiry_utc IS NULL OR expiry_utc > $now;", cancellationToken, ("$now", now)),
+            ActiveRecords = await ScalarAsync(connection, "SELECT COUNT(*) FROM memory_records WHERE approval_state = 'Active' AND (expiry_utc IS NULL OR expiry_utc > $now);", cancellationToken, ("$now", now)),
             ExpiredRecords = await ScalarAsync(connection, "SELECT COUNT(*) FROM memory_records WHERE expiry_utc IS NOT NULL AND expiry_utc <= $now;", cancellationToken, ("$now", now)),
             ByType = await GroupCountsAsync(connection, "SELECT type, COUNT(*) FROM memory_records GROUP BY type;", cancellationToken),
             ByScope = await GroupCountsAsync(connection, "SELECT scope, COUNT(*) FROM memory_records GROUP BY scope;", cancellationToken),
@@ -252,6 +275,17 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT * FROM memory_records ORDER BY updated_at_utc DESC LIMIT $max;";
+        command.Parameters.AddWithValue("$max", Math.Max(1, maxResults));
+        return await ReadRecordsAsync(command, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<MemoryRecord>> ListByApprovalStateAsync(MemoryApprovalState approvalState, int maxResults, CancellationToken cancellationToken)
+    {
+        await using var connection = OpenConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT * FROM memory_records WHERE approval_state = $approval_state ORDER BY updated_at_utc DESC LIMIT $max;";
+        command.Parameters.AddWithValue("$approval_state", approvalState.ToString());
         command.Parameters.AddWithValue("$max", Math.Max(1, maxResults));
         return await ReadRecordsAsync(command, cancellationToken);
     }
@@ -294,6 +328,18 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         {
             clauses.Add("(expiry_utc IS NULL OR expiry_utc > $now)");
             command.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
+        }
+
+        if (!request.IncludeNonActive)
+        {
+            clauses.Add("approval_state = $approval_state");
+            command.Parameters.AddWithValue("$approval_state", MemoryApprovalState.Active.ToString());
+        }
+
+        if (request.MinConfidence > 0)
+        {
+            clauses.Add("confidence >= $min_confidence");
+            command.Parameters.AddWithValue("$min_confidence", request.MinConfidence);
         }
 
         if (request.Scope is not null)
@@ -391,6 +437,13 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
                 importance REAL NOT NULL DEFAULT 0.5,
                 confidence REAL NOT NULL DEFAULT 0.5,
                 expiry_utc TEXT NULL,
+                approval_state TEXT NOT NULL DEFAULT 'Active',
+                title TEXT NOT NULL DEFAULT '',
+                source_path TEXT NOT NULL DEFAULT '',
+                source_hash TEXT NOT NULL DEFAULT '',
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT '',
+                last_verified_utc TEXT NULL,
                 metadata_json TEXT NOT NULL,
                 embedding_json TEXT NOT NULL DEFAULT '[]',
                 embedding_model TEXT NOT NULL DEFAULT '',
@@ -403,9 +456,43 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
             """;
         command.Parameters.AddWithValue("$schema_version", SchemaVersion);
         command.ExecuteNonQuery();
+
+        AddColumnIfMissing(connection, "memory_records", "approval_state", "TEXT NOT NULL DEFAULT 'Active'");
+        AddColumnIfMissing(connection, "memory_records", "title", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(connection, "memory_records", "source_path", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(connection, "memory_records", "source_hash", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(connection, "memory_records", "chunk_index", "INTEGER NOT NULL DEFAULT 0");
+        AddColumnIfMissing(connection, "memory_records", "category", "TEXT NOT NULL DEFAULT ''");
+        AddColumnIfMissing(connection, "memory_records", "last_verified_utc", "TEXT NULL");
+
+        using var indexCommand = connection.CreateCommand();
+        indexCommand.CommandText =
+            """
+            CREATE INDEX IF NOT EXISTS idx_memory_approval_confidence ON memory_records(approval_state, confidence);
+            CREATE INDEX IF NOT EXISTS idx_memory_source_path_hash ON memory_records(source_path, source_hash);
+            """;
+        indexCommand.ExecuteNonQuery();
     }
 
     private SqliteConnection OpenConnection() => new(_connectionString);
+
+    private static void AddColumnIfMissing(SqliteConnection connection, string table, string column, string definition)
+    {
+        using var pragma = connection.CreateCommand();
+        pragma.CommandText = $"PRAGMA table_info({table});";
+        using var reader = pragma.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader["name"]?.ToString(), column, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+        }
+
+        using var alter = connection.CreateCommand();
+        alter.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+        alter.ExecuteNonQuery();
+    }
 
     private static void BindRecord(SqliteCommand command, MemoryRecord record)
     {
@@ -424,6 +511,13 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         command.Parameters.AddWithValue("$importance", record.Importance);
         command.Parameters.AddWithValue("$confidence", record.Confidence);
         command.Parameters.AddWithValue("$expiry_utc", (object?)record.ExpiryUtc?.ToString("O") ?? DBNull.Value);
+        command.Parameters.AddWithValue("$approval_state", record.ApprovalState.ToString());
+        command.Parameters.AddWithValue("$title", record.Title);
+        command.Parameters.AddWithValue("$source_path", record.SourcePath);
+        command.Parameters.AddWithValue("$source_hash", record.SourceHash);
+        command.Parameters.AddWithValue("$chunk_index", record.ChunkIndex);
+        command.Parameters.AddWithValue("$category", record.Category);
+        command.Parameters.AddWithValue("$last_verified_utc", (object?)record.LastVerifiedUtc?.ToString("O") ?? DBNull.Value);
         command.Parameters.AddWithValue("$metadata_json", JsonSerializer.Serialize(record.Metadata, JsonDefaults.Default));
         command.Parameters.AddWithValue("$embedding_json", JsonSerializer.Serialize(record.Embedding));
         command.Parameters.AddWithValue("$embedding_model", record.EmbeddingModel ?? string.Empty);
@@ -481,6 +575,15 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
                 Importance = Convert.ToDouble(reader["importance"]),
                 Confidence = Convert.ToDouble(reader["confidence"]),
                 ExpiryUtc = ParseNullableDateTime(reader["expiry_utc"]?.ToString()),
+                ApprovalState = Enum.TryParse<MemoryApprovalState>(reader["approval_state"]?.ToString(), true, out var approvalState)
+                    ? approvalState
+                    : MemoryApprovalState.Active,
+                Title = reader["title"]?.ToString() ?? string.Empty,
+                SourcePath = reader["source_path"]?.ToString() ?? string.Empty,
+                SourceHash = reader["source_hash"]?.ToString() ?? string.Empty,
+                ChunkIndex = Convert.ToInt32(reader["chunk_index"]),
+                Category = reader["category"]?.ToString() ?? string.Empty,
+                LastVerifiedUtc = ParseNullableDateTime(reader["last_verified_utc"]?.ToString()),
                 Metadata = metadata,
                 Embedding = embedding,
                 EmbeddingModel = reader["embedding_model"].ToString(),

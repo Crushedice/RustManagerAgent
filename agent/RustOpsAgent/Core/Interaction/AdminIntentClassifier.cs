@@ -240,7 +240,9 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "7. server_management for: add/register/remove/delete/provision a server, update RCON\n" +
         "   credentials, \"edit server connection\". serverName and commandText (=RCON IP) go in slots.\n\n" +
         "8. chat for: git operations, pull, rebuild, build, questions about the agent software itself.\n" +
-        "   Memory/admin commands such as \"memory stats\", \"memory search\", \"memory migrate\" are ALSO chat.\n" +
+        "   Memory/admin commands such as \"memory stats\", \"/memory search\", \"memory migrate\" are ALSO chat.\n" +
+        "   Plugin reference lookup commands such as \"/plugin-index search\", \"what commands does Backpacks have\",\n" +
+        "   \"what permission is needed for /kit\", and \"which plugin owns /remove\" are ALSO chat.\n" +
         "   CRITICAL: \"git pull\", \"rebuild the agent\", \"can you pull?\" -> ALWAYS intent=chat.\n\n" +
         "9. scopeKind=all when admin says \"all servers\", \"every server\", \"all N servers\".\n" +
         "   For general status/health questions with NO specific server name, default scopeKind=all.\n\n" +
@@ -363,7 +365,11 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
 
     private static AdminIntentType InferHeuristicIntent(string lowered)
     {
-        if (lowered.StartsWith("memory ", StringComparison.Ordinal))
+        if (lowered.StartsWith("memory ", StringComparison.Ordinal) ||
+            lowered.StartsWith("/memory ", StringComparison.Ordinal) ||
+            lowered.StartsWith("plugin-index ", StringComparison.Ordinal) ||
+            lowered.StartsWith("/plugin-index ", StringComparison.Ordinal) ||
+            LooksLikePluginReferenceQuestion(lowered))
             return AdminIntentType.Chat;
         if (lowered.Contains("add server") || lowered.Contains("add remote") || lowered.Contains("register server") ||
             lowered.Contains("remove server") || lowered.Contains("delete server") || lowered.Contains("provision server") ||
@@ -392,6 +398,18 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             return AdminIntentType.Troubleshooting;
         return AdminIntentType.Chat;
     }
+
+    private static bool LooksLikePluginReferenceQuestion(string lowered) =>
+        (lowered.Contains("what command", StringComparison.Ordinal) ||
+         lowered.Contains("which command", StringComparison.Ordinal) ||
+         lowered.Contains("commands can players", StringComparison.Ordinal) ||
+         lowered.Contains("permission is needed", StringComparison.Ordinal) ||
+         lowered.Contains("which plugin owns", StringComparison.Ordinal) ||
+         lowered.Contains("does this plugin use", StringComparison.Ordinal) ||
+         lowered.Contains("hook", StringComparison.Ordinal) ||
+         lowered.Contains("config key", StringComparison.Ordinal)) &&
+        !lowered.Contains("run ", StringComparison.Ordinal) &&
+        !lowered.Contains("execute ", StringComparison.Ordinal);
 
     // Standalone lifecycle verbs — only match when NOT part of "update rcon" etc.
     private static bool IsLifecycleVerb(string lowered) =>

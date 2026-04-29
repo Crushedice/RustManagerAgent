@@ -1049,6 +1049,9 @@ public class SemanticMemoryTests
         public Task<IReadOnlyList<MemoryRecord>> ListRecentAsync(int maxResults, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<MemoryRecord>>([NewRecord("Known fix", new[] { 1f, 0f, 0f, 0f })]);
         public Task<IReadOnlyList<IGrouping<string, MemoryRecord>>> ListRepeatedFailuresAsync(int minOccurrences, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<IGrouping<string, MemoryRecord>>>(Array.Empty<IGrouping<string, MemoryRecord>>());
         public Task<MemoryRecord> AddManualMemoryAsync(ManualMemoryInput input, CancellationToken cancellationToken) => Task.FromResult(NewRecord(input.Summary, new[] { 1f, 0f, 0f, 0f }));
+        public Task<MemoryImportDisposition> ImportRecordAsync(MemoryRecord record, CancellationToken cancellationToken) => Task.FromResult(MemoryImportDisposition.Imported);
+        public Task<IReadOnlyList<MemoryRecord>> ListPendingAsync(int maxResults, CancellationToken cancellationToken) => Task.FromResult<IReadOnlyList<MemoryRecord>>(Array.Empty<MemoryRecord>());
+        public Task<bool> SetApprovalStateAsync(string id, MemoryApprovalState approvalState, CancellationToken cancellationToken) => Task.FromResult(true);
         public Task<int> RebuildEmbeddingsAsync(CancellationToken cancellationToken) => Task.FromResult(3);
         public Task<MemoryMigrationReport> MigrateLegacyMemoryAsync(bool dryRun, CancellationToken cancellationToken)
         {

@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -4455,6 +4456,11 @@ static ValidationResult ValidateOxidePluginFile(string path)
     var pluginAuthor = infoMatch.Success ? infoMatch.Groups["author"].Value.Trim() : null;
     var pluginVersion = infoMatch.Success ? infoMatch.Groups["version"].Value.Trim() : null;
     var pluginSlug = !string.IsNullOrWhiteSpace(pluginName) ? ToPluginSlug(pluginName) : null;
+    var sourceHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text)));
+    var commands = ExtractPluginCommands(text);
+    var permissions = ExtractPluginPermissions(text);
+    var hooks = ExtractPluginHooks(text);
+    var configKeys = ExtractPluginConfigKeys(text);
 
     var hasPluginBase =
         text.Contains(": RustPlugin", StringComparison.Ordinal) ||
@@ -4471,7 +4477,12 @@ static ValidationResult ValidateOxidePluginFile(string path)
             PluginName = pluginName,
             PluginAuthor = pluginAuthor,
             PluginVersion = pluginVersion,
-            PluginSlug = pluginSlug
+            PluginSlug = pluginSlug,
+            SourceHash = sourceHash,
+            Commands = commands,
+            Permissions = permissions,
+            Hooks = hooks,
+            ConfigKeys = configKeys
         };
     }
 
@@ -4487,7 +4498,12 @@ static ValidationResult ValidateOxidePluginFile(string path)
             PluginName = pluginName,
             PluginAuthor = pluginAuthor,
             PluginVersion = pluginVersion,
-            PluginSlug = pluginSlug
+            PluginSlug = pluginSlug,
+            SourceHash = sourceHash,
+            Commands = commands,
+            Permissions = permissions,
+            Hooks = hooks,
+            ConfigKeys = configKeys
         };
     }
 
@@ -4498,7 +4514,12 @@ static ValidationResult ValidateOxidePluginFile(string path)
         PluginName = pluginName,
         PluginAuthor = pluginAuthor,
         PluginVersion = pluginVersion,
-        PluginSlug = pluginSlug
+        PluginSlug = pluginSlug,
+        SourceHash = sourceHash,
+        Commands = commands,
+        Permissions = permissions,
+        Hooks = hooks,
+        ConfigKeys = configKeys
     };
 }
 
@@ -4516,6 +4537,82 @@ static PluginMetadata ParsePluginMetadata(string path)
     return new PluginMetadata(
         infoMatch.Groups["name"].Value.Trim(),
         infoMatch.Groups["version"].Value.Trim());
+}
+
+static List<PluginCommandReferenceView> ExtractPluginCommands(string source)
+{
+    var commands = new List<PluginCommandReferenceView>();
+    AddPluginAttributeCommands(commands, source, @"\[\s*ChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "ChatCommand");
+    AddPluginAttributeCommands(commands, source, @"\[\s*ConsoleCommand\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "ConsoleCommand");
+    AddPluginAttributeCommands(commands, source, @"\[\s*Command\s*\(\s*""(?<cmd>[^""]+)""\s*\)\s*\]", "CovalenceCommand");
+
+    foreach (Match match in Regex.Matches(source, @"cmd\.AddChatCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*this\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "ChatCommand", match.Groups["handler"].Value.Trim()));
+
+    foreach (Match match in Regex.Matches(source, @"AddCovalenceCommand\s*\(\s*""(?<cmd>[^""]+)""\s*,\s*(?:nameof\s*\(\s*)?""?(?<handler>[A-Za-z_][A-Za-z0-9_]*)""?", RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), "CovalenceCommand", match.Groups["handler"].Value.Trim()));
+
+    return commands
+        .GroupBy(command => $"{command.Type}:{command.Command}", StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.First())
+        .OrderBy(command => command.Command, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static void AddPluginAttributeCommands(List<PluginCommandReferenceView> commands, string source, string pattern, string type)
+{
+    foreach (Match match in Regex.Matches(source, pattern, RegexOptions.IgnoreCase))
+        commands.Add(new PluginCommandReferenceView(match.Groups["cmd"].Value.Trim(), type, FindPluginHandlerAfter(source, match.Index + match.Length)));
+}
+
+static string FindPluginHandlerAfter(string source, int index)
+{
+    var tail = source[Math.Min(index, source.Length)..];
+    var match = Regex.Match(
+        tail,
+        @"\b(?:private|public|protected|internal)?\s*(?:void|bool|object|string)\s+(?<handler>[A-Za-z_][A-Za-z0-9_]*)\s*\(",
+        RegexOptions.IgnoreCase);
+    return match.Success ? match.Groups["handler"].Value.Trim() : string.Empty;
+}
+
+static List<string> ExtractPluginPermissions(string source)
+{
+    var patterns = new[]
+    {
+        @"permission\.RegisterPermission\s*\(\s*""(?<value>[^""]+)""",
+        @"permission\.UserHasPermission\s*\([^,]+,\s*""(?<value>[^""]+)""",
+        @"\.HasPermission\s*\(\s*""(?<value>[^""]+)"""
+    };
+    return patterns
+        .SelectMany(pattern => Regex.Matches(source, pattern, RegexOptions.IgnoreCase).Select(match => match.Groups["value"].Value.Trim()))
+        .Where(value => !string.IsNullOrWhiteSpace(value))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static List<string> ExtractPluginHooks(string source)
+{
+    var known = new[] { "OnServerInitialized", "Init", "Loaded", "Unload", "OnPlayerConnected", "OnPlayerDisconnected", "OnEntityDeath", "OnPlayerDeath", "OnUserChat", "CanBuild", "CanLootEntity" };
+    return known
+        .Where(hook => Regex.IsMatch(source, $@"\b(?:void|object|bool|string)\s+{Regex.Escape(hook)}\s*\(", RegexOptions.IgnoreCase))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(value => value, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+}
+
+static List<string> ExtractPluginConfigKeys(string source)
+{
+    var keys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (Match match in Regex.Matches(source, @"Config\s*\[\s*""(?<key>[^""]+)""\s*\]", RegexOptions.IgnoreCase))
+        keys.Add(match.Groups["key"].Value.Trim());
+    foreach (Match match in Regex.Matches(source, @"GetConfig\s*\(\s*""(?<key>[^""]+)""", RegexOptions.IgnoreCase))
+        keys.Add(match.Groups["key"].Value.Trim());
+    foreach (Match match in Regex.Matches(source, @"JsonProperty\s*\(\s*""(?<key>[^""]+)""\s*\)", RegexOptions.IgnoreCase))
+        keys.Add(match.Groups["key"].Value.Trim());
+    foreach (Match match in Regex.Matches(source, @"configData\.(?<key>[A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase))
+        keys.Add(match.Groups["key"].Value.Trim());
+    return keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToList();
 }
 
 static string ToPluginSlug(string input)
@@ -4731,7 +4828,14 @@ public sealed class ValidationResult
     public string? PluginAuthor { get; set; }
     public string? PluginVersion { get; set; }
     public string? PluginSlug { get; set; }
+    public string SourceHash { get; set; } = string.Empty;
+    public List<PluginCommandReferenceView> Commands { get; set; } = new();
+    public List<string> Permissions { get; set; } = new();
+    public List<string> Hooks { get; set; } = new();
+    public List<string> ConfigKeys { get; set; } = new();
 }
+
+public sealed record PluginCommandReferenceView(string Command, string Type, string HandlerMethod);
 
 public sealed class PluginInstallRequest
 {

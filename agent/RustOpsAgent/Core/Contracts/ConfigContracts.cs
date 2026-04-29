@@ -45,7 +45,18 @@ internal sealed class MemorySettings
     [JsonPropertyName("pruneLowImportanceThreshold")] public double PruneLowImportanceThreshold { get; set; } = 0.15;
     [JsonPropertyName("pruneLowConfidenceThreshold")] public double PruneLowConfidenceThreshold { get; set; } = 0.2;
     [JsonPropertyName("pruneOlderThanDays")] public int PruneOlderThanDays { get; set; } = 30;
+    [JsonPropertyName("minimumRecallConfidence")] public double MinimumRecallConfidence { get; set; } = 0.55;
+    [JsonPropertyName("memoryImport")] public MemoryImportSettings MemoryImport { get; set; } = new();
     [JsonPropertyName("embedding")] public EmbeddingSettings Embedding { get; set; } = new();
+}
+
+internal sealed class MemoryImportSettings
+{
+    [JsonPropertyName("defaultApprovalState")] public MemoryApprovalState DefaultApprovalState { get; set; } = MemoryApprovalState.Pending;
+    [JsonPropertyName("trustedSeedFolders")] public List<string> TrustedSeedFolders { get; set; } = new() { "./knowledge/verified" };
+    [JsonPropertyName("chunkTargetTokens")] public int ChunkTargetTokens { get; set; } = 900;
+    [JsonPropertyName("chunkMaxTokens")] public int ChunkMaxTokens { get; set; } = 1400;
+    [JsonPropertyName("nearDuplicateThreshold")] public double NearDuplicateThreshold { get; set; } = 0.94;
 }
 
 internal sealed class EmbeddingSettings
@@ -128,6 +139,7 @@ internal sealed class PluginUpdateSettings
     [JsonPropertyName("searchFilter")] public string SearchFilter { get; set; } = "rust";
     [JsonPropertyName("downloadEnabled")] public bool DownloadEnabled { get; set; }
     [JsonPropertyName("stagingPath")] public string StagingPath { get; set; } = "data/plugin-staging";
+    [JsonPropertyName("referenceIndexDatabasePath")] public string ReferenceIndexDatabasePath { get; set; } = "data/plugin-reference-index.db";
 }
 
 internal sealed class CpuAffinitySettings

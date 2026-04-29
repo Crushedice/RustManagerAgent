@@ -8,13 +8,23 @@ internal sealed class RustChatToolHandler : IToolHandler
 {
     private readonly NeoCortexStore _memory;
     private readonly ISemanticMemoryService _semanticMemory;
+    private readonly IMemoryImportService? _memoryImport;
+    private readonly PluginReferenceIndexer? _pluginReferenceIndexer;
     private readonly AutoPullService? _autoPull;
     private readonly ServerKnowledgeCatalog _knowledge;
 
-    public RustChatToolHandler(NeoCortexStore memory, ISemanticMemoryService semanticMemory, AutoPullService? autoPull = null, ServerKnowledgeCatalog? knowledge = null)
+    public RustChatToolHandler(
+        NeoCortexStore memory,
+        ISemanticMemoryService semanticMemory,
+        AutoPullService? autoPull = null,
+        ServerKnowledgeCatalog? knowledge = null,
+        IMemoryImportService? memoryImport = null,
+        PluginReferenceIndexer? pluginReferenceIndexer = null)
     {
         _memory = memory;
         _semanticMemory = semanticMemory;
+        _memoryImport = memoryImport;
+        _pluginReferenceIndexer = pluginReferenceIndexer;
         _autoPull = autoPull;
         _knowledge = knowledge ?? new ServerKnowledgeCatalog();
     }
@@ -35,6 +45,18 @@ internal sealed class RustChatToolHandler : IToolHandler
         if (memoryCommandResult is not null)
         {
             return memoryCommandResult;
+        }
+
+        var pluginIndexCommandResult = await TryHandlePluginIndexCommandAsync(context, cancellationToken);
+        if (pluginIndexCommandResult is not null)
+        {
+            return pluginIndexCommandResult;
+        }
+
+        var pluginReferenceResult = await TryHandlePluginReferenceQuestionAsync(context, cancellationToken);
+        if (pluginReferenceResult is not null)
+        {
+            return pluginReferenceResult;
         }
 
         var catalogQuestionResult = TryHandleCatalogQuestion(context);
@@ -131,11 +153,74 @@ internal sealed class RustChatToolHandler : IToolHandler
 
     private async Task<ToolExecutionResult?> TryHandleMemoryCommandAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        var message = context.Message.Trim();
+        var message = context.Message.Trim().TrimStart('/');
         var lowered = message.ToLowerInvariant();
         if (!lowered.StartsWith("memory", StringComparison.Ordinal))
         {
             return null;
+        }
+
+        if (lowered.StartsWith("memory import ", StringComparison.Ordinal) &&
+            !lowered.StartsWith("memory import server catalog", StringComparison.Ordinal) &&
+            !lowered.StartsWith("memory import convar catalog", StringComparison.Ordinal))
+        {
+            if (_memoryImport is null)
+            {
+                return new ToolExecutionResult(false, "Memory import service is not configured.", ErrorCode: "not_configured");
+            }
+
+            var args = message["memory import ".Length..].Trim();
+            var trusted = args.Contains("--trusted", StringComparison.OrdinalIgnoreCase);
+            var dryRun = args.Contains("--dry-run", StringComparison.OrdinalIgnoreCase);
+            var folder = args
+                .Replace("--trusted", string.Empty, StringComparison.OrdinalIgnoreCase)
+                .Replace("--dry-run", string.Empty, StringComparison.OrdinalIgnoreCase)
+                .Trim().Trim('"');
+            if (string.IsNullOrWhiteSpace(folder))
+            {
+                return new ToolExecutionResult(false, "Use: /memory import <folderPath> [--trusted] [--dry-run]");
+            }
+
+            var report = await _memoryImport.ImportFolderAsync(new MemoryImportOptions { FolderPath = folder, Trusted = trusted, DryRun = dryRun }, cancellationToken);
+            var suffix = report.Messages.Count == 0 ? string.Empty : "\n" + string.Join('\n', report.Messages.Take(5));
+            return new ToolExecutionResult(report.Errors == 0, $"Memory import complete: {report.ToSummary()}{suffix}", MutatedState: report.Imported > 0);
+        }
+
+        if (lowered.StartsWith("memory pending", StringComparison.Ordinal))
+        {
+            var records = await _semanticMemory.ListPendingAsync(25, cancellationToken);
+            if (records.Count == 0)
+            {
+                return new ToolExecutionResult(true, "No pending memory records.");
+            }
+
+            var lines = records.Select(record => $"{record.Id} [{record.Source}] {record.Summary} confidence={record.Confidence:F2} source={record.SourcePath}");
+            return new ToolExecutionResult(true, string.Join('\n', lines));
+        }
+
+        if (lowered.StartsWith("memory approve ", StringComparison.Ordinal))
+        {
+            var id = message["memory approve ".Length..].Trim();
+            var updated = await _semanticMemory.SetApprovalStateAsync(id, MemoryApprovalState.Active, cancellationToken);
+            return updated
+                ? new ToolExecutionResult(true, $"Approved memory record '{id}'.", MutatedState: true)
+                : new ToolExecutionResult(false, $"No memory record found for id '{id}'.");
+        }
+
+        if (lowered.StartsWith("memory reject ", StringComparison.Ordinal))
+        {
+            var id = message["memory reject ".Length..].Trim();
+            var updated = await _semanticMemory.SetApprovalStateAsync(id, MemoryApprovalState.Rejected, cancellationToken);
+            return updated
+                ? new ToolExecutionResult(true, $"Rejected memory record '{id}'.", MutatedState: true)
+                : new ToolExecutionResult(false, $"No memory record found for id '{id}'.");
+        }
+
+        if (lowered.StartsWith("memory forget ", StringComparison.Ordinal))
+        {
+            var id = message["memory forget ".Length..].Trim();
+            await _semanticMemory.DeleteAsync(id, cancellationToken);
+            return new ToolExecutionResult(true, $"Forgot memory record '{id}'.", MutatedState: true);
         }
 
         if (lowered.StartsWith("memory stats", StringComparison.Ordinal))
@@ -244,6 +329,144 @@ internal sealed class RustChatToolHandler : IToolHandler
 
         return new ToolExecutionResult(false, "Unknown memory command. Try: memory stats | memory search <query> | memory recent | memory show <id> | memory delete <id> | memory repeated failures | memory rebuild | memory migrate | memory prune | memory add <summary> :: <detail>");
     }
+
+    private async Task<ToolExecutionResult?> TryHandlePluginIndexCommandAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        var message = context.Message.Trim().TrimStart('/');
+        var lowered = message.ToLowerInvariant();
+        if (!lowered.StartsWith("plugin-index", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        if (_pluginReferenceIndexer is null)
+        {
+            return new ToolExecutionResult(false, "Plugin reference index is not configured.", ErrorCode: "not_configured");
+        }
+
+        if (lowered.StartsWith("plugin-index refresh", StringComparison.Ordinal))
+        {
+            var report = await _pluginReferenceIndexer.RefreshAllAsync(cancellationToken);
+            var suffix = report.Messages.Count == 0 ? string.Empty : "\n" + string.Join('\n', report.Messages.Take(5));
+            return new ToolExecutionResult(report.Errors == 0, $"Plugin index refresh complete: {report.ToSummary()}{suffix}", MutatedState: report.Indexed > 0);
+        }
+
+        if (lowered.StartsWith("plugin-index search ", StringComparison.Ordinal))
+        {
+            var query = message["plugin-index search ".Length..].Trim();
+            var matches = await _pluginReferenceIndexer.SearchAsync(query, cancellationToken);
+            return new ToolExecutionResult(true, FormatPluginSearch(matches, includeAdmin: true));
+        }
+
+        if (lowered.StartsWith("plugin-index commands", StringComparison.Ordinal))
+        {
+            var pluginName = message.Length > "plugin-index commands".Length ? message["plugin-index commands".Length..].Trim() : string.Empty;
+            var records = string.IsNullOrWhiteSpace(pluginName)
+                ? await _pluginReferenceIndexer.ListAsync(cancellationToken)
+                : await _pluginReferenceIndexer.SearchAsync(pluginName, cancellationToken);
+            var lines = records
+                .Where(record => string.IsNullOrWhiteSpace(pluginName) || record.PluginName.Contains(pluginName, StringComparison.OrdinalIgnoreCase))
+                .SelectMany(record => record.Commands.Select(command => $"{record.PluginName}: {FormatCommand(command, includeAdmin: true)}"))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(80)
+                .ToList();
+            return new ToolExecutionResult(true, lines.Count == 0 ? "No plugin commands indexed." : string.Join('\n', lines));
+        }
+
+        if (lowered.StartsWith("plugin-index permissions ", StringComparison.Ordinal) ||
+            lowered.StartsWith("plugin-index hooks ", StringComparison.Ordinal))
+        {
+            var isHooks = lowered.StartsWith("plugin-index hooks ", StringComparison.Ordinal);
+            var prefix = isHooks ? "plugin-index hooks " : "plugin-index permissions ";
+            var pluginName = message[prefix.Length..].Trim();
+            var records = await _pluginReferenceIndexer.SearchAsync(pluginName, cancellationToken);
+            var lines = records
+                .Where(record => record.PluginName.Contains(pluginName, StringComparison.OrdinalIgnoreCase))
+                .Select(record => $"{record.PluginName}: {string.Join(", ", isHooks ? record.Hooks : record.Permissions)}")
+                .ToList();
+            return new ToolExecutionResult(true, lines.Count == 0 ? "No matching plugin reference records found." : string.Join('\n', lines));
+        }
+
+        return new ToolExecutionResult(false, "Unknown plugin-index command. Try: /plugin-index refresh | search <query> | commands [pluginName] | permissions <pluginName> | hooks <pluginName>");
+    }
+
+    private async Task<ToolExecutionResult?> TryHandlePluginReferenceQuestionAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        if (_pluginReferenceIndexer is null || !LooksLikePluginReferenceQuestion(context.Message))
+        {
+            return null;
+        }
+
+        var records = await _pluginReferenceIndexer.SearchAsync(context.Message, cancellationToken);
+        if (records.Count == 0)
+        {
+            return null;
+        }
+
+        var includeAdmin = !LooksPlayerFacing(context.Message);
+        return new ToolExecutionResult(
+            true,
+            FormatPluginSearch(records, includeAdmin),
+            Payload: new { source = "plugin-reference-index", count = records.Count },
+            ErrorCode: "authoritative_catalog");
+    }
+
+    private static bool LooksLikePluginReferenceQuestion(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        return lowered.Contains("command", StringComparison.Ordinal) ||
+               lowered.Contains("permission", StringComparison.Ordinal) ||
+               lowered.Contains("oxide plugin", StringComparison.Ordinal) ||
+               lowered.Contains("umod plugin", StringComparison.Ordinal) ||
+               lowered.Contains("plugin", StringComparison.Ordinal) ||
+               lowered.Contains("hook", StringComparison.Ordinal) ||
+               lowered.Contains("config key", StringComparison.Ordinal) ||
+               lowered.Contains("chat command", StringComparison.Ordinal) ||
+               lowered.Contains("console command", StringComparison.Ordinal);
+    }
+
+    private static bool LooksPlayerFacing(string message)
+    {
+        var lowered = message.ToLowerInvariant();
+        return lowered.Contains("player-facing", StringComparison.Ordinal) ||
+               lowered.Contains("player safe", StringComparison.Ordinal) ||
+               lowered.Contains("players use", StringComparison.Ordinal) ||
+               lowered.Contains("what commands can players", StringComparison.Ordinal);
+    }
+
+    private static string FormatPluginSearch(IReadOnlyList<PluginReferenceRecord> records, bool includeAdmin)
+    {
+        var lines = new List<string>();
+        foreach (var record in records.Take(8))
+        {
+            var commands = record.Commands
+                .Where(command => includeAdmin || !PluginReferenceIndexer.LooksAdminOnly(command))
+                .Select(command => FormatCommand(command, includeAdmin))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(10)
+                .ToList();
+            var permissions = includeAdmin
+                ? string.Join(", ", record.Permissions.Take(10))
+                : string.Empty;
+            var hooks = includeAdmin ? $" Hooks: {string.Join(", ", record.Hooks.Take(8))}." : string.Empty;
+            var permissionText = includeAdmin && !string.IsNullOrWhiteSpace(permissions) ? $" Permissions: {permissions}." : string.Empty;
+            lines.Add($"{record.PluginName}: commands {FormatList(commands)}.{permissionText}{hooks}");
+        }
+
+        return lines.Count == 0 ? "No matching plugin reference records found." : string.Join('\n', lines);
+    }
+
+    private static string FormatCommand(PluginCommandReference command, bool includeAdmin)
+    {
+        var prefix = command.Type == "ConsoleCommand" ? string.Empty : "/";
+        var text = $"{prefix}{command.Command.TrimStart('/')}";
+        return includeAdmin && !string.IsNullOrWhiteSpace(command.RequiredPermission)
+            ? $"{text} ({command.Type}, permission {command.RequiredPermission})"
+            : $"{text} ({command.Type})";
+    }
+
+    private static string FormatList(IReadOnlyList<string> items) =>
+        items.Count == 0 ? "none detected" : string.Join(", ", items);
 
     private ToolExecutionResult? TryHandleCatalogQuestion(ToolExecutionContext context)
     {

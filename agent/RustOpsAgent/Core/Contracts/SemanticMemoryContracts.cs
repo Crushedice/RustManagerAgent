@@ -13,7 +13,8 @@ internal enum MemoryRecordType
     UserInstruction,
     ServerState,
     ToolObservation,
-    Reflection
+    Reflection,
+    PluginSummary
 }
 
 internal enum MemoryScope
@@ -33,7 +34,19 @@ internal enum MemorySource
     AdminCommand,
     ReflectionLoop,
     ConfigScan,
-    ManualImport
+    ManualImport,
+    SeededImport,
+    AiGeneratedImport,
+    FailedAttempt,
+    VerifiedFact,
+    PluginSummary
+}
+
+internal enum MemoryApprovalState
+{
+    Active,
+    Pending,
+    Rejected
 }
 
 internal sealed class MemoryRecord
@@ -53,6 +66,13 @@ internal sealed class MemoryRecord
     [JsonPropertyName("importance")] public double Importance { get; set; } = 0.5;
     [JsonPropertyName("confidence")] public double Confidence { get; set; } = 0.5;
     [JsonPropertyName("expiryUtc")] public DateTime? ExpiryUtc { get; set; }
+    [JsonPropertyName("approvalState")] public MemoryApprovalState ApprovalState { get; set; } = MemoryApprovalState.Active;
+    [JsonPropertyName("title")] public string Title { get; set; } = string.Empty;
+    [JsonPropertyName("sourcePath")] public string SourcePath { get; set; } = string.Empty;
+    [JsonPropertyName("sourceHash")] public string SourceHash { get; set; } = string.Empty;
+    [JsonPropertyName("chunkIndex")] public int ChunkIndex { get; set; }
+    [JsonPropertyName("category")] public string Category { get; set; } = string.Empty;
+    [JsonPropertyName("lastVerifiedUtc")] public DateTime? LastVerifiedUtc { get; set; }
     [JsonPropertyName("metadata")] public Dictionary<string, string> Metadata { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     [JsonPropertyName("embedding")] public float[] Embedding { get; set; } = Array.Empty<float>();
     [JsonPropertyName("embeddingModel")] public string? EmbeddingModel { get; set; }
@@ -63,6 +83,10 @@ internal sealed class MemoryRecord
     {
         Text = Text?.Trim() ?? string.Empty;
         Summary = Summary?.Trim() ?? string.Empty;
+        Title = Title?.Trim() ?? string.Empty;
+        SourcePath = SourcePath?.Trim() ?? string.Empty;
+        SourceHash = SourceHash?.Trim() ?? string.Empty;
+        Category = Category?.Trim() ?? string.Empty;
         Tags = Tags
             .Where(tag => !string.IsNullOrWhiteSpace(tag))
             .Select(tag => tag.Trim())
@@ -151,7 +175,9 @@ internal sealed class MemorySearchRequest
     [JsonPropertyName("relatedEntityIds")] public List<string>? RelatedEntityIds { get; set; }
     [JsonPropertyName("maxResults")] public int MaxResults { get; set; } = 6;
     [JsonPropertyName("minSimilarity")] public double MinSimilarity { get; set; } = 0.55;
+    [JsonPropertyName("minConfidence")] public double MinConfidence { get; set; }
     [JsonPropertyName("includeExpired")] public bool IncludeExpired { get; set; }
+    [JsonPropertyName("includeNonActive")] public bool IncludeNonActive { get; set; }
     [JsonIgnore] public float[]? QueryEmbedding { get; set; }
     [JsonIgnore] public string? QueryEmbeddingModel { get; set; }
 }
@@ -207,6 +233,29 @@ internal sealed class MemoryMigrationReport
         $"files={FilesScanned.Count} discovered={RecordsDiscovered} imported={RecordsImported} skipped={RecordsSkipped} duplicates={DuplicatesRemoved} embeddingFailures={EmbeddingFailures} malformed={MalformedEntries} errors={OtherErrors} dryRun={DryRun}";
 }
 
+internal sealed class MemoryImportOptions
+{
+    public string FolderPath { get; set; } = string.Empty;
+    public bool Trusted { get; set; }
+    public bool DryRun { get; set; }
+}
+
+internal sealed class MemoryImportReport
+{
+    public int FilesScanned { get; set; }
+    public int ChunksDiscovered { get; set; }
+    public int Imported { get; set; }
+    public int Pending { get; set; }
+    public int Rejected { get; set; }
+    public int Duplicates { get; set; }
+    public int Skipped { get; set; }
+    public int Errors { get; set; }
+    public List<string> Messages { get; set; } = new();
+
+    public string ToSummary() =>
+        $"files={FilesScanned} chunks={ChunksDiscovered} imported={Imported} pending={Pending} duplicates={Duplicates} skipped={Skipped} errors={Errors}";
+}
+
 internal enum MemoryImportDisposition
 {
     Imported,
@@ -227,6 +276,13 @@ internal sealed class ManualMemoryInput
     public List<string> RelatedEntityIds { get; set; } = new();
     public double Importance { get; set; } = 0.6;
     public double Confidence { get; set; } = 0.8;
+    public MemoryApprovalState ApprovalState { get; set; } = MemoryApprovalState.Active;
+    public string Title { get; set; } = string.Empty;
+    public string SourcePath { get; set; } = string.Empty;
+    public string SourceHash { get; set; } = string.Empty;
+    public int ChunkIndex { get; set; }
+    public string Category { get; set; } = string.Empty;
+    public DateTime? LastVerifiedUtc { get; set; }
     public Dictionary<string, string> Metadata { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
@@ -244,6 +300,7 @@ internal interface IMemoryStore
 internal interface IInspectableMemoryStore : IMemoryStore
 {
     Task<IReadOnlyList<MemoryRecord>> ListRecentAsync(int maxResults, CancellationToken cancellationToken);
+    Task<IReadOnlyList<MemoryRecord>> ListByApprovalStateAsync(MemoryApprovalState approvalState, int maxResults, CancellationToken cancellationToken);
     Task<IReadOnlyList<MemoryRecord>> GetAllAsync(CancellationToken cancellationToken);
     Task<bool> ExistsByContentHashAsync(string contentHash, CancellationToken cancellationToken);
 }
@@ -299,7 +356,51 @@ internal interface ISemanticMemoryService
     Task<IReadOnlyList<MemoryRecord>> ListRecentAsync(int maxResults, CancellationToken cancellationToken);
     Task<IReadOnlyList<IGrouping<string, MemoryRecord>>> ListRepeatedFailuresAsync(int minOccurrences, CancellationToken cancellationToken);
     Task<MemoryRecord> AddManualMemoryAsync(ManualMemoryInput input, CancellationToken cancellationToken);
+    Task<MemoryImportDisposition> ImportRecordAsync(MemoryRecord record, CancellationToken cancellationToken);
+    Task<IReadOnlyList<MemoryRecord>> ListPendingAsync(int maxResults, CancellationToken cancellationToken);
+    Task<bool> SetApprovalStateAsync(string id, MemoryApprovalState approvalState, CancellationToken cancellationToken);
     Task<int> RebuildEmbeddingsAsync(CancellationToken cancellationToken);
     Task<MemoryMigrationReport> MigrateLegacyMemoryAsync(bool dryRun, CancellationToken cancellationToken);
     Task<int> PruneAsync(CancellationToken cancellationToken);
+}
+
+internal interface IMemoryImportService
+{
+    Task<MemoryImportReport> ImportFolderAsync(MemoryImportOptions options, CancellationToken cancellationToken);
+}
+
+internal sealed class PluginReferenceRecord
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string ServerName { get; set; } = string.Empty;
+    public string PluginName { get; set; } = string.Empty;
+    public string SourcePath { get; set; } = string.Empty;
+    public string SourceHash { get; set; } = string.Empty;
+    public string Version { get; set; } = string.Empty;
+    public string Author { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public List<PluginCommandReference> Commands { get; set; } = new();
+    public List<string> Permissions { get; set; } = new();
+    public List<string> Hooks { get; set; } = new();
+    public List<string> ConfigKeys { get; set; } = new();
+    public string RawSourceReferenceId { get; set; } = string.Empty;
+    public DateTime LastIndexedUtc { get; set; } = DateTime.UtcNow;
+}
+
+internal sealed class PluginCommandReference
+{
+    public string Command { get; set; } = string.Empty;
+    public string Type { get; set; } = string.Empty;
+    public string HandlerMethod { get; set; } = string.Empty;
+    public string RequiredPermission { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+    public int? LineNumber { get; set; }
+}
+
+internal interface IPluginReferenceIndexStore
+{
+    Task<PluginReferenceRecord?> GetBySourcePathAsync(string sourcePath, CancellationToken cancellationToken);
+    Task UpsertAsync(PluginReferenceRecord record, string rawSource, CancellationToken cancellationToken);
+    Task<IReadOnlyList<PluginReferenceRecord>> ListAsync(CancellationToken cancellationToken);
+    Task<IReadOnlyList<PluginReferenceRecord>> SearchAsync(string query, CancellationToken cancellationToken);
 }

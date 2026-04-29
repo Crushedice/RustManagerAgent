@@ -28,6 +28,14 @@
     "pruneLowImportanceThreshold": 0.15,
     "pruneLowConfidenceThreshold": 0.2,
     "pruneOlderThanDays": 30,
+    "minimumRecallConfidence": 0.55,
+    "memoryImport": {
+      "defaultApprovalState": "Pending",
+      "trustedSeedFolders": ["./knowledge/verified"],
+      "chunkTargetTokens": 900,
+      "chunkMaxTokens": 1400,
+      "nearDuplicateThreshold": 0.94
+    },
     "embedding": {
       "provider": "openai-compatible",
       "baseUrl": "${RUSTOPS_EMBEDDING_BASE_URL}",
@@ -123,7 +131,8 @@
     "checkIntervalMinutes": 60,
     "notifyAdmins": true,
     "searchUrlTemplate": "https://umod.org/plugins/search.json?query={0}&page=1&sort=title&sortdir=asc&filter={1}",
-    "searchFilter": "rust"
+    "searchFilter": "rust",
+    "referenceIndexDatabasePath": "data/plugin-reference-index.db"
   },
   "llm": {
     "enabled": true,

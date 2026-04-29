@@ -1,0 +1,12 @@
+[
+  {
+    "title": "AI-generated review placeholder",
+    "category": "review",
+    "tags": ["ai-generated", "pending-review"],
+    "confidence": 0.5,
+    "importance": 0.4,
+    "sourceType": "AiGeneratedImport",
+    "approval": "Pending",
+    "content": "This placeholder demonstrates the pending approval path for AI-generated imports."
+  }
+]
