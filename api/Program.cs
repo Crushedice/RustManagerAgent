@@ -1150,17 +1150,38 @@ app.MapGet("/servers/{server}/oxide/validate", (string server) =>
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToList();
 
-    var jsonFiles = configPaths
-        .Where(Directory.Exists)
-        .SelectMany(path => Directory.GetFiles(path, "*.json", SearchOption.AllDirectories))
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
+    string[] jsonFiles;
+    string[] pluginFiles;
+    try
+    {
+        jsonFiles = configPaths
+            .Where(Directory.Exists)
+            .SelectMany(path => Directory.GetFiles(path, "*.json", SearchOption.AllDirectories))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-    var pluginFiles = pluginsPaths
-        .Where(Directory.Exists)
-        .SelectMany(path => Directory.GetFiles(path, "*.cs", SearchOption.AllDirectories))
-        .Distinct(StringComparer.OrdinalIgnoreCase)
-        .ToArray();
+        pluginFiles = pluginsPaths
+            .Where(Directory.Exists)
+            .SelectMany(path => Directory.GetFiles(path, "*.cs", SearchOption.AllDirectories))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Ok(new
+        {
+            server,
+            ok = false,
+            error = "access_denied",
+            note = ex.Message,
+            searchedPaths = new
+            {
+                oxideRoots,
+                configPaths,
+                pluginsPaths
+            }
+        });
+    }
 
     var jsonResults = jsonFiles.Select(ValidateJsonFile).ToList();
     var pluginResults = pluginFiles.Select(ValidateOxidePluginFile).ToList();
@@ -1180,6 +1201,39 @@ app.MapGet("/servers/{server}/oxide/validate", (string server) =>
         jsonConfigs = jsonResults,
         plugins = pluginResults
     });
+});
+
+app.MapGet("/servers/{server}/plugins/updates", async (string server, CancellationToken cancellationToken) =>
+{
+    var result = await CheckPluginUpdatesAsync(server, cancellationToken);
+    return result is null
+        ? Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."))
+        : Results.Ok(result);
+});
+
+app.MapPost("/servers/{server}/plugins/install", async (string server, PluginInstallRequest request, CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.PluginName))
+        return Results.BadRequest(new ApiError("invalid_request", "pluginName is required."));
+
+    if (string.IsNullOrWhiteSpace(request.DownloadUrl) ||
+        !Uri.TryCreate(request.DownloadUrl, UriKind.Absolute, out var downloadUri) ||
+        downloadUri.Scheme is not ("http" or "https"))
+    {
+        return Results.BadRequest(new ApiError("invalid_request", "downloadUrl must be an absolute HTTP(S) URL."));
+    }
+
+    try
+    {
+        var result = await InstallPluginAsync(server, request.PluginName, downloadUri, cancellationToken);
+        return result is null
+            ? Results.NotFound(new ApiError("not_found", $"No config found for '{server}'."))
+            : Results.Ok(result);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return Results.Json(new ApiError("access_denied", ex.Message), statusCode: StatusCodes.Status403Forbidden);
+    }
 });
 
 // -- Managed tasks for agent-created cron jobs --------------------------------
@@ -3206,17 +3260,181 @@ static List<LlmModelView> ExtractLmStudioModels(string? nativeJsonText, string? 
 
 static List<string> GetOxideRootCandidates(ServerConfig normalized)
 {
+    if (!string.IsNullOrWhiteSpace(normalized.OxideDir))
+        return new List<string> { normalized.OxideDir.TrimEnd('/', '\\') };
+
+    var canonicalRoot = Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust";
+
     return new[]
         {
+            Path.Combine(canonicalRoot, normalized.Name, "oxide"),
             Path.Combine(normalized.ServerDir, "oxide"),
             Path.Combine(normalized.ServerDir, normalized.ServerIdentity, "oxide"),
             Path.Combine(normalized.ServerDir, "server", normalized.ServerIdentity, "oxide"),
-            Path.Combine("/srv/rust", normalized.Name, "oxide"),
-            Path.Combine("/srv/rust", normalized.ServerIdentity, "oxide")
+            Path.Combine(canonicalRoot, normalized.ServerIdentity, "oxide")
         }
         .Where(path => !string.IsNullOrWhiteSpace(path))
         .Distinct(StringComparer.OrdinalIgnoreCase)
         .ToList();
+}
+
+static async Task<object?> CheckPluginUpdatesAsync(string server, CancellationToken cancellationToken)
+{
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return null;
+
+    var normalized = NormalizeConfig(server, cfg);
+    var candidates = GetOxideRootCandidates(normalized)
+        .Select(root => Path.Combine(root, "plugins"))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    string? pluginsDir;
+    try
+    {
+        pluginsDir = candidates.FirstOrDefault(Directory.Exists);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return new
+        {
+            server,
+            updates = Array.Empty<object>(),
+            error = "access_denied",
+            note = ex.Message,
+            triedPaths = candidates
+        };
+    }
+
+    if (pluginsDir is null)
+    {
+        return new
+        {
+            server,
+            updates = Array.Empty<object>(),
+            note = "plugins directory not found in any expected location",
+            triedPaths = candidates
+        };
+    }
+
+    List<PluginMetadata> plugins;
+    try
+    {
+        plugins = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.TopDirectoryOnly)
+            .Select(ParsePluginMetadata)
+            .Where(plugin => !string.IsNullOrWhiteSpace(plugin.Name))
+            .ToList();
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        return new
+        {
+            server,
+            updates = Array.Empty<object>(),
+            error = "access_denied",
+            path = pluginsDir,
+            note = $"Read permission denied for '{pluginsDir}'. Grant read access to the RustOps API service user for that directory. Details: {ex.Message}",
+            triedPaths = candidates
+        };
+    }
+
+    var updates = new List<object>();
+    using var http = new HttpClient();
+    foreach (var plugin in plugins)
+    {
+        var searchName = Uri.EscapeDataString(plugin.Name!);
+        var url = $"https://umod.org/plugins/search.json?query={searchName}&page=1&sort=title&sortdir=asc&filter=rust";
+        string body;
+        try
+        {
+            body = await http.GetStringAsync(url, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod lookup failed: {ex.Message}" });
+            continue;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("data", out var data) ||
+                data.ValueKind != JsonValueKind.Array ||
+                data.GetArrayLength() == 0)
+            {
+                updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found" });
+                continue;
+            }
+
+            var first = data[0];
+            var latest = first.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+            var current = plugin.Version;
+            var needsUpdate = !string.IsNullOrWhiteSpace(latest) &&
+                              !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
+            var downloadUrl = needsUpdate && first.TryGetProperty("download_url", out var dlNode)
+                ? dlNode.GetString()
+                : null;
+
+            updates.Add(new
+            {
+                plugin = plugin.Name,
+                current,
+                latest,
+                downloadUrl,
+                state = needsUpdate ? "update_available" : "current"
+            });
+        }
+        catch (JsonException ex)
+        {
+            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod response parse failed: {ex.Message}" });
+        }
+    }
+
+    return new { server, pluginPath = pluginsDir, updates };
+}
+
+static async Task<object?> InstallPluginAsync(string server, string pluginName, Uri downloadUri, CancellationToken cancellationToken)
+{
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
+        return null;
+
+    var normalized = NormalizeConfig(server, cfg);
+    var candidates = GetOxideRootCandidates(normalized)
+        .Select(root => Path.Combine(root, "plugins"))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    var pluginsDir = candidates.FirstOrDefault(Directory.Exists)
+        ?? Path.Combine(Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust", normalized.Name, "oxide", "plugins");
+
+    try
+    {
+        Directory.CreateDirectory(pluginsDir);
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        throw new UnauthorizedAccessException($"Write permission denied for '{pluginsDir}'. Grant read/write access to the RustOps API service user for that directory. Details: {ex.Message}", ex);
+    }
+
+    var safeName = string.Concat(pluginName.Select(c => char.IsLetterOrDigit(c) || c is '_' or '-' ? c : '_'));
+    if (string.IsNullOrWhiteSpace(safeName))
+        safeName = "Plugin";
+
+    var destPath = Path.Combine(pluginsDir, $"{safeName}.cs");
+    try
+    {
+        using var http = new HttpClient();
+        var bytes = await http.GetByteArrayAsync(downloadUri, cancellationToken);
+        await File.WriteAllBytesAsync(destPath, bytes, cancellationToken);
+
+        return new { server, plugin = pluginName, installed = true, path = destPath, bytes = bytes.Length };
+    }
+    catch (UnauthorizedAccessException ex)
+    {
+        throw new UnauthorizedAccessException($"Write permission denied for '{destPath}'. Grant read/write access to the RustOps API service user. Details: {ex.Message}", ex);
+    }
 }
 
 static List<LlmLoadedModelView> ExtractLmStudioLoadedModels(string? nativeJsonText)
@@ -4284,6 +4502,22 @@ static ValidationResult ValidateOxidePluginFile(string path)
     };
 }
 
+static PluginMetadata ParsePluginMetadata(string path)
+{
+    var text = File.ReadAllText(path);
+    var infoMatch = Regex.Match(
+        text,
+        "\\[\\s*Info\\s*\\(\\s*\"(?<name>[^\"]+)\"\\s*,\\s*\"(?<author>[^\"]*)\"\\s*,\\s*\"(?<version>[^\"]+)\"\\s*\\)\\s*\\]",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    if (!infoMatch.Success)
+        return new PluginMetadata(Path.GetFileNameWithoutExtension(path), null);
+
+    return new PluginMetadata(
+        infoMatch.Groups["name"].Value.Trim(),
+        infoMatch.Groups["version"].Value.Trim());
+}
+
 static string ToPluginSlug(string input)
 {
     var slug = Regex.Replace(input.Trim().ToLowerInvariant(), "[^a-z0-9]+", "-");
@@ -4498,6 +4732,14 @@ public sealed class ValidationResult
     public string? PluginVersion { get; set; }
     public string? PluginSlug { get; set; }
 }
+
+public sealed class PluginInstallRequest
+{
+    public string PluginName { get; set; } = string.Empty;
+    public string DownloadUrl { get; set; } = string.Empty;
+}
+
+public sealed record PluginMetadata(string? Name, string? Version);
 
 public sealed class ManagedTaskInfo
 {

@@ -407,7 +407,7 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         if (serverConfig is null)
             return new ToolExecutionResult(false, $"Could not parse config for '{server}'.", server, false, "parse_error");
 
-        var configDirs = ResolveOxideConfigDirectories(serverConfig);
+        var configDirs = ResolveOxideConfigDirectories(serverConfig, server);
         Console.WriteLine($"[plugin-config] Resolved {configDirs.Count} oxide config directories for '{server}': {string.Join(", ", configDirs)}");
         if (configDirs.Count == 0)
         {
@@ -705,16 +705,32 @@ internal sealed class RustFileEditToolHandler : IToolHandler
         return null;
     }
 
-    private static IReadOnlyList<string> ResolveOxideConfigDirectories(JsonObject serverConfig)
+    private static IReadOnlyList<string> ResolveOxideConfigDirectories(JsonObject serverConfig, string serverName)
     {
         var dirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var oxideDir = ReadJsonString(serverConfig, "oxideDir");
+        if (!string.IsNullOrWhiteSpace(oxideDir))
+        {
+            var configDir = Path.Combine(oxideDir, "config");
+            dirs.Add(configDir);
+            Console.WriteLine($"[oxide-dirs] Added from oxideDir: {configDir}");
+        }
+
+        var root = Environment.GetEnvironmentVariable("RUST_SERVER_ROOT");
+        if (string.IsNullOrWhiteSpace(root))
+            root = "/srv/rust";
+
+        var canonicalDir = Path.Combine(root, serverName, "oxide", "config");
+        dirs.Add(canonicalDir);
+        Console.WriteLine($"[oxide-dirs] Added canonical path: {canonicalDir}");
 
         var serverDir = ReadJsonString(serverConfig, "serverDir");
         if (!string.IsNullOrWhiteSpace(serverDir))
         {
-            var oxideDir = Path.Combine(serverDir, "oxide", "config");
-            dirs.Add(oxideDir);
-            Console.WriteLine($"[oxide-dirs] Added from serverDir: {oxideDir}");
+            var serverDirConfig = Path.Combine(serverDir, "oxide", "config");
+            dirs.Add(serverDirConfig);
+            Console.WriteLine($"[oxide-dirs] Added from serverDir: {serverDirConfig}");
         }
 
         var logFile = ReadJsonString(serverConfig, "logFile");
@@ -729,9 +745,9 @@ internal sealed class RustFileEditToolHandler : IToolHandler
             var logDir = Path.GetDirectoryName(logPath);
             if (!string.IsNullOrWhiteSpace(logDir))
             {
-                var oxideDir = Path.Combine(logDir, "oxide", "config");
-                dirs.Add(oxideDir);
-                Console.WriteLine($"[oxide-dirs] Added from logFile: {oxideDir}");
+                var logConfigDir = Path.Combine(logDir, "oxide", "config");
+                dirs.Add(logConfigDir);
+                Console.WriteLine($"[oxide-dirs] Added from logFile: {logConfigDir}");
             }
         }
 

@@ -171,15 +171,16 @@ internal sealed class PluginService
         // Apply the same fallbacks the Program.cs normalizer applies so raw configs work.
         var name      = string.IsNullOrWhiteSpace(cfg.Name)         ? serverName    : cfg.Name;
         var identity  = string.IsNullOrWhiteSpace(cfg.ServerIdentity) ? name         : cfg.ServerIdentity;
-        var serverDir = string.IsNullOrWhiteSpace(cfg.ServerDir)    ? $"/srv/rust/{name}" : cfg.ServerDir;
+        var root      = Environment.GetEnvironmentVariable("RUST_SERVER_ROOT") ?? "/srv/rust";
+        var serverDir = string.IsNullOrWhiteSpace(cfg.ServerDir)    ? Path.Combine(root, name) : cfg.ServerDir;
 
         return new[]
         {
+            Path.Combine(root, name, "oxide"),
             Path.Combine(serverDir, "oxide"),
             Path.Combine(serverDir, identity, "oxide"),
             Path.Combine(serverDir, "server", identity, "oxide"),
-            Path.Combine("/srv/rust", name, "oxide"),
-            Path.Combine("/srv/rust", identity, "oxide"),
+            Path.Combine(root, identity, "oxide"),
         }
         .Where(p => !string.IsNullOrWhiteSpace(p))
         .Distinct(StringComparer.OrdinalIgnoreCase)
