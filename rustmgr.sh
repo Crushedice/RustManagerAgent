@@ -94,10 +94,15 @@ list_servers() {
     local files=("$CONFIG_DIR"/*.json)
     shopt -u nullglob
 
+    # Files that live in the config directory but are not server configs.
+    local -A _skip=([remote-servers]=1)
+
     local found=0
     for f in "${files[@]}"; do
+        local name; name="$(basename "$f" .json)"
+        [[ -n "${_skip[$name]+x}" ]] && continue
         found=1
-        basename "$f" .json
+        printf '%s\n' "$name"
     done
 
     if [[ "$found" -eq 0 ]]; then

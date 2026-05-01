@@ -260,13 +260,34 @@ SVCEOF
 print_firewall_hint() {
   local port; port="${AGENT_BIND##*:}"
   log ""
-  log "Firewall: open port ${port}/tcp from your primary RusticalandOPS host."
-  log "  ufw:  ufw allow from <primary-host-ip> to any port ${port} proto tcp"
+  log "HOW THIS WORKS:"
+  log "  The remote agent is a PASSIVE HTTP server — it only listens."
+  log "  The main RusticalandOPS API on your primary host connects TO this node."
+  log "  This node never initiates a connection back to the main host."
+  log ""
+  log "ON THIS HOST (remote node):"
+  log "  - Service listens on port ${port} (${AGENT_BIND})"
+  log "  - Nothing else to configure here."
+  log ""
+  log "Firewall: open port ${port}/tcp inbound from your primary host only."
+  log "  ufw:      ufw allow from <primary-host-ip> to any port ${port} proto tcp"
   log "  iptables: iptables -A INPUT -p tcp --dport ${port} -s <primary-host-ip> -j ACCEPT"
   log ""
-  log "Primary host registration: add this node to the agent registry with"
-  log "  URL: http://<this-host-ip>:${port}"
-  log "  API key: (see ${INSTALL_ROOT}/remote-agent.env)"
+  log "ON THE PRIMARY HOST (main API):"
+  log "  Add an entry to: /opt/rust-manager/config/remote-servers.json"
+  log ""
+  log '  {'
+  log '    "servers": ['
+  log '      {'
+  log '        "name": "your-server-name",'
+  log '        "agentBaseUrl": "http://<this-host-ip>:'${port}'",'
+  log '        "agentApiKey": "<key-from-remote-agent.env>",'
+  log '        "agentServerName": "your-server-name"'
+  log '      }'
+  log '    ]'
+  log '  }'
+  log ""
+  log "  The agentApiKey is in: ${INSTALL_ROOT}/remote-agent.env (RUSTOPS_REMOTE_AGENT_API_KEY)"
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────

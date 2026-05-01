@@ -57,9 +57,9 @@
   },
   "gitOps": {
     "enabled": false,
-    "repoPath": "/opt/rust-manager/src",
-    "remoteName": "origin",
-    "baseBranch": "main",
+    "repoPath": "${RUSTOPS_GITOPS_REPO_PATH}",
+    "remoteName": "${RUSTOPS_GITOPS_REMOTE}",
+    "baseBranch": "${RUSTOPS_GITOPS_BASE_BRANCH}",
     "pushBranchPrefix": "agent/",
     "allowPush": false,
     "githubToken": "${GITHUB_TOKEN}"
@@ -67,9 +67,9 @@
   "autoPull": {
     "enabled": false,
     "intervalMinutes": 60,
-    "repoPath": "/opt/rust-manager/src",
-    "remoteName": "origin",
-    "branchName": "main",
+    "repoPath": "${RUSTOPS_GITOPS_REPO_PATH}",
+    "remoteName": "${RUSTOPS_GITOPS_REMOTE}",
+    "branchName": "${RUSTOPS_GITOPS_AUTO_PULL_BRANCH}",
     "buildEnabled": true,
     "buildScript": "Agent-Build.sh",
     "restartEnabled": false,
@@ -115,7 +115,7 @@
     "chatSystemPrompt": "You are RustOps, an AI assistant managing Rust game servers on behalf of the admins.\nYou have direct access to server health, logs, players, plugins, RCON, and the repo.\nYou remember what was discussed and use that context — never ask for something you already know.\nBe direct: state the outcome first, add supporting detail after. Keep replies under 100 words unless the situation demands more.\nTalk like a knowledgeable ops colleague, not a chatbot or status board.\nWhen something fails, say what went wrong and what the next step is.\nWhen something works, confirm it and flag anything worth watching.\nFor plural status requests (all servers, every server), check all known servers.\nOn follow-up corrections, keep the previous intent unless the admin clearly switches topic.\nDo not mention internal routing, error codes, tool names, or implementation details.\nDo not invent facts — if you don't have data, say so and offer to fetch it.\nWhen an admin teaches you something (ignore pattern, preference, importance rule), confirm you've noted it."
   },
   "llmDeep": {
-    "enabled": true,
+    "enabled": false,
     "provider": "${RUSTOPS_LLM_DEEP_PROVIDER}",
     "baseUrl": "${RUSTOPS_LLM_DEEP_BASE_URL}",
     "model": "${RUSTOPS_LLM_DEEP_MODEL}",
@@ -125,7 +125,7 @@
     "useForRecommendations": false
   },
   "llmCompose": {
-    "enabled": true,
+    "enabled": false,
     "provider": "${RUSTOPS_LLM_COMPOSE_PROVIDER}",
     "baseUrl": "${RUSTOPS_LLM_COMPOSE_BASE_URL}",
     "model": "${RUSTOPS_LLM_COMPOSE_MODEL}",

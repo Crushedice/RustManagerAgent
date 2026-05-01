@@ -240,7 +240,22 @@ sudo bash setup-remote-node.sh
 
 This installs .NET, steamcmd, creates the service user, deploys the remote agent binary, writes a `remote-agent.env` with a generated API key, and enables the `rustops-remote-agent` systemd service.
 
-After setup, register the node in the primary host's agent registry with the generated API key and the node's URL (`http://<host>:2088`).
+After setup, open `config/remote-servers.json` on the primary host and add an entry:
+
+```json
+{
+  "servers": [
+    {
+      "name": "server-name",
+      "agentBaseUrl": "http://<remote-host-ip>:2088",
+      "agentApiKey": "<key from remote-agent.env>",
+      "agentServerName": "server-name"
+    }
+  ]
+}
+```
+
+The remote agent is a passive HTTP server — it only listens. The primary API is the active side that connects to it. `RUSTOPS_REMOTE_AGENT_BIND` (on the remote host) is just the listen address; nothing on the primary host uses that variable.
 
 ### Run locally (development)
 
