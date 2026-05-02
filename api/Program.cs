@@ -191,18 +191,40 @@ app.MapGet("/dashboard/summary", async () =>
         .Where(r => !string.IsNullOrWhiteSpace(r.AgentBaseUrl))
         .Select(r => CheckRemoteAgentHealthAsync(r)));
 
-    // For reachable agents, fetch live server data in parallel
-    var remoteStatusData = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
-    await Task.WhenAll(remoteServersForSummary
-        .Where(r => remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable)
-        .Select(async r =>
+    // For reachable+authed agents, fetch live status, players, and serverinfo in parallel
+    var remoteStatusData   = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+    var remotePlayerData   = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+    var remoteInfoData     = new Dictionary<string, JsonNode?>(StringComparer.OrdinalIgnoreCase);
+
+    var reachableAgents = remoteServersForSummary
+        .Where(r => remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable && agSt.IsAuthValid)
+        .ToList();
+
+    await Task.WhenAll(reachableAgents.Select(async r =>
+    {
+        var serverSlug = Uri.EscapeDataString(RemoteAgentServerName(r));
+        var statusData = await TryReadRemoteAgentJsonAsync(r.Name, $"/servers/{serverSlug}/status");
+        lock (remoteStatusData) remoteStatusData[r.Name] = statusData;
+
+        // Only query players + serverinfo if the server is actually running
+        var isOnline = (statusData as System.Text.Json.Nodes.JsonObject)
+            ?.TryGetPropertyValue("online", out var onlineNode) == true
+            && onlineNode?.GetValue<bool?>() == true;
+
+        if (isOnline)
         {
-            var data = await TryReadRemoteAgentJsonAsync(r.Name, $"/servers/{Uri.EscapeDataString(RemoteAgentServerName(r))}/status");
-            lock (remoteStatusData) remoteStatusData[r.Name] = data;
-        }));
+            var playerTask = TryReadRemoteAgentJsonAsync(r.Name, $"/servers/{serverSlug}/players");
+            var infoTask   = TryReadRemoteAgentJsonAsync(r.Name, $"/servers/{serverSlug}/serverinfo");
+            await Task.WhenAll(playerTask, infoTask);
+            var playerResult = playerTask.Result;
+            var infoResult   = infoTask.Result;
+            lock (remotePlayerData) remotePlayerData[r.Name] = playerResult;
+            lock (remoteInfoData)   remoteInfoData[r.Name]   = infoResult;
+        }
+    }));
 
     var remoteOnlineCount = remoteServersForSummary.Count(r =>
-        remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable);
+        remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable && agSt.IsAuthValid);
 
     return Results.Ok(new
     {
@@ -269,18 +291,69 @@ app.MapGet("/dashboard/summary", async () =>
             })
             .Concat(remoteServersForSummary.Select(r =>
             {
-                var agSt = remoteAgentStatus.TryGetValue(r.Name, out var s) ? s : null;
-                var liveData = remoteStatusData.TryGetValue(r.Name, out var d) ? d : null;
-                var liveObj = liveData as System.Text.Json.Nodes.JsonObject;
+                var agSt       = remoteAgentStatus.TryGetValue(r.Name, out var s)    ? s    : null;
+                var liveData   = remoteStatusData.TryGetValue(r.Name, out var d)     ? d    : null;
+                var playerData = remotePlayerData.TryGetValue(r.Name, out var pd)    ? pd   : null;
+                var infoData   = remoteInfoData.TryGetValue(r.Name, out var id)      ? id   : null;
 
-                string GetStr(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<string>() ?? "" : "";
-                bool GetBool(string key, bool def = false) => liveObj?.TryGetPropertyValue(key, out var v) == true ? (v?.GetValue<bool?>() ?? def) : def;
-                int? GetInt(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<int?>() : null;
-                long? GetLong(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<long?>() : null;
-                double? GetDbl(string key) => liveObj?.TryGetPropertyValue(key, out var v) == true ? v?.GetValue<double?>() : null;
+                var liveObj   = liveData   as System.Text.Json.Nodes.JsonObject;
+                var playerObj = playerData as System.Text.Json.Nodes.JsonObject;
+                var infoObj   = infoData   as System.Text.Json.Nodes.JsonObject;
 
-                var isOnline = liveData != null && GetBool("online");
-                var liveState = liveData != null ? (GetStr("state") is { Length: > 0 } st ? st : "remote") : "remote";
+                // helpers over status object
+                string  GetStr (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<string>()  ?? "" : "";
+                bool    GetBool(string key, bool def = false) => liveObj?.TryGetPropertyValue(key, out var v) == true ? (v?.GetValue<bool?>() ?? def) : def;
+                int?    GetInt (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<int?>()    : null;
+                long?   GetLong(string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<long?>()   : null;
+                double? GetDbl (string key) => liveObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<double?>() : null;
+
+                // helpers over serverinfo (infoObj can be array of players or object)
+                string? InfoStr(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<string>()  : null;
+                int?    InfoInt(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<int?>()    : null;
+                double? InfoDbl(string key) => infoObj?.TryGetPropertyValue(key, out var v)   == true ? v?.GetValue<double?>() : null;
+
+                // player list (remote agent returns raw JSON array or object with array property)
+                List<string> BuildPlayerPreview()
+                {
+                    if (playerData is null) return new List<string>();
+                    var arr = playerData as System.Text.Json.Nodes.JsonArray;
+                    if (arr is null && playerObj is not null)
+                    {
+                        // might be wrapped: { "players": [...] }
+                        foreach (var key in new[] { "players", "playerList", "playerlist" })
+                            if (playerObj.TryGetPropertyValue(key, out var v) && v is System.Text.Json.Nodes.JsonArray ja)
+                            { arr = ja; break; }
+                    }
+                    if (arr is null) return new List<string>();
+                    return arr
+                        .OfType<System.Text.Json.Nodes.JsonObject>()
+                        .Select(p =>
+                            p["displayName"]?.GetValue<string>() ??
+                            p["DisplayName"]?.GetValue<string>() ??
+                            p["name"]?.GetValue<string>() ?? "")
+                        .Where(n => !string.IsNullOrWhiteSpace(n))
+                        .Take(5)
+                        .ToList();
+                }
+
+                int? PlayerCount()
+                {
+                    if (playerData is null) return null;
+                    if (playerData is System.Text.Json.Nodes.JsonArray jarr) return jarr.Count;
+                    // infoObj might have current player count
+                    return InfoInt("Players") ?? InfoInt("players") ?? InfoInt("currentPlayers");
+                }
+
+                var isOnline   = liveData != null && GetBool("online");
+                var liveState  = liveData != null ? (GetStr("state") is { Length: > 0 } st ? st : "remote") : "remote";
+                var playerNames = BuildPlayerPreview();
+                var playerCount = PlayerCount() ?? (playerNames.Count > 0 ? (int?)playerNames.Count : null);
+                // Prefer live RCON serverinfo data; fall back to status object then display name
+                var maxPlayers    = InfoInt("MaxPlayers") ?? InfoInt("maxPlayers")  ?? InfoInt("ServerMaxPlayers");
+                var hostname      = (string?)(InfoStr("Hostname") ?? InfoStr("hostname") ?? (GetStr("hostname") is { Length: > 0 } h ? h : null) ?? r.DisplayName);
+                var map           = (string?)(InfoStr("Map")      ?? InfoStr("map")      ?? (GetStr("map")      is { Length: > 0 } m ? m : null));
+                var framerate     = InfoDbl("Framerate") ?? InfoDbl("framerate") ?? GetDbl("framerate");
+                var queuedPlayers = InfoInt("Queued")    ?? InfoInt("queued")    ?? GetInt("queuedPlayers");
 
                 return new
                 {
@@ -290,16 +363,16 @@ app.MapGet("/dashboard/summary", async () =>
                     autoRestart = GetBool("autoRestart"),
                     pid = GetInt("pid"),
                     recentWarningCount = 0,
-                    currentPlayers = GetInt("currentPlayers"),
-                    maxPlayers = GetInt("maxPlayers"),
-                    playerPreview = new List<string>(),
+                    currentPlayers = playerCount,
+                    maxPlayers,
+                    playerPreview = playerNames,
                     uptimeSeconds = GetLong("uptimeSeconds"),
                     memoryMb = GetDbl("memoryMb"),
-                    queryOk = GetBool("queryOk"),
-                    hostname = (string?)(liveData != null ? GetStr("hostname") : r.DisplayName),
-                    map = (string?)(liveData != null ? GetStr("map") : null),
-                    framerate = GetDbl("framerate"),
-                    queuedPlayers = GetInt("queuedPlayers"),
+                    queryOk = playerData != null,
+                    hostname,
+                    map,
+                    framerate,
+                    queuedPlayers,
                     remote = true,
                     agentReachable = agSt?.IsReachable ?? false,
                     agentAuthValid = agSt?.IsAuthValid ?? false,

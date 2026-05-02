@@ -561,11 +561,19 @@ try
         if (!await IsKnownServerAsync(server))
             return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-        var commandResult = await SendRconAsync(server, command);
-        var payload = TryExtractJson(commandResult.Reply);
-        return payload is null
-            ? Results.BadRequest(new ApiError("parse_error", $"Could not parse {command} response."))
-            : Results.Content(payload, "application/json");
+        try
+        {
+            var commandResult = await SendRconAsync(server, command);
+            var payload = TryExtractJson(commandResult.Reply);
+            return payload is null
+                ? Results.BadRequest(new ApiError("parse_error", $"Could not parse {command} response."))
+                : Results.Content(payload, "application/json");
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureException(ex, $"Remote agent RCON query '{command}' failed.", "remote-agent.rcon");
+            return Results.BadRequest(new ApiError("rcon_error", ex.Message));
+        }
     }
 
     async Task<IResult> ExecuteModerationAsync(string server, string command)
