@@ -410,3 +410,4 @@ For deeper agent-specific details, see:
 - `agent/RustOpsAgent/README.md`
 - `deploy/systemd/README.md`
 - `SteamBot/OpsSteamBot/README.md`
+- `memory/FEATURE_AUDIT.md`
