@@ -93,7 +93,7 @@ internal sealed class RconConfigurationLoader
                     continue;
                 }
 
-                var rconUri = new Uri($"ws://{rconIp?.Trim().Trim('"')}/{rconPassword}");
+                var rconUri = new Uri($"ws://{rconIp?.Trim().Trim('"')}:{rconPort}/{rconPassword}");
                 configs.Add((fileName, rconUri, rconPassword));
                 RustOpsSentry.AddBreadcrumb($"Loaded local RCON config for '{fileName}'", "rcon");
             }
