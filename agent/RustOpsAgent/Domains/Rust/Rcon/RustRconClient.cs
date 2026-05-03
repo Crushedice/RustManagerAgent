@@ -24,11 +24,11 @@ internal sealed class RustRconClient : IRconClient
                 throw new InvalidOperationException($"Could not resolve hostname '{uri.Host}' to an IPv4 address");
             }
 
-            var endpoint = new IPEndPoint(address, uri.Port > 0 ? uri.Port : 28016);
-            _rcon = new RCON(endpoint, password, (uint)endpoint.Port);
+            var port = (ushort)(uri.Port > 0 ? uri.Port : 28016);
+            _rcon = new RCON(address, port, password);
 
             await _rcon.ConnectAsync();
-            RustOpsSentry.AddBreadcrumb($"RCON connected to {uri.Host}:{endpoint.Port}", "agent.rcon");
+            RustOpsSentry.AddBreadcrumb($"RCON connected to {uri.Host}:{port}", "agent.rcon");
         }
         catch (Exception ex)
         {
