@@ -4316,7 +4316,7 @@ static List<DashboardLlmInteraction> ReadLlmInteractions(JsonElement root)
             ResponsePreview = ReadString(item, "responsePreview")
         })
         .OrderByDescending(item => item.AtUtc)
-        .Take(12)
+        .Take(50)
         .ToList();
 }
 
@@ -4725,7 +4725,7 @@ static List<DashboardIncident> ReadRecentIncidents(JsonElement root)
             });
         })
         .OrderByDescending(item => item.CreatedAtUtc)
-        .Take(12)
+        .Take(50)
         .ToList();
 }
 
@@ -4938,6 +4938,7 @@ static string BuildDashboardHtml() => """
         <div class="card"><h2>Agent Errors / Feedback</h2><div id="errors" class="list"></div><h3 style="margin-top:18px;">Recent Feedback</h3><div id="feedback" class="list"></div></div>
         <div class="card"><h2>Server Console <span class="legend" data-tip="Live error counts per server pulled from the agent's console monitor. Errors are deduplicated and counted since the last agent restart.">?</span></h2><div id="consoleStats" class="list"></div></div>
         <div class="card"><h2>Player Chat <span class="legend" data-tip="Stats computed from the player chat stream the agent reads in real time. Word counts cover today's messages only. Sentiment is updated every 30 minutes by the LLM.">?</span></h2><div id="chatStats" class="list"></div></div>
+        <div class="card wide"><h2>Recent Player Messages <span class="legend" data-tip="Latest player messages captured from server consoles. Shows player name, server, and message with timestamp.">?</span></h2><div id="recentMessages" class="list"></div></div>
         <div class="card"><h2>Admin Calls <span class="legend" data-tip="Player messages that match admin/mod call patterns (asking for help, reporting issues, etc). Each entry shows who called, what server, and what they said.">?</span></h2><div id="adminCalls" class="list"></div></div>
         <div class="card"><h2>Per-Server Chat Volume <span class="legend" data-tip="Message counts per server for today and cumulative. Tracks active player discussions per server.">?</span></h2><div id="serverChatVolume" class="list"></div></div>
         <div class="card wide"><h2>Incident Feedback <span class="legend" data-tip="Each row is an incident the agent recorded when it failed to fulfill a request. Use the verdict buttons and note field to give the agent real feedback — it reads this to improve future handling.">?</span></h2><div id="incidentFeedbackStatus" class="muted" style="margin-bottom:10px;">Loading incidents…</div><div id="incidentFeedbackList" class="list"></div></div>
@@ -5225,7 +5226,7 @@ static string BuildDashboardHtml() => """
     }
 
     function renderAdminCalls(data) {
-      const calls = (data?.adminCalls || []).sort((a,b) => new Date(b.capturedAtUtc) - new Date(a.capturedAtUtc)).slice(0, 20);
+      const calls = (data?.adminCalls || []).sort((a,b) => new Date(b.capturedAtUtc) - new Date(a.capturedAtUtc)).slice(0, 50);
       if (!calls.length) { $('adminCalls').innerHTML = '<div class="muted">No admin calls recorded.</div>'; return; }
       $('adminCalls').innerHTML = calls.map(call => item(
         `${esc(call.playerName)} @ ${esc(call.serverName)}`,
@@ -5343,6 +5344,7 @@ static string BuildDashboardHtml() => """
         renderCommandConfig(commandConfig);
         renderConsoleStats(consoleData);
         renderChatStats(chatData);
+        renderRecentPlayerMessages(chatData);
         renderAdminCalls(adminCallData);
         renderServerChatVolume(adminCallData);
       } catch (error) { alert(`Dashboard request failed: ${error.message}`); }
@@ -5470,6 +5472,16 @@ static string BuildDashboardHtml() => """
       if (funStats.length) parts.push(`<div class="item"><div style="font-weight:700;">Today's Fun Facts</div>${funStats.map(([w,c])=>`<div class="muted" style="margin-top:4px;font-size:12px;">"${esc(w)}" said ${c}x today</div>`).join('')}</div>`);
       if (!parts.length) { $('chatStats').innerHTML = '<div class="muted">No player chat data yet.</div>'; return; }
       $('chatStats').innerHTML = parts.join('');
+    }
+
+    function renderRecentPlayerMessages(data) {
+      const messages = (data?.recentMessages || []).slice(0, 50);
+      if (!messages.length) { $('recentMessages').innerHTML = '<div class="muted">No player messages captured yet.</div>'; return; }
+      $('recentMessages').innerHTML = messages.map(msg => item(
+        `${esc(msg.playerName || 'unknown')} @ ${esc(msg.serverName || 'unknown')}`,
+        `${esc(msg.message || '')}`,
+        `${fmt(msg.capturedAtUtc)}`
+      )).join('');
     }
 
     async function loadIncidentFeedback() {
