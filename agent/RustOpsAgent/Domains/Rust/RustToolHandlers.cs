@@ -2033,6 +2033,15 @@ internal static class RustDirectRconHelper
     public static IReadOnlyList<string> GetRegisteredRemoteServerNames() =>
         RemoteOverrides.Keys.ToList();
 
+    /// <summary>Names of ALL servers with active or pre-registered RCON sessions (remote and local).</summary>
+    public static IReadOnlyList<string> GetAllKnownServerNames()
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var key in RemoteOverrides.Keys) names.Add(key);
+        foreach (var key in Sessions.Keys) names.Add(key);
+        return names.ToList();
+    }
+
     public static IReadOnlyList<string> GetRollingLog(string server)
     {
         if (Sessions.TryGetValue(server, out var session))

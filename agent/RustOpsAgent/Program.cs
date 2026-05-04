@@ -171,7 +171,7 @@ var serverKnowledge = new ServerKnowledgeCatalog();
 Console.WriteLine($"[agent] Server knowledge loaded: {serverKnowledge.GetSnapshot().Variables.Count} variables, {serverKnowledge.GetSnapshot().Commands.Count} commands");
 
 // Register remote server RCON credentials so the agent can connect directly to them.
-// Local servers are handled lazily by RustDirectRconHelper reading their config files.
+// Local servers are also warmed up eagerly below using credentials from their config files.
 var remoteServerNamesForWarmup = new List<string>();
 try
 {
@@ -265,6 +265,42 @@ if (remoteServerNamesForWarmup.Count > 0)
         })
         .ToList();
     _ = Task.WhenAll(warmupTasks); // fire-and-forget so startup isn't blocked
+}
+
+// Eagerly open RCON sessions for LOCAL servers so chat-monitor receives unsolicited
+// messages (chat, console events) from startup — not only after the first admin command.
+// Local servers derive their RCON credentials from their rustmgr config files.
+try
+{
+    using var serversResponse = await apiClient.GetAsync("/servers", CancellationToken.None);
+    var serversRoot = serversResponse.RootElement;
+    if (serversRoot.ValueKind == JsonValueKind.Array)
+    {
+        var localServerNames = serversRoot.EnumerateArray()
+            .Where(e => !e.TryGetProperty("remote", out var r) || r.ValueKind == JsonValueKind.False)
+            .Select(e => e.TryGetProperty("name", out var n) ? n.GetString()?.Trim() : null)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Select(n => n!)
+            .ToList();
+
+        if (localServerNames.Count > 0)
+        {
+            Console.WriteLine($"[agent] Warming up RCON for {localServerNames.Count} local server(s)...");
+            var localWarmupTasks = localServerNames
+                .Select(async name =>
+                {
+                    var outcome = await RustDirectRconHelper.WarmupAsync(name, CancellationToken.None);
+                    Console.WriteLine($"[agent] RCON local warmup {name}: {outcome.Message}");
+                })
+                .ToList();
+            _ = Task.WhenAll(localWarmupTasks); // fire-and-forget so startup isn't blocked
+        }
+    }
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"[agent] WARNING: Could not warm up local RCON sessions: {ex.Message}");
+    RustOpsSentry.CaptureException(ex, "Failed to warm up local RCON sessions", "startup");
 }
 
 Console.CancelKeyPress += (_, e) =>

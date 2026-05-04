@@ -98,7 +98,7 @@ internal sealed class AgentRuntime
             return;
         _lastRemoteRconWarmupAtUtc = DateTime.UtcNow;
 
-        var servers = RustDirectRconHelper.GetRegisteredRemoteServerNames();
+        var servers = RustDirectRconHelper.GetAllKnownServerNames();
         if (servers.Count == 0)
             return;
 

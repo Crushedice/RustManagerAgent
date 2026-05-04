@@ -3762,7 +3762,7 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                         Summary = ReadString(item, "result")
                     }))
                     .OrderByDescending(item => item.ExecutedAtUtc)
-                    .Take(20)
+                    .Take(100)
                     .ToList();
             }
 
@@ -3779,7 +3779,7 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                         ResponsePreview = ReadString(item, "responsePreview")
                     })
                     .OrderByDescending(item => item.AtUtc)
-                    .Take(20)
+                    .Take(100)
                     .ToList();
             }
         }
@@ -3828,7 +3828,7 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                 Summary = ReadString(item, "failureReason")
             }))
             .OrderByDescending(item => item.CreatedAtUtc)
-            .Take(20)
+            .Take(100)
             .ToList();
 
         var groupedGaps = records
@@ -3852,7 +3852,7 @@ static void MergeNeoCortexSnapshot(AgentDashboardSnapshot snapshot, string neoCo
                 };
             })
             .OrderByDescending(item => item.LastObservedAtUtc)
-            .Take(20)
+            .Take(100)
             .ToList();
 
         if (groupedGaps.Count > 0)
@@ -4303,7 +4303,7 @@ static List<DashboardCapabilityGap> ReadCapabilityGaps(JsonElement root)
             LastObservedAtUtc = ReadDateTime(item, "lastObservedAtUtc")
         })
         .OrderByDescending(item => item.LastObservedAtUtc)
-        .Take(20)
+        .Take(100)
         .ToList();
 }
 
@@ -5395,7 +5395,7 @@ static string BuildDashboardHtml() => """
       const entries = Object.entries(servers);
       if (entries.length === 0) { $('consoleStats').innerHTML = '<div class="muted">No console data yet.</div>'; return; }
       $('consoleStats').innerHTML = entries.map(([name, s]) => {
-        const topErrors = (s.recentErrors || []).sort((a, b) => b.count - a.count).slice(0, 3);
+        const topErrors = (s.recentErrors || []).sort((a, b) => b.count - a.count);
         const topHtml = topErrors.length ? topErrors.map(e => `<div class="muted" style="margin-top:4px;font-size:12px;">• ${esc(e.message.length > 70 ? e.message.slice(0,70)+'…' : e.message)} <span style="color:var(--accent)">(${e.count}x)</span></div>`).join('') : '<div class="muted" style="font-size:12px;">No errors recorded.</div>';
         const total = s.totalErrorsIngested ?? 0;
         return `<div class="item"><div style="font-weight:700;">${esc(name)}</div><div class="muted" style="margin-top:4px;font-size:12px;">${total} error${total !== 1 ? 's' : ''} ingested total</div>${topHtml}</div>`;
@@ -5407,8 +5407,8 @@ static string BuildDashboardHtml() => """
       const score = data?.sentimentScore;
       const label = data?.sentimentLabel || 'unknown';
       const summary = data?.sentimentSummary || '';
-      const themes = (data?.keyThemes || []).slice(0, 5);
-      const feedback = (data?.constructiveFeedback || []).slice(0, 3);
+      const themes = data?.keyThemes || [];
+      const feedback = data?.constructiveFeedback || [];
 
       const today = new Date().toDateString();
       const todayMsgs = messages.filter(m => m.capturedAtUtc && new Date(m.capturedAtUtc).toDateString() === today);
@@ -5421,7 +5421,7 @@ static string BuildDashboardHtml() => """
       const isPlayerWord = w => w.length >= 3 && !/^(oxide|error|warning|info|debug|plugin|loading|loaded|unload|init|start|stop|null|true|false|void|http|https|www)$/.test(w);
       const freq = {};
       for (const m of todayMsgs) { for (const [w] of ((m.message||'').toLowerCase().matchAll(/\b[a-z]{3,}\b/g))) { if (!stopwords.has(w) && isPlayerWord(w)) freq[w] = (freq[w]||0) + 1; } }
-      const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,8);
+      const topWords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,20);
 
       // Fun word counts for today
       const funWords = ['fuck','shit','damn','noob','toxic','cheater','hacker','cope','seethe'];
@@ -5443,7 +5443,7 @@ static string BuildDashboardHtml() => """
     }
 
     function renderRecentPlayerMessages(data) {
-      const messages = (data?.recentMessages || []).slice(0, 50);
+      const messages = data?.recentMessages || [];
       if (!messages.length) { $('recentMessages').innerHTML = '<div class="muted">No player messages captured yet.</div>'; return; }
       $('recentMessages').innerHTML = messages.map(msg => item(
         `${esc(msg.playerName || 'unknown')} @ ${esc(msg.serverName || 'unknown')}`,
