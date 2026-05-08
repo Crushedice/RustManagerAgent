@@ -245,7 +245,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "   NEVER use server_control for raw commands, convars, or config changes.\n\n" +
         "3. rcon_command for any message with: \"rcon\", \"run\", \"execute\", \"send command\", quoted\n" +
         "   command text, \"what does X.Y do\", \"explain X.Y\", \"get X.Y on server\", \"set X.Y to V\"\n" +
-        "   where X.Y is NOT in the config file key list above.\n\n" +
+        "   where X.Y is NOT in the config file key list above.\n" +
+        "   Server messaging commands (always rcon_command, always include full RCON command in commandText):\n" +
+        "     brd <text>              → broadcast a message to ALL players on the server\n" +
+        "     spk <steamId>,<text>   → send a private message to ONE player by SteamID64\n" +
+        "   Map admin phrases: \"broadcast X\", \"announce X\", \"tell all players X\" → commandText=\"brd X\"\n" +
+        "                      \"message player STEAMID: X\", \"pm STEAMID X\"       → commandText=\"spk STEAMID,X\"\n\n" +
         "4. troubleshooting + rust.plugins.verify for: \"compile error/s\", \"plugin error/s\",\n" +
         "   \"oxide issue/s\", \"umod issue/s\", \"cs error/s\". NEVER treat \"compile\" as a server name.\n\n" +
         "5. status_check + rust.network.inspect for: \"network\", \"throughput\", \"latency\",\n" +
@@ -300,7 +305,15 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "\"memory stats\" / \"memory search restart failure\"\n" +
         "  -> intent=chat, targetRef=rust.chat.reply\n\n" +
         "\"add remote server MyServer at 1.2.3.4:28016 password abc\"\n" +
-        "  -> intent=server_management, targetRef=rust.server.management, slots.serverName=\"MyServer\", slots.commandText=\"1.2.3.4\"\n";
+        "  -> intent=server_management, targetRef=rust.server.management, slots.serverName=\"MyServer\", slots.commandText=\"1.2.3.4\"\n\n" +
+        "\"broadcast Server restart in 10 minutes on cotton\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"brd Server restart in 10 minutes\", slots.serverName=\"cotton\"\n\n" +
+        "\"announce to all players on monthly that wipe is tomorrow\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"brd wipe is tomorrow\", slots.serverName=\"monthly\"\n\n" +
+        "\"send message to player 76561198123456789 saying Welcome on cotton\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198123456789,Welcome\", slots.serverName=\"cotton\"\n\n" +
+        "\"pm 76561198001234567 You have been warned on modded\"\n" +
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198001234567,You have been warned\", slots.serverName=\"modded\"\n";
 
     private string BuildPrompt(
         string message,

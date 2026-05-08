@@ -460,6 +460,42 @@ app.MapGet("/agent/truncation-status", () =>
     });
 });
 
+// -- Plugin chat ingestion: POST /plugin-chat
+// Accepts chat events from in-game Rust plugins and drops them in the agent's plugin-chat inbox.
+// Body: { "server": "cotton", "steamId": "76561198...", "username": "PlayerName", "message": "hello" }
+app.MapPost("/plugin-chat", async (HttpContext ctx) =>
+{
+    string body;
+    try { body = await new StreamReader(ctx.Request.Body).ReadToEndAsync(); }
+    catch { return Results.BadRequest(new { error = "invalid_body" }); }
+
+    PluginChatEvent? evt;
+    try { evt = JsonSerializer.Deserialize<PluginChatEvent>(body, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }); }
+    catch { return Results.BadRequest(new { error = "invalid_json" }); }
+
+    if (evt is null || string.IsNullOrWhiteSpace(evt.Server) || string.IsNullOrWhiteSpace(evt.Message))
+        return Results.BadRequest(new { error = "missing_fields", required = new[] { "server", "message" } });
+
+    var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
+    var inboxPath = agentPaths.PluginChatInboxPath;
+    Directory.CreateDirectory(inboxPath);
+
+    var id = Guid.NewGuid().ToString("N");
+    var payload = new
+    {
+        server  = evt.Server.Trim(),
+        steamId = evt.SteamId?.Trim(),
+        username = evt.Username?.Trim(),
+        message = evt.Message.Trim()
+    };
+    var fileName = $"{DateTime.UtcNow:yyyyMMddHHmmssfff}-plugin-chat-{id}.json";
+    await File.WriteAllTextAsync(
+        Path.Combine(inboxPath, fileName),
+        JsonSerializer.Serialize(payload));
+
+    return Results.Ok(new { ok = true, id });
+});
+
 app.MapPost("/agent/truncate/errors", async (TruncationRequest request) =>
 {
     if (request.BeforeDateUtc == null)
@@ -3508,6 +3544,10 @@ static AgentRuntimePaths ResolveAgentRuntimePaths(string agentSettingsPath, stri
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_CHAT_INBOX_PATH") ?? agentSettings?.Inbox?.ChatInboxPath,
             agentBaseDir,
             Path.Combine(defaultAgentRootDir, "data", "chat-inbox")),
+        PluginChatInboxPath = RustOpsEnv.ResolveConfiguredPath(
+            RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_PLUGIN_CHAT_INBOX_PATH") ?? agentSettings?.Inbox?.PluginChatInboxPath,
+            agentBaseDir,
+            Path.Combine(defaultAgentRootDir, "data", "plugin-chat-inbox")),
         MessageOutboxPath = RustOpsEnv.ResolveConfiguredPath(
             RustOpsEnv.FirstNonEmptyEnvironment("RUSTOPS_MESSAGE_OUTBOX_PATH") ?? agentSettings?.Outbox?.MessageOutboxPath,
             agentBaseDir,
@@ -6289,11 +6329,20 @@ public sealed class AgentRuntimePaths
     public string FeedbackInboxPath { get; set; } = string.Empty;
     public string DecisionInboxPath { get; set; } = string.Empty;
     public string ChatInboxPath { get; set; } = string.Empty;
+    public string PluginChatInboxPath { get; set; } = string.Empty;
     public string MessageOutboxPath { get; set; } = string.Empty;
     public string SentOutboxPath { get; set; } = string.Empty;
     public string LogRulesPath { get; set; } = string.Empty;
     public string SemanticMemoryDbPath { get; set; } = string.Empty;
     public string PluginDbPath { get; set; } = string.Empty;
+}
+
+public sealed class PluginChatEvent
+{
+    [JsonPropertyName("server")] public string Server { get; set; } = string.Empty;
+    [JsonPropertyName("steamId")] public string? SteamId { get; set; }
+    [JsonPropertyName("username")] public string? Username { get; set; }
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
 }
 
 public class AgentLlmConfigUpdate
@@ -6432,6 +6481,7 @@ public sealed class AgentSettingsInboxView
     [JsonPropertyName("feedbackInboxPath")] public string? FeedbackInboxPath { get; set; }
     [JsonPropertyName("decisionInboxPath")] public string? DecisionInboxPath { get; set; }
     [JsonPropertyName("chatInboxPath")] public string? ChatInboxPath { get; set; }
+    [JsonPropertyName("pluginChatInboxPath")] public string? PluginChatInboxPath { get; set; }
 }
 
 public sealed class AgentSettingsOutboxView

@@ -77,6 +77,7 @@ internal sealed class InboxSettings
     [JsonPropertyName("feedbackInboxPath")] public string FeedbackInboxPath { get; set; } = "data/feedback-inbox";
     [JsonPropertyName("decisionInboxPath")] public string DecisionInboxPath { get; set; } = "data/decision-inbox";
     [JsonPropertyName("chatInboxPath")] public string ChatInboxPath { get; set; } = "data/chat-inbox";
+    [JsonPropertyName("pluginChatInboxPath")] public string PluginChatInboxPath { get; set; } = "data/plugin-chat-inbox";
 }
 
 internal sealed class OutboxSettings
@@ -205,6 +206,14 @@ internal sealed class ChatInboxItem
     [JsonPropertyName("adminId")] public string AdminId { get; set; } = "admin";
     [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
     [JsonPropertyName("channel")] public string? Channel { get; set; }
+}
+
+internal sealed class PluginChatInboxItem
+{
+    [JsonPropertyName("server")] public string Server { get; set; } = string.Empty;
+    [JsonPropertyName("steamId")] public string? SteamId { get; set; }
+    [JsonPropertyName("username")] public string? Username { get; set; }
+    [JsonPropertyName("message")] public string Message { get; set; } = string.Empty;
 }
 
 internal sealed class DecisionInboxItem

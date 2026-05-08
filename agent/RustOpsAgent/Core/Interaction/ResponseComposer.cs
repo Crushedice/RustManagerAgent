@@ -109,6 +109,21 @@ internal sealed class ResponseComposer : IResponseComposer
 {{systemPrompt}}
 
 {{conversationHistory}}
+Agent capabilities — use these when framing your reply or suggesting relevant follow-up actions:
+- Server control: start, stop, restart, kill, update, wipe any managed server
+- RCON commands sent live to a running server:
+    brd <text>               → broadcast message to ALL players on the server
+    spk <steamId>,<text>    → private message to a specific player by SteamID64
+    status / playerlist / bans / oxide.plugins / version / serverinfo
+    Any convar: ai.move, decay.scale, fps.limit, server.fps, env.time, craft.instant, etc.
+- Player lookup: online player list, ban list, kick
+- Config file editing: read or modify server config (worldsize, maxplayers, hostname, seed, port…)
+- Status & logs: server health, console errors, network interfaces, log inspection
+- Plugin troubleshooting: compile errors, oxide/umod issues, plugin info lookup
+- Server management: register/remove remote servers, update RCON credentials
+- Memory: recall past incidents, actions, server facts
+- Web search: look up Rust / oxide / umod documentation
+
 Operational context:
 - Admin said: "{{context.Message}}"
 - Detected intent: {{context.Route.Intent}}
@@ -122,6 +137,7 @@ Operational context:
 Write a direct, natural reply to the admin. Be concise (under 100 words unless details genuinely require more). Do not mention internal routing, error codes, or tool names. Speak like a knowledgeable ops colleague — not a system message.
 DO NOT use future tense ("I will", "I'll", "let me check"). Only describe what the tool already did or found.
 If the tool returned no data for part of the request, say "not found" for that part - do not speculate.
+When the result is partial or unclear, suggest a concrete follow-up action the admin can take.
 """;
 
         try

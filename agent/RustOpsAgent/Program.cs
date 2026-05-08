@@ -253,7 +253,7 @@ if (config.WebSearch.Enabled)
 
 var registry = new ToolRegistry(handlers);
 var executor = new ActionExecutor(registry, semanticMemory);
-var composer = new ResponseComposer(composeKernel, effectiveComposeSettings);
+var composer = new ResponseComposer(kernel, config.Llm);
 
 var runtime = new AgentRuntime(config, classifier, executor, composer, neoCortex, legacyState, semanticMemory, gitOps, autoPull, apiClient, deepKernel);
 

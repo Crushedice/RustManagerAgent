@@ -238,6 +238,7 @@ internal sealed class AgentRuntime
                     Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
 
                 await SafeExecuteAsync(() => ProcessChatInboxAsync(cancellationToken), "chat-processing", cancellationToken);
+                await SafeExecuteAsync(() => ProcessPluginChatInboxAsync(cancellationToken), "plugin-chat-processing", cancellationToken);
                 await SafeExecuteAsync(() => ObserveServersAsync(cancellationToken), "server-observation", cancellationToken);
                 await SafeExecuteAsync(() => ReconnectRemoteRconSessionsAsync(cancellationToken), "remote-rcon-reconnect", cancellationToken);
                 await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
@@ -696,6 +697,49 @@ internal sealed class AgentRuntime
         }
     }
 
+    private async Task ProcessPluginChatInboxAsync(CancellationToken cancellationToken)
+    {
+        var inboxPath = _config.Inbox.PluginChatInboxPath;
+        if (!Directory.Exists(inboxPath))
+            return;
+
+        var playerChat = _neoCortex.LoadPlayerChat();
+        var changed = false;
+
+        foreach (var file in EnumerateInboxFiles(inboxPath))
+        {
+            if (_stop || cancellationToken.IsCancellationRequested)
+                break;
+            try
+            {
+                var text = await File.ReadAllTextAsync(file, cancellationToken);
+                var item = JsonSerializer.Deserialize<PluginChatInboxItem>(text, JsonDefaults.Default);
+                if (item is null || string.IsNullOrWhiteSpace(item.Message) || string.IsNullOrWhiteSpace(item.Server))
+                    continue;
+
+                var playerName = !string.IsNullOrWhiteSpace(item.Username)
+                    ? item.Username
+                    : item.SteamId ?? "unknown";
+
+                Console.WriteLine($"[plugin-chat] {item.Server}: {playerName}: {item.Message}");
+                RecordPlayerChat(playerChat, item.Server, playerName, item.Message, DateTime.UtcNow);
+                changed = true;
+            }
+            catch (Exception ex)
+            {
+                RustOpsSentry.CaptureException(ex, "Plugin chat inbox processing failed.", "agent.plugin-chat",
+                    extras: new Dictionary<string, object?> { ["file"] = file });
+            }
+            finally
+            {
+                TryDelete(file);
+            }
+        }
+
+        if (changed)
+            _neoCortex.SavePlayerChat(playerChat);
+    }
+
     private string? TryHandleLearnDirective(string message)
     {
         var lowered = message.Trim().ToLowerInvariant();
@@ -1057,13 +1101,28 @@ internal sealed class AgentRuntime
         if (!ChatLineRegex.IsMatch(line))
             return null;
 
-        // Format: ... [Chat] PlayerName[steamId]: message
         var chatIdx = line.IndexOf("[Chat]", StringComparison.OrdinalIgnoreCase);
         if (chatIdx < 0)
             return null;
 
         var after = line[(chatIdx + 6)..].TrimStart();
-        // PlayerName[steamId64]: message  OR  PlayerName: message
+
+        // WebRCON sends chat as a JSON object: {"Username":"...","Message":"...","UserId":"...","Channel":0,...}
+        if (after.StartsWith('{'))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(after);
+                var root = doc.RootElement;
+                var username = root.TryGetProperty("Username", out var uEl) ? uEl.GetString() : null;
+                var chatMsg = root.TryGetProperty("Message", out var mEl) ? mEl.GetString() : null;
+                if (!string.IsNullOrWhiteSpace(username) && chatMsg is not null)
+                    return (username.Trim(), chatMsg.Trim());
+            }
+            catch { /* fall through to text-format parse */ }
+        }
+
+        // Log-file / old RCON format: PlayerName[steamId64]: message  OR  PlayerName: message
         var colonIdx = after.IndexOf(':');
         if (colonIdx <= 0)
             return null;
