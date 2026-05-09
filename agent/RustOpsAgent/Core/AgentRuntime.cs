@@ -2772,8 +2772,14 @@ RecentErrors:
 
     private bool CanUseDeepLlm(string scope, bool emitSkipLog = true)
     {
-        if (_deepKernel is null || !_config.Llm.Enabled || !_config.Llm.UseForRecommendations)
-            return false;
+        if (_deepKernel is null) return false;
+        // Deep tasks (sentiment / incident review / classifier evolution) are background
+        // analysis, NOT user-facing chat recommendations, so the fast LLM's
+        // UseForRecommendations flag must not gate them. The deep kernel uses LlmDeep when
+        // configured separately, otherwise it shares the fast kernel — either way only the
+        // matching kernel's Enabled flag is the right gate.
+        var deepDedicated = _config.LlmDeep.Enabled && !string.IsNullOrWhiteSpace(_config.LlmDeep.BaseUrl);
+        if (!deepDedicated && !_config.Llm.Enabled) return false;
 
         var nowUtc = DateTime.UtcNow;
         if (nowUtc < _deepLlmUnauthorizedMutedUntilUtc)
