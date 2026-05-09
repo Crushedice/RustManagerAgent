@@ -186,6 +186,7 @@ internal sealed class RustStatusToolHandler : IToolHandler
 internal sealed class RustServerControlToolHandler : IToolHandler
 {
     private const int DefaultRestartCountdownSeconds = 120;
+    private const int DefaultStopCountdownSeconds = 60;
 
     private readonly RustOpsApiClient _api;
     private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
@@ -219,44 +220,117 @@ internal sealed class RustServerControlToolHandler : IToolHandler
                 return await ExecuteRestartAsync(context, pendingServer, secs.Value, cancellationToken);
         }
 
-        var server = await RustToolHelper.ResolveServerAsync(_api, context, cancellationToken);
-        if (string.IsNullOrWhiteSpace(server))
+        var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+        var scope = RustToolHelper.ResolveServerScope(context, knownServers, allowPluralDefaultAll: false);
+
+        if (scope.RequiresClarification || scope.Servers.Count == 0)
         {
-            var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
             return new ToolExecutionResult(
                 false,
-                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.ServerControl, knownServers, allowAllServers: false),
+                RustToolHelper.BuildScopeClarificationQuestion(AdminIntentType.ServerControl, knownServers, allowAllServers: true),
                 null, false, "clarification_required",
                 SelectedServers: context.SelectionState.LastResolvedServers,
                 ScopeKind: ServerScopeKind.Unspecified);
         }
 
+        // Multi-server: execute across all resolved servers.
+        if (scope.Servers.Count > 1)
+            return await ExecuteMultiServerAsync(context, message, scope.Servers, cancellationToken);
+
+        var server = scope.Servers[0];
+
         if (message.Contains("restart"))
             return await HandleRestartAsync(context, server, cancellationToken);
+
+        if (message.Contains("stop"))
+            return await HandleStopAsync(context, server, cancellationToken);
 
         var endpoint = ResolveEndpoint(message);
         if (endpoint is null)
         {
             return new ToolExecutionResult(
                 false,
-                $"What should I do to {server}? Say start, stop, restart, kill, or update.",
+                $"What should I do to {server}? Say start, stop, restart, kill, update, or wipe.",
                 server, false, "clarification_required",
                 SelectedServers: new[] { server },
                 ScopeKind: ServerScopeKind.Single);
         }
 
-        using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
-        var action = endpoint.Split('/').Last();
-        if (_semanticMemory is not null)
+        try
         {
-            _ = _semanticMemory.RecordServerFactAsync(
-                server,
-                $"Server lifecycle: {action} executed on {server}",
-                $"Admin triggered '{action}' on server '{server}'. Result: success.",
-                new[] { "lifecycle", action, server.ToLowerInvariant() },
-                CancellationToken.None);
+            using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
+            var action = endpoint.Split('/').Last();
+            if (_semanticMemory is not null)
+            {
+                _ = _semanticMemory.RecordServerFactAsync(
+                    server,
+                    $"Server lifecycle: {action} executed on {server}",
+                    $"Admin triggered '{action}' on server '{server}'. Result: success.",
+                    new[] { "lifecycle", action, server.ToLowerInvariant() },
+                    CancellationToken.None);
+            }
+            return new ToolExecutionResult(true, $"Executed {action} for {server}.", server, true, Payload: response.RootElement.ToString());
         }
-        return new ToolExecutionResult(true, $"Executed {action} for {server}.", server, true, Payload: response.RootElement.ToString());
+        catch (Exception ex)
+        {
+            var action = endpoint.Split('/').Last();
+            return new ToolExecutionResult(false, $"Failed to {action} {server}: {ex.Message}", server, false, "api_error",
+                SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
+        }
+    }
+
+    private async Task<ToolExecutionResult> ExecuteMultiServerAsync(
+        ToolExecutionContext context, string message, IReadOnlyList<string> servers, CancellationToken cancellationToken)
+    {
+        if (message.Contains("restart"))
+        {
+            var seconds = ParseRestartSeconds(context.Message) ?? DefaultRestartCountdownSeconds;
+            foreach (var s in servers)
+                await ExecuteRestartAsync(context, s, seconds, cancellationToken);
+            return new ToolExecutionResult(true,
+                $"Restart initiated for {servers.Count} servers ({string.Join(", ", servers)}) with {seconds}s countdown.",
+                null, true, SelectedServers: servers, ScopeKind: ServerScopeKind.All);
+        }
+
+        if (message.Contains("stop"))
+        {
+            foreach (var s in servers)
+                await HandleStopAsync(context, s, cancellationToken);
+            var secs = ParseStopSeconds(context.Message) ?? DefaultStopCountdownSeconds;
+            return new ToolExecutionResult(true,
+                $"Stop initiated for {servers.Count} servers ({string.Join(", ", servers)}) with {secs}s countdown.",
+                null, true, SelectedServers: servers, ScopeKind: ServerScopeKind.All);
+        }
+
+        var endpoint = ResolveEndpoint(message);
+        if (endpoint is null)
+        {
+            return new ToolExecutionResult(false,
+                $"What should I do to these {servers.Count} servers? Say kill, stop, restart, update, or start.",
+                null, false, "clarification_required", SelectedServers: servers, ScopeKind: ServerScopeKind.Subset);
+        }
+
+        var action = endpoint.Split('/').Last();
+        var successes = new List<string>();
+        var failures = new List<string>();
+        foreach (var s in servers)
+        {
+            try
+            {
+                using var _ = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(s)), new { }, cancellationToken);
+                successes.Add(s);
+            }
+            catch (Exception ex)
+            {
+                failures.Add($"{s} ({ex.Message})");
+            }
+        }
+
+        var summary = failures.Count == 0
+            ? $"{action} executed for all {servers.Count} servers: {string.Join(", ", servers)}."
+            : $"{action} succeeded for {successes.Count}/{servers.Count}: {string.Join(", ", successes)}. Failed: {string.Join(", ", failures)}.";
+        return new ToolExecutionResult(successes.Count > 0, summary, null, successes.Count > 0,
+            SelectedServers: servers, ScopeKind: ServerScopeKind.All);
     }
 
     private async Task<ToolExecutionResult> HandleRestartAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
@@ -316,6 +390,79 @@ internal sealed class RustServerControlToolHandler : IToolHandler
             server, true,
             SelectedServers: new[] { server },
             ScopeKind: ServerScopeKind.Single);
+    }
+
+    private async Task<ToolExecutionResult> HandleStopAsync(ToolExecutionContext context, string server, CancellationToken cancellationToken)
+    {
+        var seconds = ParseStopSeconds(context.Message) ?? DefaultStopCountdownSeconds;
+        return await ExecuteStopAsync(context, server, seconds, cancellationToken);
+    }
+
+    private async Task<ToolExecutionResult> ExecuteStopAsync(ToolExecutionContext context, string server, int seconds, CancellationToken cancellationToken)
+    {
+        var rconSent = false;
+        try
+        {
+            var warning = await RustDirectRconHelper.TryExecuteAsync(server, $"say Server is shutting down in {seconds} seconds.", cancellationToken);
+            rconSent = warning is not null;
+        }
+        catch (Exception ex)
+        {
+            RustOpsSentry.CaptureMessage(
+                $"RCON stop warning failed for '{server}', proceeding with immediate stop.",
+                "agent.server-control", Sentry.SentryLevel.Warning,
+                extras: new Dictionary<string, object?> { ["server"] = server, ["exception"] = ex.Message });
+        }
+
+        if (_semanticMemory is not null)
+        {
+            _ = _semanticMemory.RecordServerFactAsync(
+                server,
+                $"Server stop initiated on {server}",
+                $"Stop triggered by admin. Countdown: {seconds}s. RCON warning sent: {rconSent}.",
+                new[] { "lifecycle", "stop", server.ToLowerInvariant() },
+                CancellationToken.None);
+        }
+
+        if (rconSent && seconds > 0)
+        {
+            // Fire background task: wait the countdown, then send final warning and stop.
+            var api = _api;
+            var adminId = context.AdminId;
+            var notifyAdmin = _notifyAdmin;
+            var countSecs = seconds;
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(countSecs));
+                try { await RustDirectRconHelper.TryExecuteAsync(server, "say Shutting down now.", CancellationToken.None); } catch { }
+                try
+                {
+                    using var _ = await api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/stop", new { }, CancellationToken.None);
+                    notifyAdmin?.Invoke(adminId, $"[{server}] Server stopped after {countSecs}s countdown.", server);
+                }
+                catch (Exception ex)
+                {
+                    notifyAdmin?.Invoke(adminId, $"[{server}] Stop command failed: {ex.Message}", server);
+                }
+            });
+            return new ToolExecutionResult(true,
+                $"Stop initiated for {server} with {seconds}s countdown. Players warned in-game.",
+                server, true, SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
+        }
+        else
+        {
+            try
+            {
+                using var response = await _api.PostAsync($"/servers/{Uri.EscapeDataString(server)}/stop", new { }, cancellationToken);
+                return new ToolExecutionResult(true, $"Stop executed for {server} (immediate — RCON unavailable).", server, true,
+                    Payload: response.RootElement.ToString(), SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
+            }
+            catch (Exception ex)
+            {
+                return new ToolExecutionResult(false, $"Failed to stop {server}: {ex.Message}", server, false, "api_error",
+                    SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
+            }
+        }
     }
 
     private static async Task MonitorRestartAsync(
@@ -424,9 +571,23 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         return null;
     }
 
+    private static int? ParseStopSeconds(string message)
+    {
+        var minuteMatch = Regex.Match(message, @"stop\s+(?:in\s+)?(\d+)\s*(?:minute|min|m)\b", RegexOptions.IgnoreCase);
+        if (minuteMatch.Success && int.TryParse(minuteMatch.Groups[1].Value, out var mins))
+            return mins * 60;
+
+        var secondMatch = Regex.Match(message, @"stop\s+(?:in\s+)?(\d+)\s*(?:second|sec|s)?\b", RegexOptions.IgnoreCase);
+        if (secondMatch.Success && int.TryParse(secondMatch.Groups[1].Value, out var secs) && secs > 0)
+            return secs;
+
+        return null;
+    }
+
     // Returns null when the message doesn't match a known operation — caller must handle.
     private static string? ResolveEndpoint(string message)
     {
+        if (message.Contains("wipe")) return "/servers/{server}/wipe";
         if (message.Contains("kill")) return "/servers/{server}/kill";
         if (message.Contains("stop")) return "/servers/{server}/stop";
         if (message.Contains("update")) return "/servers/{server}/update";

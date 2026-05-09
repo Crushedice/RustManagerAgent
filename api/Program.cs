@@ -1774,11 +1774,55 @@ app.MapPost("/servers/{server}/wipe", async (string server) =>
         return remoteResult ?? Results.BadRequest(new ApiError("remote_server", "Wipe operations require a remote agent for this server."));
     }
 
-    if (!await IsValidServerAsync(server))
+    var cfg = LoadServerConfig(server);
+    if (cfg is null)
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
+    if (string.IsNullOrWhiteSpace(cfg.ServerDir) || !Directory.Exists(cfg.ServerDir))
+        return Results.BadRequest(new ApiError("invalid_config", $"serverDir '{cfg.ServerDir}' does not exist."));
 
-    var result = await ExecRustMgrAsync("wipe", server);
-    return result.Ok ? Results.Ok(result) : Results.BadRequest(result);
+    // Per RusticaLand spec: delete every file at the top level of /server/{server}/ EXCEPT
+    // companion.id. Folders are preserved. This is what "wipe" means here — clearing the
+    // map files (.sav, .map, .db, save backups) while keeping the companion identity and
+    // anything organised under subdirectories (oxide/, identity/, etc.).
+    var deleted = new List<string>();
+    var skipped = new List<string>();
+    var failed = new List<object>();
+    try
+    {
+        foreach (var path in Directory.EnumerateFiles(cfg.ServerDir, "*", SearchOption.TopDirectoryOnly))
+        {
+            var name = Path.GetFileName(path);
+            if (string.Equals(name, "companion.id", StringComparison.OrdinalIgnoreCase))
+            {
+                skipped.Add(name);
+                continue;
+            }
+            try
+            {
+                File.Delete(path);
+                deleted.Add(name);
+            }
+            catch (Exception ex)
+            {
+                failed.Add(new { name, error = ex.Message });
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new ApiError("io_error", $"Failed enumerating '{cfg.ServerDir}': {ex.Message}"));
+    }
+
+    return Results.Ok(new
+    {
+        ok = failed.Count == 0,
+        server,
+        serverDir = cfg.ServerDir,
+        deletedCount = deleted.Count,
+        deleted,
+        skipped,
+        failed
+    });
 });
 
 // -- Config read ---------------------------------------------------------------

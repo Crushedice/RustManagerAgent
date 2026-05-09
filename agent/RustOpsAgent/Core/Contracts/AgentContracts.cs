@@ -44,7 +44,15 @@ internal sealed record AdminIntentRoute(
     WorkflowMemoryContext? PlanningMemoryContext = null,
     string ClassifierSource = "heuristic",
     bool LlmAttempted = false,
-    bool LlmSucceeded = false);
+    bool LlmSucceeded = false,
+    IReadOnlyList<AdminIntentStep>? Steps = null);
+
+// One step of a multi-step admin request. The first step is also reflected in the
+// top-level Intent/Slots/TargetRef of the parent AdminIntentRoute.
+internal sealed record AdminIntentStep(
+    AdminIntentType Intent,
+    AdminIntentSlots Slots,
+    string? TargetRef);
 
 internal sealed record ToolExecutionContext(
     string AdminId,

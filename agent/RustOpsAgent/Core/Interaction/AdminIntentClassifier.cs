@@ -181,6 +181,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 ? BuildClarificationQuestion(intent, knownServers, clarification)
                 : null;
 
+            var steps = TryParseSteps(root, defaultServer: serverName);
+
             return new AdminIntentRoute(
                 intent,
                 new AdminIntentSlots(serverName, playerName, commandText, timeRange, severity, scopeKind, serverNames, configKey, configValue),
@@ -191,7 +193,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 planningMemory,
                 "llm",
                 true,
-                true);
+                true,
+                steps);
         }
         catch
         {
@@ -204,6 +207,12 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "You are classifying admin messages for a Rust game server operations agent.\n" +
         "Return ONLY strict JSON — no markdown, no explanation, nothing else.\n\n" +
         "Required JSON keys: intent, confidence, needsClarification, clarificationQuestion, targetRef, slots\n\n" +
+        "Optional JSON key: steps — when the admin asks for several distinct operations in one\n" +
+        "message (e.g. \"wipe monthly with new mapsize 4500 and new seed 12345 and start it\"),\n" +
+        "return an array of {intent, targetRef, slots} objects in execution order. Each step has\n" +
+        "the same shape as the top-level fields. Top-level intent/targetRef/slots should describe\n" +
+        "the FIRST step. Only emit steps when the admin clearly asks for >1 operation; for a\n" +
+        "single operation, omit the steps key.\n\n" +
         "══ INTENT VALUES ══\n" +
         "chat              General conversation, questions about the agent, git/build/code operations\n" +
         "server_control    Rust game server lifecycle ONLY: start, stop, restart, kill, update, wipe\n" +
@@ -234,7 +243,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "     server.worldsize  server.seed  server.maxplayers  server.hostname\n" +
         "     server.port  server.identity  rcon.port  rcon.password  rcon.ip\n" +
         "     app.port  serverDir  logFile  additionalArgs\n" +
-        "   Aliases for config keys: worldsize, seed, maxplayers, hostname, serverdir, logfile\n" +
+        "   Aliases for config keys: worldsize, mapsize, map size, seed, maxplayers, hostname, serverdir, logfile\n" +
+        "   (\"mapsize\" / \"map size\" -> server.worldsize)\n" +
         "   -> intent=file_edit, targetRef=rust.file.edit\n" +
         "   -> put the key in slots.configKey, the new value (if any) in slots.configValue\n\n" +
         "   All OTHER dotted identifiers (ai.move, decay.scale, fps.limit, env.time, server.fps,\n" +
@@ -242,7 +252,11 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "   -> intent=rcon_command, targetRef=rust.rcon.command\n" +
         "   -> put the identifier (and any value) in slots.commandText\n\n" +
         "2. server_control is ONLY for lifecycle: start, stop, restart, kill, update, wipe.\n" +
-        "   NEVER use server_control for raw commands, convars, or config changes.\n\n" +
+        "   NEVER use server_control for raw commands, convars, or config changes.\n" +
+        "   WIPE semantics: \"wipe\" deletes the map/save files at the top level of the server\n" +
+        "   directory (companion.id and subfolders are kept). It does NOT change config — if\n" +
+        "   the admin asks to wipe AND change mapsize/seed, those config edits are SEPARATE\n" +
+        "   file_edit steps that must run BEFORE the wipe + restart.\n\n" +
         "3. rcon_command for any message with: \"rcon\", \"run\", \"execute\", \"send command\", quoted\n" +
         "   command text, \"what does X.Y do\", \"explain X.Y\", \"get X.Y on server\", \"set X.Y to V\"\n" +
         "   where X.Y is NOT in the config file key list above.\n" +
@@ -313,7 +327,19 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "\"send message to player 76561198123456789 saying Welcome on cotton\"\n" +
         "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198123456789,Welcome\", slots.serverName=\"cotton\"\n\n" +
         "\"pm 76561198001234567 You have been warned on modded\"\n" +
-        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198001234567,You have been warned\", slots.serverName=\"modded\"\n";
+        "  -> intent=rcon_command, targetRef=rust.rcon.command, slots.commandText=\"spk 76561198001234567,You have been warned\", slots.serverName=\"modded\"\n\n" +
+        "\"set mapsize to 4500 on monthly\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\"\n\n" +
+        "\"wipe monthly\"\n" +
+        "  -> intent=server_control, targetRef=rust.server.control, slots.serverName=\"monthly\", slots.commandText=\"wipe\"\n\n" +
+        "\"wipe monthly with new mapsize 4500 and new seed 12345 then start it\"\n" +
+        "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\",\n" +
+        "     steps=[\n" +
+        "       {intent:file_edit, targetRef:rust.file.edit, slots:{configKey:\"server.worldsize\", configValue:\"4500\", serverName:\"monthly\"}},\n" +
+        "       {intent:file_edit, targetRef:rust.file.edit, slots:{configKey:\"server.seed\", configValue:\"12345\", serverName:\"monthly\"}},\n" +
+        "       {intent:server_control, targetRef:rust.server.control, slots:{serverName:\"monthly\", commandText:\"wipe\"}},\n" +
+        "       {intent:server_control, targetRef:rust.server.control, slots:{serverName:\"monthly\", commandText:\"start\"}}\n" +
+        "     ]\n";
 
     private string BuildPrompt(
         string message,
@@ -819,6 +845,55 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "subset" => ServerScopeKind.Subset,
         _ => ServerScopeKind.Unspecified
     };
+
+    private static IReadOnlyList<AdminIntentStep>? TryParseSteps(JsonElement root, string? defaultServer)
+    {
+        if (!root.TryGetProperty("steps", out var stepsNode) || stepsNode.ValueKind != JsonValueKind.Array)
+            return null;
+
+        var list = new List<AdminIntentStep>();
+        foreach (var stepEl in stepsNode.EnumerateArray())
+        {
+            if (stepEl.ValueKind != JsonValueKind.Object) continue;
+            var stepIntent = stepEl.TryGetProperty("intent", out var iEl) ? ParseIntent(iEl.GetString() ?? "chat") : AdminIntentType.Chat;
+            var stepTargetRef = NormalizeTargetRef(stepEl.TryGetProperty("targetRef", out var trEl) ? trEl.GetString() : null);
+
+            string? sName = null, pName = null, cText = null, tRange = null, sev = null, cKey = null, cValue = null;
+            var sKind = ServerScopeKind.Unspecified;
+            List<string>? sNames = null;
+            if (stepEl.TryGetProperty("slots", out var sl) && sl.ValueKind == JsonValueKind.Object)
+            {
+                sName = sl.TryGetProperty("serverName", out var v1) ? v1.GetString() : null;
+                pName = sl.TryGetProperty("playerName", out var v2) ? v2.GetString() : null;
+                cText = sl.TryGetProperty("commandText", out var v3) ? v3.GetString() : null;
+                tRange = sl.TryGetProperty("timeRange", out var v4) ? v4.GetString() : null;
+                sev = sl.TryGetProperty("severity", out var v5) ? v5.GetString() : null;
+                cKey = sl.TryGetProperty("configKey", out var v6) ? v6.GetString() : null;
+                cValue = sl.TryGetProperty("configValue", out var v7) ? v7.GetString() : null;
+                sKind = sl.TryGetProperty("scopeKind", out var v8) ? ParseScopeKind(v8.GetString()) : ServerScopeKind.Unspecified;
+                if (sl.TryGetProperty("serverNames", out var v9) && v9.ValueKind == JsonValueKind.Array)
+                {
+                    sNames = v9.EnumerateArray()
+                        .Where(x => x.ValueKind == JsonValueKind.String)
+                        .Select(x => x.GetString()!.Trim())
+                        .Where(x => !string.IsNullOrEmpty(x))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                }
+            }
+
+            // Inherit defaultServer when a step omits it (e.g. chained ops on the same server).
+            if (string.IsNullOrWhiteSpace(sName) && (sNames is null || sNames.Count == 0))
+                sName = defaultServer;
+
+            list.Add(new AdminIntentStep(
+                stepIntent,
+                new AdminIntentSlots(sName, pName, cText, tRange, sev, sKind, sNames, cKey, cValue),
+                stepTargetRef));
+        }
+
+        return list.Count > 1 ? list : null; // a single step is just the top-level route
+    }
 
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch
     {

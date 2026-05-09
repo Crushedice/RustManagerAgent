@@ -37,6 +37,14 @@ internal sealed class ActionExecutor : IActionExecutor
 
         LogRepeatedFailureHints(context);
 
+        // Multi-step sequence: execute steps in order, stop on first failure unless the step
+        // is non-blocking. Each step runs as its own ToolExecutionContext with a synthesised
+        // route so the existing per-handler logic doesn't need to know about sequencing.
+        if (context.Route.Steps is { Count: > 1 } steps)
+        {
+            return await ExecuteSequenceAsync(context, steps, cancellationToken);
+        }
+
         var handler = _registry.ResolveSingle(context);
         if (handler is null)
         {
@@ -44,6 +52,86 @@ internal sealed class ActionExecutor : IActionExecutor
         }
 
         return await handler.ExecuteAsync(context, cancellationToken);
+    }
+
+    private async Task<ToolExecutionResult> ExecuteSequenceAsync(
+        ToolExecutionContext context,
+        IReadOnlyList<AdminIntentStep> steps,
+        CancellationToken cancellationToken)
+    {
+        var summaries = new List<string>();
+        var allSucceeded = true;
+        string? lastServer = context.SelectionState.LastServerName;
+        ToolExecutionResult? last = null;
+
+        Console.WriteLine($"[executor] running sequence of {steps.Count} steps for admin {context.AdminId}.");
+
+        for (var i = 0; i < steps.Count; i++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var step = steps[i];
+            var stepRoute = new AdminIntentRoute(
+                step.Intent,
+                step.Slots,
+                context.Route.Confidence,
+                NeedsClarification: false,
+                ClarificationQuestion: null,
+                step.TargetRef,
+                context.Route.PlanningMemoryContext,
+                context.Route.ClassifierSource,
+                context.Route.LlmAttempted,
+                context.Route.LlmSucceeded,
+                Steps: null);
+
+            var stepContext = context with
+            {
+                Route = stepRoute,
+                ExecutionMemoryContext = null
+            };
+
+            var handler = _registry.ResolveSingle(stepContext);
+            if (handler is null)
+            {
+                allSucceeded = false;
+                summaries.Add($"step {i + 1}/{steps.Count} ({step.Intent}): no eligible tool — sequence aborted.");
+                last = new ToolExecutionResult(false, summaries[^1], lastServer, false, "no_tool");
+                break;
+            }
+
+            ToolExecutionResult result;
+            try
+            {
+                result = await handler.ExecuteAsync(stepContext, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                allSucceeded = false;
+                summaries.Add($"step {i + 1}/{steps.Count} ({step.Intent}): exception — {ex.Message}");
+                last = new ToolExecutionResult(false, summaries[^1], lastServer, false, "exception");
+                break;
+            }
+
+            last = result;
+            lastServer = result.SelectedServer ?? lastServer;
+            summaries.Add($"step {i + 1}/{steps.Count} ({step.Intent}{(step.Slots.ServerName is null ? string.Empty : $" → {step.Slots.ServerName}")}): {(result.Success ? "ok" : "FAILED")} — {result.Message}");
+            if (!result.Success)
+            {
+                allSucceeded = false;
+                Console.WriteLine($"[executor] step {i + 1} failed; aborting remaining {steps.Count - i - 1} step(s).");
+                break;
+            }
+        }
+
+        var summary = string.Join("\n", summaries);
+        return new ToolExecutionResult(
+            allSucceeded,
+            summary,
+            lastServer,
+            MutatedState: last?.MutatedState ?? false,
+            ErrorCode: allSucceeded ? null : (last?.ErrorCode ?? "sequence_failed"),
+            Payload: summary,
+            SelectedServers: last?.SelectedServers,
+            ScopeKind: last?.ScopeKind ?? ServerScopeKind.Unspecified);
     }
 
     private static void LogRepeatedFailureHints(ToolExecutionContext context)
