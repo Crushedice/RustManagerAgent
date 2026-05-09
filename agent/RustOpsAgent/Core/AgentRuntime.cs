@@ -54,6 +54,8 @@ internal sealed class AgentRuntime
     private DateTime _lastPluginCheckAtUtc = DateTime.MinValue;
     private DateTime _lastForcedPollAtUtc = DateTime.MinValue;
     private readonly PlayerStore? _playerStore;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> _forcedCheckThrottle = new(StringComparer.Ordinal);
+    private static readonly HttpClient _forcedHttpClient = new() { Timeout = TimeSpan.FromSeconds(10) };
 
     public AgentRuntime(
         AgentConfig config,
@@ -1188,12 +1190,9 @@ internal sealed class AgentRuntime
         var join = JoinLineRegex.Match(line);
         if (join.Success)
         {
-            _playerStore.RecordSighting(
-                join.Groups["sid"].Value,
-                join.Groups["name"].Value,
-                server,
-                join.Groups["ip"].Value,
-                startsSession: true);
+            var sid = join.Groups["sid"].Value;
+            _playerStore.RecordSighting(sid, join.Groups["name"].Value, server, join.Groups["ip"].Value, startsSession: true);
+            _ = QueryForcedStatusAsync(sid);
             return;
         }
 
@@ -1207,6 +1206,67 @@ internal sealed class AgentRuntime
                 auth.Groups["ip"].Value,
                 startsSession: false);
         }
+    }
+
+    // Per-player forced-status check via apps.rusticaland.net:8853/getplayer.
+    // Body is the bare steamid as a string (the plugin POSTs userid.ToString()).
+    // Response is plain text:
+    //   "No"     → not forced (allowed to join without launcher)
+    //   "Yes"    → forced and never used the launcher  → forced=true
+    //   "Using"  → currently using the launcher        → forced=false
+    //   "<datetime>" → last heartbeat; >120min stale   → forced=true
+    //   anything else → skip (don't update; treat as unknown)
+    // Throttled to once per steamid every 10 minutes so admin-triggered re-joins
+    // don't hammer the endpoint.
+    private async Task QueryForcedStatusAsync(string steamId)
+    {
+        if (_playerStore is null || string.IsNullOrWhiteSpace(steamId)) return;
+        var now = DateTime.UtcNow;
+        if (_forcedCheckThrottle.TryGetValue(steamId, out var last) && now - last < TimeSpan.FromMinutes(10))
+            return;
+        _forcedCheckThrottle[steamId] = now;
+
+        try
+        {
+            using var content = new StringContent(steamId);
+            using var resp = await _forcedHttpClient.PostAsync("http://apps.rusticaland.net:8853/getplayer", content);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"[forced] /getplayer {steamId}: HTTP {(int)resp.StatusCode}");
+                return;
+            }
+            var body = (await resp.Content.ReadAsStringAsync()).Trim().Trim('"');
+            bool? forced = body switch
+            {
+                "No"    => false,
+                "Yes"   => true,
+                "Using" => false,
+                _ => TryParseHeartbeatStaleness(body)
+            };
+            if (forced is null)
+            {
+                Console.WriteLine($"[forced] /getplayer {steamId}: skipped — unrecognised response '{body}'");
+                return;
+            }
+            _playerStore.MarkForcedStatus(steamId, forced);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[forced] /getplayer {steamId} failed: {ex.Message}");
+        }
+    }
+
+    // Heartbeat datetime: forced if older than 120 minutes (matches the plugin's
+    // "Launcher HeartBeat timed out" threshold). Returns null when unparseable so
+    // the caller doesn't overwrite an existing flag with bad data.
+    private static bool? TryParseHeartbeatStaleness(string body)
+    {
+        if (!DateTime.TryParse(body, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                out var stamp))
+            return null;
+        var minutes = (DateTime.UtcNow - stamp).TotalMinutes;
+        return minutes > 120;
     }
 
     private void RecordPlayerChat(PlayerChatKnowledge chat, string server, string player, string message, DateTime capturedAtUtc)
@@ -2427,8 +2487,8 @@ Recent player chat (newest last):
                 Console.WriteLine("[forced] poll returned no entries.");
                 return;
             }
-            _playerStore.ApplyForcedList(entries);
-            Console.WriteLine($"[forced] applied {entries.Count} forced entries.");
+            var (matched, ignored) = _playerStore.ApplyForcedList(entries);
+            Console.WriteLine($"[forced] {entries.Count} listed; matched {matched} known players, ignored {ignored} unknown.");
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)

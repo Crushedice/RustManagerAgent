@@ -161,9 +161,16 @@ internal sealed class PlayerStore
         }
     }
 
-    public void ApplyForcedList(IReadOnlyList<ForcedListEntry> entries)
+    // Refreshes the `forced` flag on players we ALREADY track. The /all endpoint is treated
+    // as a lookup source, not a player roster — we never insert rows from it. New players
+    // enter the table only through real server activity (chat / join / auth events).
+    // Returns (matchedCount, ignoredCount) so the caller can log how many of the entries
+    // referenced players we already know about.
+    public (int Matched, int IgnoredUnknown) ApplyForcedList(IReadOnlyList<ForcedListEntry> entries)
     {
-        if (entries.Count == 0) return;
+        if (entries.Count == 0) return (0, 0);
+        var matched = 0;
+        var ignored = 0;
         try
         {
             using var connection = new SqliteConnection(_connectionString);
@@ -171,11 +178,12 @@ internal sealed class PlayerStore
             using var tx = connection.BeginTransaction();
             var now = DateTime.UtcNow.ToString("O");
 
-            // Clear all forced flags first so removed entries get unset.
+            // Clear forced flag on every known player; entries below will re-set it for those
+            // currently in the list. Players who fell off the list end up with forced=0.
             using (var clear = connection.CreateCommand())
             {
                 clear.Transaction = tx;
-                clear.CommandText = "UPDATE players SET forced = 0, forced_checked_utc = $now WHERE forced = 1;";
+                clear.CommandText = "UPDATE players SET forced = 0, forced_checked_utc = $now;";
                 clear.Parameters.AddWithValue("$now", now);
                 clear.ExecuteNonQuery();
             }
@@ -184,55 +192,22 @@ internal sealed class PlayerStore
             {
                 if (string.IsNullOrWhiteSpace(entry.SteamId)) continue;
                 var sid = entry.SteamId.Trim();
-                var name = (entry.DisplayName ?? string.Empty).Trim();
-                var ip = (entry.LastIp ?? string.Empty).Trim();
-
-                // Read existing aliases / IP history so we can append rather than replace.
-                var existing = LoadInternal(connection, sid);
-                var aliases = existing?.Aliases ?? new List<string>();
-                if (!string.IsNullOrEmpty(name) &&
-                    !aliases.Contains(name, StringComparer.OrdinalIgnoreCase))
-                {
-                    aliases.Add(name);
-                    if (aliases.Count > 25) aliases.RemoveAt(0);
-                }
-                var ips = existing?.IpHistory ?? new List<string>();
-                if (!string.IsNullOrEmpty(ip) && !ips.Contains(ip, StringComparer.Ordinal))
-                {
-                    ips.Add(ip);
-                    if (ips.Count > 25) ips.RemoveAt(0);
-                }
 
                 using var cmd = connection.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandText =
                     """
-                    INSERT INTO players (
-                        steam_id, display_name, alias_history_json, first_seen_utc, last_seen_utc,
-                        last_server, total_sessions, ip_history_json, last_ip,
-                        last_chat_message, last_chat_at_utc, ban_state, forced, forced_checked_utc,
-                        notes, metadata_json, updated_at_utc)
-                    VALUES (
-                        $sid, $name, $aliases, $now, $now,
-                        '', 0, $ips, $lastip,
-                        '', NULL, '', 1, $now,
-                        '', '{}', $now)
-                    ON CONFLICT(steam_id) DO UPDATE SET
-                        display_name = CASE WHEN length(excluded.display_name) > 0 THEN excluded.display_name ELSE players.display_name END,
-                        alias_history_json = excluded.alias_history_json,
-                        ip_history_json = excluded.ip_history_json,
-                        last_ip = CASE WHEN length(excluded.last_ip) > 0 THEN excluded.last_ip ELSE players.last_ip END,
-                        forced = 1,
-                        forced_checked_utc = excluded.forced_checked_utc,
-                        updated_at_utc = excluded.updated_at_utc;
+                    UPDATE players
+                    SET forced = 1,
+                        forced_checked_utc = $now,
+                        updated_at_utc = $now
+                    WHERE steam_id = $sid;
                     """;
                 cmd.Parameters.AddWithValue("$sid", sid);
-                cmd.Parameters.AddWithValue("$name", name);
-                cmd.Parameters.AddWithValue("$aliases", JsonSerializer.Serialize(aliases));
-                cmd.Parameters.AddWithValue("$ips", JsonSerializer.Serialize(ips));
-                cmd.Parameters.AddWithValue("$lastip", ip);
                 cmd.Parameters.AddWithValue("$now", now);
-                cmd.ExecuteNonQuery();
+                var affected = cmd.ExecuteNonQuery();
+                if (affected > 0) matched++;
+                else ignored++;
             }
 
             tx.Commit();
@@ -241,6 +216,34 @@ internal sealed class PlayerStore
         {
             _log?.Invoke($"forced-list apply failed: {ex.Message}");
         }
+        return (matched, ignored);
+    }
+
+    // Per-player forced-status check via the /getplayer endpoint. Used opportunistically
+    // when a player we already track joins a server, so that admins see fresh forced state
+    // without waiting for the 5-minute /all sweep. Caller is responsible for throttling.
+    public void MarkForcedStatus(string steamId, bool? forced)
+    {
+        if (string.IsNullOrWhiteSpace(steamId)) return;
+        try
+        {
+            using var connection = new SqliteConnection(_connectionString);
+            connection.Open();
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText =
+                """
+                UPDATE players
+                SET forced = $forced,
+                    forced_checked_utc = $now,
+                    updated_at_utc = $now
+                WHERE steam_id = $sid;
+                """;
+            cmd.Parameters.AddWithValue("$sid", steamId.Trim());
+            cmd.Parameters.AddWithValue("$forced", forced == true ? 1 : 0);
+            cmd.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex) { _log?.Invoke($"forced-mark failed for {steamId}: {ex.Message}"); }
     }
 
     public PlayerRecord? Get(string steamId)
