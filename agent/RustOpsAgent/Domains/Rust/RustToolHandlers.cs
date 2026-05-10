@@ -1524,7 +1524,12 @@ internal sealed class RustPluginToolHandler : IToolHandler
                     else if (state == "current")
                         updateMessages.Add($"{pluginName}: up to date ({current ?? "?"})");
                     else
-                        updateMessages.Add($"{pluginName}: {state ?? "unknown"}");
+                    {
+                        var reason = entry.TryGetProperty("reason", out var rv) ? rv.GetString() : null;
+                        updateMessages.Add(string.IsNullOrWhiteSpace(reason)
+                            ? $"{pluginName}: {state ?? "unknown"}"
+                            : $"{pluginName}: {state ?? "unknown"} ({reason})");
+                    }
                 }
             }
 

@@ -6,6 +6,7 @@ BASE_DIR="/opt/rust-manager"
 CONFIG_DIR="$BASE_DIR/config"
 GENERATED_DIR="$BASE_DIR/generated"
 RUNTIME_DIR="$BASE_DIR/runtime"
+LOG_DIR="$BASE_DIR/logs"
 
 STEAMCMD_BIN="${STEAMCMD_BIN:-/usr/games/steamcmd}"
 STEAM_USER="${STEAM_USER:-anonymous}"
@@ -16,11 +17,77 @@ STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-30}"
 START_WAIT_SECONDS="${START_WAIT_SECONDS:-45}"
 RESTART_LOOP_DELAY_SECONDS="${RESTART_LOOP_DELAY_SECONDS:-5}"
 
-mkdir -p "$CONFIG_DIR" "$GENERATED_DIR" "$RUNTIME_DIR"
+mkdir -p "$CONFIG_DIR" "$GENERATED_DIR" "$RUNTIME_DIR" "$LOG_DIR"
 
 die() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+log_message() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')
+    printf '[%s] [%s] %s\n' "$timestamp" "$level" "$message"
+}
+
+log_debug() {
+    log_message "DEBUG" "$*" >> "$LOG_DIR/manager.log"
+}
+
+log_info() {
+    log_message "INFO" "$*" | tee -a "$LOG_DIR/manager.log"
+}
+
+log_warn() {
+    log_message "WARN" "$*" | tee -a "$LOG_DIR/manager.log" >&2
+}
+
+log_error() {
+    log_message "ERROR" "$*" | tee -a "$LOG_DIR/manager.log" >&2
+}
+
+server_log_file() {
+    local server="$1"
+    echo "$LOG_DIR/$server.log"
+}
+
+server_log() {
+    local server="$1"
+    shift
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')
+    local log_file
+    log_file="$(server_log_file "$server")"
+    printf '[%s] [%s] %s\n' "$timestamp" "$level" "$message" >> "$log_file"
+}
+
+server_log_debug() {
+    local server="$1"
+    shift
+    server_log "$server" "DEBUG" "$*"
+}
+
+server_log_info() {
+    local server="$1"
+    shift
+    server_log "$server" "INFO" "$*"
+}
+
+server_log_warn() {
+    local server="$1"
+    shift
+    server_log "$server" "WARN" "$*"
+}
+
+server_log_error() {
+    local server="$1"
+    shift
+    server_log "$server" "ERROR" "$*"
 }
 
 require_bin() {
@@ -178,6 +245,7 @@ load_config() {
     local server="$1"
     local cfg
     cfg="$(server_config_path "$server")"
+    server_log_debug "$server" "Loading config from: $cfg"
     [[ -f "$cfg" ]] || die "Config not found: $cfg"
 
     CFG_NAME="$(json_get "$cfg" '.name')"
@@ -204,21 +272,23 @@ load_config() {
     CFG_ADDITIONAL_ARGS="$(json_get_or_empty "$cfg" '.additionalArgs')"
     CFG_SERVER_DIR="$(json_get "$cfg" '.serverDir')"
 
-    [[ -n "$CFG_NAME" ]] || die "Invalid config: name"
-    [[ -n "$CFG_SERVER_HOSTNAME" ]] || die "Invalid config: server.hostname"
-    [[ -n "$CFG_SERVER_IDENTITY" ]] || die "Invalid config: server.identity"
-    [[ -n "$CFG_SERVER_DIR" ]] || die "Invalid config: serverDir"
-    [[ -n "$CFG_RCON_PASSWORD" ]] || die "Invalid config: rcon.password"
+    [[ -n "$CFG_NAME" ]] || { server_log_error "$server" "Invalid config: name"; die "Invalid config: name"; }
+    [[ -n "$CFG_SERVER_HOSTNAME" ]] || { server_log_error "$server" "Invalid config: server.hostname"; die "Invalid config: server.hostname"; }
+    [[ -n "$CFG_SERVER_IDENTITY" ]] || { server_log_error "$server" "Invalid config: server.identity"; die "Invalid config: server.identity"; }
+    [[ -n "$CFG_SERVER_DIR" ]] || { server_log_error "$server" "Invalid config: serverDir"; die "Invalid config: serverDir"; }
+    [[ -n "$CFG_RCON_PASSWORD" ]] || { server_log_error "$server" "Invalid config: rcon.password"; die "Invalid config: rcon.password"; }
 
-    [[ "$CFG_SERVER_PORT" =~ ^[0-9]+$ ]] || die "Invalid server.port in $cfg"
-    [[ "$CFG_RCON_PORT" =~ ^[0-9]+$ ]] || die "Invalid rcon.port in $cfg"
-    [[ "$CFG_APP_PORT" =~ ^[0-9]+$ ]] || die "Invalid app.port in $cfg"
-    [[ "$CFG_SERVER_WORLDSIZE" =~ ^[0-9]+$ ]] || die "Invalid server.worldsize in $cfg"
-    [[ "$CFG_SERVER_SEED" =~ ^[0-9]+$ ]] || die "Invalid server.seed in $cfg"
-    [[ "$CFG_SERVER_MAXPLAYERS" =~ ^[0-9]+$ ]] || die "Invalid server.maxplayers in $cfg"
+    [[ "$CFG_SERVER_PORT" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid server.port in $cfg: $CFG_SERVER_PORT"; die "Invalid server.port in $cfg"; }
+    [[ "$CFG_RCON_PORT" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid rcon.port in $cfg: $CFG_RCON_PORT"; die "Invalid rcon.port in $cfg"; }
+    [[ "$CFG_APP_PORT" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid app.port in $cfg: $CFG_APP_PORT"; die "Invalid app.port in $cfg"; }
+    [[ "$CFG_SERVER_WORLDSIZE" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid server.worldsize in $cfg: $CFG_SERVER_WORLDSIZE"; die "Invalid server.worldsize in $cfg"; }
+    [[ "$CFG_SERVER_SEED" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid server.seed in $cfg: $CFG_SERVER_SEED"; die "Invalid server.seed in $cfg"; }
+    [[ "$CFG_SERVER_MAXPLAYERS" =~ ^[0-9]+$ ]] || { server_log_error "$server" "Invalid server.maxplayers in $cfg: $CFG_SERVER_MAXPLAYERS"; die "Invalid server.maxplayers in $cfg"; }
 
-    [[ -d "$CFG_SERVER_DIR" ]] || die "ServerDir does not exist: $CFG_SERVER_DIR"
-    [[ -x "$CFG_SERVER_DIR/RustDedicated" ]] || die "RustDedicated not found or not executable: $CFG_SERVER_DIR/RustDedicated"
+    [[ -d "$CFG_SERVER_DIR" ]] || { server_log_error "$server" "ServerDir does not exist: $CFG_SERVER_DIR"; die "ServerDir does not exist: $CFG_SERVER_DIR"; }
+    [[ -x "$CFG_SERVER_DIR/RustDedicated" ]] || { server_log_error "$server" "RustDedicated not found or not executable: $CFG_SERVER_DIR/RustDedicated"; die "RustDedicated not found or not executable: $CFG_SERVER_DIR/RustDedicated"; }
+
+    server_log_info "$server" "Config loaded successfully - hostname=$CFG_SERVER_HOSTNAME port=$CFG_SERVER_PORT serverdir=$CFG_SERVER_DIR"
 }
 
 trace_server_command() {
@@ -336,12 +406,13 @@ EOF
 
 write_runner_script() {
     local server="$1"
-    local runner_path control_path trace_path command_path
+    local runner_path control_path trace_path command_path log_path
     local identity server_port rcon_port app_port
     runner_path="$(runner_script_path "$server")"
     control_path="$(restart_flag_path "$server")"
     trace_path="$(command_trace_path "$server")"
     command_path="$(generated_cmd_path "$server")"
+    log_path="$(server_log_file "$server")"
     load_config "$server"
 
     identity="$CFG_SERVER_IDENTITY"
@@ -360,14 +431,69 @@ set -uo pipefail
 CONTROL_PATH=$(quote_arg "$control_path")
 TRACE_PATH=$(quote_arg "$trace_path")
 COMMAND_PATH=$(quote_arg "$command_path")
+LOG_PATH=$(quote_arg "$log_path")
 RESTART_DELAY=$(quote_arg "$RESTART_LOOP_DELAY_SECONDS")
 IDENTITY=$(quote_arg "$identity")
 SERVER_PORT=$(quote_arg "$server_port")
 RCON_PORT=$(quote_arg "$rcon_port")
 APP_PORT=$(quote_arg "$app_port")
+SERVER_NAME="$server"
 
 trace() {
     printf '[%s] %s\n' "\$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "\$1" >> "\$TRACE_PATH"
+}
+
+log_supervisor() {
+    local level="\$1"
+    shift
+    local message="\$*"
+    printf '[%s] [supervisor] [%s] %s\n' "\$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')" "\$level" "\$message" >> "\$LOG_PATH"
+}
+
+log_process() {
+    local level="\$1"
+    shift
+    local message="\$*"
+    printf '[%s] [process] [%s] %s\n' "\$(date -u '+%Y-%m-%dT%H:%M:%S.%3NZ')" "\$level" "\$message" >> "\$LOG_PATH"
+}
+
+get_process_stats() {
+    local pid="\$1"
+    [[ -z "\$pid" ]] && return 1
+    if [[ -f /proc/\$pid/stat ]]; then
+        local vsize rss
+        vsize=\$(awk '{print \$23}' /proc/\$pid/stat 2>/dev/null || echo "0")
+        rss=\$(awk '{print \$24}' /proc/\$pid/stat 2>/dev/null || echo "0")
+        echo "vsize=\${vsize}B rss=\${rss}B"
+        return 0
+    fi
+    return 1
+}
+
+get_process_info() {
+    local pid="\$1"
+    [[ -z "\$pid" ]] && return 1
+    if [[ -f /proc/\$pid/status ]]; then
+        local state name
+        state=\$(grep "^State:" /proc/\$pid/status 2>/dev/null | awk '{print \$2}')
+        name=\$(grep "^Name:" /proc/\$pid/status 2>/dev/null | awk '{print \$2}')
+        echo "name=\${name} state=\${state}"
+        return 0
+    fi
+    return 1
+}
+
+check_process_alive() {
+    local pid="\$1"
+    [[ -z "\$pid" ]] && return 1
+    if kill -0 "\$pid" 2>/dev/null; then
+        return 0
+    else
+        if [[ -d /proc/\$pid ]]; then
+            log_process "WARN" "Process \$pid exists in /proc but kill -0 failed"
+        fi
+        return 1
+    fi
 }
 
 find_rust_pids() {
@@ -440,34 +566,76 @@ wait_for_pids_exit() {
     local pids_raw="\$1"
     [[ -n "\$pids_raw" ]] || return 0
 
+    local waited=0
     while true; do
         local any_alive=0
         local pid
         for pid in \$pids_raw; do
-            if kill -0 "\$pid" 2>/dev/null; then
+            if check_process_alive "\$pid"; then
                 any_alive=1
+                log_process "DEBUG" "Waiting for pid \$pid to exit (\${waited}s elapsed)"
                 break
             fi
         done
         if (( any_alive == 0 )); then
+            [[ \$waited -gt 0 ]] && log_process "INFO" "All processes exited after \${waited}s"
             return 0
         fi
         sleep 1
+        waited=\$((waited + 1))
     done
 }
 
+log_supervisor "INFO" "Supervisor starting for server \$SERVER_NAME (identity=\$IDENTITY)"
+
 while [[ -f "\$CONTROL_PATH" ]]; do
     if [[ ! -f "\$COMMAND_PATH" ]]; then
+        log_supervisor "DEBUG" "Waiting for command file: \$COMMAND_PATH"
         trace "supervisor: waiting for command file"
         sleep "\$RESTART_DELAY"
         continue
     fi
 
     cmd="\$(cat "\$COMMAND_PATH")"
-    trace "process start: RustDedicated"
+    log_supervisor "INFO" "Starting process: RustDedicated (identity=\$IDENTITY)"
+    log_process "DEBUG" "Command: \$cmd"
+
+    local start_time
+    start_time=\$(date +%s)
+
     bash -lc "\$cmd"
     exit_code=\$?
-    trace "process exit: code=\$exit_code"
+
+    local end_time
+    end_time=\$(date +%s)
+    local runtime=\$((end_time - start_time))
+
+    log_process "ERROR" "Process exited with code=\$exit_code after \${runtime}s"
+    trace "process exit: code=\$exit_code runtime=\${runtime}s"
+
+    # Check if process was killed by signal
+    if (( exit_code > 128 )); then
+        local signal=\$((exit_code - 128))
+        log_process "WARN" "Process killed by signal: \$signal"
+        case \$signal in
+            9) log_process "WARN" "Process was forcefully killed (SIGKILL)" ;;
+            15) log_process "WARN" "Process received termination signal (SIGTERM)" ;;
+            11) log_process "ERROR" "Process crashed with segmentation fault (SIGSEGV)" ;;
+            6) log_process "ERROR" "Process received abort signal (SIGABRT)" ;;
+            *) log_process "WARN" "Process killed by signal \$signal" ;;
+        esac
+    elif (( exit_code == 0 )); then
+        log_process "INFO" "Process exited normally"
+    else
+        log_process "ERROR" "Process exited with error code \$exit_code"
+    fi
+
+    # Log final process stats if available
+    if leftover_pids="\$(find_rust_pids | head -1)"; then
+        if [[ -n "\$leftover_pids" ]]; then
+            log_process "DEBUG" "Found orphaned process: \$leftover_pids"
+        fi
+    fi
 
     # Rust Dedicated can spawn a Unity bootstrapper process that exits quickly while
     # a child RustDedicated continues running. If that happens and we immediately loop,
@@ -475,18 +643,23 @@ while [[ -f "\$CONTROL_PATH" ]]; do
     # Detect and wait for remaining matching RustDedicated pids to exit before restarting.
     leftover_pids="\$(find_rust_pids | tr '\n' ' ' | sed 's/[[:space:]]\\+/ /g' | sed 's/^ //; s/ \$//')"
     if [[ -n "\$leftover_pids" ]]; then
+        log_supervisor "WARN" "Bootstrapper exited but RustDedicated still running (pids: \$leftover_pids)"
         trace "supervisor: bootstrapper exited but RustDedicated still running (pids: \$leftover_pids)"
         wait_for_pids_exit "\$leftover_pids"
+        log_supervisor "INFO" "RustDedicated pid(s) exited"
         trace "supervisor: RustDedicated pid(s) exited"
     fi
 
     if [[ ! -f "\$CONTROL_PATH" ]]; then
+        log_supervisor "INFO" "Control flag removed, exiting supervisor loop"
         break
     fi
 
+    log_supervisor "DEBUG" "Waiting \$RESTART_DELAY seconds before restart"
     sleep "\$RESTART_DELAY"
 done
 
+log_supervisor "INFO" "Supervisor stopped"
 trace "supervisor: stopped"
 EOF
 
@@ -743,6 +916,7 @@ status_one() {
     local server="$1"
 
     if ! server_exists "$server"; then
+        server_log_debug "$server" "Status check: config not found"
         echo "$server: missing-config"
         return 1
     fi
@@ -763,10 +937,15 @@ status_one() {
     pid="$(server_pid "$server" || true)"
     if [[ -n "$pid" ]]; then
         state="running"
+        server_log_debug "$server" "Status check: running (pid=$pid, session=$sess, autorestart=$autorestart)"
     elif [[ "$autorestart" == "yes" && "$sess" == "yes" ]]; then
         state="starting"
+        server_log_debug "$server" "Status check: starting (session=$sess, autorestart=$autorestart)"
     elif [[ "$sess" == "yes" ]]; then
         state="session-only"
+        server_log_debug "$server" "Status check: session-only (no process)"
+    else
+        server_log_debug "$server" "Status check: offline"
     fi
 
     echo "name: $server"
@@ -782,7 +961,8 @@ start_one() {
     local server="$1"
     local runner_path control_path pid waited trace_path recent_trace
 
-    server_exists "$server" || die "Unknown server: $server"
+    server_log_info "$server" "========== START REQUESTED =========="
+    server_exists "$server" || { server_log_error "$server" "Unknown server: $server"; die "Unknown server: $server"; }
     sync_config_one "$server" >/dev/null
 
     control_path="$(restart_flag_path "$server")"
@@ -790,43 +970,54 @@ start_one() {
     pid="$(server_pid "$server" || true)"
 
     if [[ -n "$pid" ]] && ! tmux_has_session "$server"; then
+        server_log_error "$server" "Server already running outside managed session (pid $pid)"
         die "$server is already running outside the managed tmux session (pid $pid)"
     fi
 
     if tmux_has_session "$server"; then
         pid="$(server_pid "$server" || true)"
         if [[ -n "$pid" ]]; then
+            server_log_info "$server" "Server already running (pid=$pid)"
             touch "$control_path"
             echo "$server already running"
             return 0
         fi
 
+        server_log_debug "$server" "Killing old tmux session"
         tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
         sleep 1
     fi
 
     touch "$control_path"
     trace_path="$(command_trace_path "$server")"
-    tmux new-session -d -s "$(session_name "$server")" "bash -lc $(shell_escape "$runner_path")"
+    server_log_debug "$server" "Creating new tmux session: $(session_name "$server")"
+    server_log_debug "$server" "Runner script: $runner_path"
+    tmux new-session -d -s "$(session_name "$server")" "bash -lc $(shell_escape "$runner_path")" 2>&1 | server_log_debug "$server" "tmux output: %s"
 
     waited=0
     detected_pid=""
+    server_log_info "$server" "Waiting for process to start (timeout: ${START_WAIT_SECONDS}s)"
     while (( waited < START_WAIT_SECONDS )); do
         pid="$(server_pid "$server" || true)"
         if [[ -n "$pid" ]]; then
             if [[ -z "$detected_pid" ]]; then
+                server_log_info "$server" "Process detected with pid=$pid"
                 detected_pid="$pid"
             fi
             sleep 3
             local final_pid
             final_pid="$(server_pid "$server" || true)"
             if [[ -n "$final_pid" ]] && [[ "$final_pid" == "$detected_pid" ]]; then
+                server_log_info "$server" "========== START SUCCESSFUL ========== (pid=$final_pid after ${waited}s)"
                 echo "started $server"
                 return 0
+            else
+                server_log_debug "$server" "PID changed or lost (detected=$detected_pid, now=$final_pid)"
             fi
         fi
 
         if ! tmux_has_session "$server"; then
+            server_log_error "$server" "Tmux session died, process did not start"
             break
         fi
 
@@ -840,9 +1031,11 @@ start_one() {
     fi
 
     if [[ -n "$recent_trace" ]]; then
+        server_log_error "$server" "========== START FAILED ========== Exit code 1 - Recent trace: $recent_trace"
         die "Start did not produce a RustDedicated pid for $server within ${START_WAIT_SECONDS}s. Recent trace: $recent_trace"
     fi
 
+    server_log_error "$server" "========== START FAILED ========== Exit code 1"
     die "Start did not produce a RustDedicated pid for $server within ${START_WAIT_SECONDS}s"
 }
 
@@ -851,27 +1044,34 @@ stop_one() {
     local control_path
     local -a pids
 
+    server_log_info "$server" "========== STOP REQUESTED =========="
     control_path="$(restart_flag_path "$server")"
     rm -f "$control_path"
 
     if ! tmux_has_session "$server"; then
         mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
         if (( ${#pids[@]} > 0 )); then
+            server_log_info "$server" "No tmux session, found orphaned pids: ${pids[*]}"
             for pid in "${pids[@]}"; do
-                kill -TERM "$pid" 2>/dev/null || true
+                server_log_info "$server" "Sending SIGTERM to orphaned pid $pid"
+                kill -TERM "$pid" 2>/dev/null || { server_log_warn "$server" "Failed to kill pid $pid"; }
             done
+            server_log_info "$server" "========== STOPPED =========="
             echo "stopped $server"
             return 0
         fi
 
+        server_log_info "$server" "========== ALREADY STOPPED =========="
         echo "$server already stopped"
         return 0
     fi
 
     mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
     if (( ${#pids[@]} > 0 )); then
+        server_log_info "$server" "Found ${#pids[@]} process(es): ${pids[*]}"
         for pid in "${pids[@]}"; do
-            kill -TERM "$pid" 2>/dev/null || true
+            server_log_info "$server" "Sending SIGTERM to pid $pid"
+            kill -TERM "$pid" 2>/dev/null || { server_log_warn "$server" "Failed to send SIGTERM to $pid"; }
         done
 
         local waited=0
@@ -884,9 +1084,11 @@ stop_one() {
                 fi
             done
             if (( any_alive == 0 )); then
+                server_log_info "$server" "All processes exited gracefully after ${waited}s"
                 break
             fi
 
+            [[ $((waited % 5)) -eq 0 ]] && server_log_debug "$server" "Waiting for graceful shutdown (${waited}/${STOP_TIMEOUT_SECONDS}s)"
             sleep 1
             waited=$((waited + 1))
         done
@@ -899,17 +1101,22 @@ stop_one() {
             fi
         done
         if (( any_left == 1 )); then
-            echo "graceful stop timed out for $server, killing process"
+            server_log_warn "$server" "Graceful stop timed out after ${STOP_TIMEOUT_SECONDS}s, force killing processes"
             for pid in "${pids[@]}"; do
-                kill -9 "$pid" 2>/dev/null || true
+                if kill -0 "$pid" 2>/dev/null; then
+                    server_log_warn "$server" "Sending SIGKILL to pid $pid"
+                    kill -9 "$pid" 2>/dev/null || { server_log_error "$server" "Failed to force kill $pid"; }
+                fi
             done
         fi
     fi
 
     if tmux_has_session "$server"; then
+        server_log_debug "$server" "Killing tmux session: $(session_name "$server")"
         tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
     fi
 
+    server_log_info "$server" "========== STOPPED =========="
     echo "stopped $server"
 }
 
@@ -918,21 +1125,28 @@ kill_one() {
     local control_path
     local -a pids
 
+    server_log_info "$server" "========== FORCE KILL REQUESTED =========="
     # kill is a hard stop: ensure autorestart is disabled so status doesn't get stuck in "starting"
     control_path="$(restart_flag_path "$server")"
     rm -f "$control_path"
 
     mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
     if (( ${#pids[@]} > 0 )); then
+        server_log_warn "$server" "Force killing ${#pids[@]} process(es): ${pids[*]}"
         for pid in "${pids[@]}"; do
-            kill -9 "$pid" 2>/dev/null || true
+            server_log_warn "$server" "Sending SIGKILL to pid $pid"
+            kill -9 "$pid" 2>/dev/null || { server_log_error "$server" "Failed to kill pid $pid"; }
         done
+    else
+        server_log_info "$server" "No processes found to kill"
     fi
 
     if tmux_has_session "$server"; then
+        server_log_debug "$server" "Killing tmux session: $(session_name "$server")"
         tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
     fi
 
+    server_log_info "$server" "========== FORCE KILLED =========="
     echo "killed $server"
 }
 
@@ -941,13 +1155,17 @@ restart_one() {
     local old_pid new_pid waited control_path
     local -a pids
 
-    server_exists "$server" || die "Unknown server: $server"
+    server_log_info "$server" "========== RESTART REQUESTED =========="
+    server_exists "$server" || { server_log_error "$server" "Unknown server"; die "Unknown server: $server"; }
     sync_config_one "$server" >/dev/null
 
     if ! tmux_has_session "$server"; then
+        server_log_info "$server" "No managed session found, orphaned process restart"
         mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
         if (( ${#pids[@]} > 0 )); then
+            server_log_info "$server" "Found orphaned processes: ${pids[*]}"
             for pid in "${pids[@]}"; do
+                server_log_info "$server" "Sending SIGTERM to orphaned pid $pid"
                 kill -TERM "$pid" 2>/dev/null || true
             done
             waited=0
@@ -966,7 +1184,10 @@ restart_one() {
                 waited=$((waited + 1))
             done
             for pid in "${pids[@]}"; do
-                kill -9 "$pid" 2>/dev/null || true
+                if kill -0 "$pid" 2>/dev/null; then
+                    server_log_warn "$server" "Force killing orphaned pid $pid"
+                    kill -9 "$pid" 2>/dev/null || true
+                fi
             done
         fi
 
@@ -979,18 +1200,23 @@ restart_one() {
 
     old_pid="$(server_pid "$server" || true)"
     if [[ -z "$old_pid" ]]; then
+        server_log_info "$server" "No running process found, starting fresh"
         tmux kill-session -t "$(session_name "$server")" 2>/dev/null || true
         start_one "$server"
         return 0
     fi
 
+    server_log_info "$server" "Restarting managed process (old_pid=$old_pid)"
     trace_server_command "$server" "restart requested"
     mapfile -t pids < <(server_related_pids "$server" 2>/dev/null || true)
     if (( ${#pids[@]} > 0 )); then
+        server_log_info "$server" "Found ${#pids[@]} processes to restart: ${pids[*]}"
         for pid in "${pids[@]}"; do
+            server_log_info "$server" "Sending SIGTERM to pid $pid"
             kill -TERM "$pid" 2>/dev/null || true
         done
     else
+        server_log_info "$server" "Sending SIGTERM to old_pid $old_pid"
         kill -TERM "$old_pid" 2>/dev/null || true
     fi
 
@@ -999,23 +1225,27 @@ restart_one() {
         sleep 1
         new_pid="$(server_pid "$server" || true)"
         if [[ -n "$new_pid" && "$new_pid" != "$old_pid" ]]; then
+            server_log_info "$server" "========== RESTARTED ========== (old_pid=$old_pid, new_pid=$new_pid after ${waited}s)"
             echo "restarted $server"
             return 0
         fi
+        [[ $((waited % 10)) -eq 0 ]] && server_log_debug "$server" "Waiting for restart (${waited}s elapsed)"
         waited=$((waited + 1))
     done
 
+    server_log_error "$server" "========== RESTART FAILED ========== Timed out after ${STOP_TIMEOUT_SECONDS}s"
     die "Timed out waiting for $server to restart"
 }
 
 update_one() {
     local server="$1"
 
-    server_exists "$server" || die "Unknown server: $server"
+    server_log_info "$server" "========== UPDATE STARTED =========="
+    server_exists "$server" || { server_log_error "$server" "Unknown server"; die "Unknown server: $server"; }
     load_config "$server"
     require_update_deps
 
-    echo "updating $server in $CFG_SERVER_DIR"
+    server_log_info "$server" "Updating Rust server in $CFG_SERVER_DIR"
     local steam_out rc
     set +e
     steam_out="$(
@@ -1033,16 +1263,19 @@ update_one() {
     if (( rc != 0 )); then
         # SteamCMD may return exit 8 with app state 0x6 despite install being present.
         if [[ "$steam_out" == *"state is 0x6 after update job"* ]]; then
-            echo "steamcmd returned exit $rc with state 0x6; treating as non-fatal"
+            server_log_warn "$server" "SteamCMD returned exit $rc with state 0x6 (treating as non-fatal)"
             trace_server_command "$server" "update: steamcmd exit $rc state 0x6 (treated non-fatal)"
+            server_log_info "$server" "========== UPDATE COMPLETED =========="
             echo "updated $server"
             return 0
         fi
 
+        server_log_error "$server" "========== UPDATE FAILED ========== SteamCMD exit code $rc"
         die "steamcmd update failed for $server (exit $rc)"
     fi
 
     trace_server_command "$server" "update completed"
+    server_log_info "$server" "========== UPDATE COMPLETED SUCCESSFULLY =========="
     echo "updated $server"
 }
 
@@ -1216,30 +1449,35 @@ send_one() {
     shift || true
     local cmd="$*"
 
-    [[ -n "$cmd" ]] || die "Missing command"
+    [[ -n "$cmd" ]] || { server_log_error "$server" "Missing command"; die "Missing command"; }
 
     # Gate on the actual process, not on tmux. RCON works regardless of session state.
     local pid
     pid="$(server_pid "$server" || true)"
-    [[ -n "$pid" ]] || die "Server not running: $server"
+    [[ -n "$pid" ]] || { server_log_error "$server" "Cannot send command: server not running"; die "Server not running: $server"; }
 
+    server_log_debug "$server" "Attempting to send RCON command: $cmd (to pid=$pid)"
     if rcon_send "$server" "$cmd" "0"; then
+        server_log_info "$server" "Command sent via RCON: $cmd"
         trace_server_command "$server" "send(rcon): $cmd"
         echo "sent to $server: $cmd"
         return 0
     fi
 
+    server_log_warn "$server" "RCON failed, attempting tmux fallback"
     # RCON unavailable — fall back to tmux send-keys if the session exists.
     # Note: this path only works when the process reads stdin from the terminal,
     # which is not reliable for RustDedicated in batchmode. It is kept as a
     # last resort so graceful shutdown commands ("quit") can still be attempted.
     if tmux_has_session "$server"; then
+        server_log_info "$server" "Command sent via tmux fallback: $cmd"
         tmux send-keys -t "$(session_name "$server")" -- "$cmd" C-m
         trace_server_command "$server" "send(tmux-fallback): $cmd"
         echo "sent to $server via tmux fallback: $cmd"
         return 0
     fi
 
+    server_log_error "$server" "Failed to send command: RCON refused, no tmux session"
     die "Failed to send command to $server: RCON connection refused and no tmux session. Ensure +rcon.web 1 is set and the server is fully started."
 }
 

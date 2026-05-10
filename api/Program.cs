@@ -4711,58 +4711,97 @@ static async Task<object?> CheckPluginUpdatesAsync(string server, CancellationTo
     }
 
     var updates = new List<object>();
-    using var http = new HttpClient();
+    using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+    http.DefaultRequestHeaders.UserAgent.ParseAdd("RustOpsAgent/1.0 (+https://umod.org)");
+    http.DefaultRequestHeaders.Accept.ParseAdd("application/json");
     foreach (var plugin in plugins)
     {
-        var searchName = Uri.EscapeDataString(plugin.Name!);
-        var url = $"https://umod.org/plugins/search.json?query={searchName}&page=1&sort=title&sortdir=asc&filter=rust";
-        string body;
-        try
+        var lookup = await LookupUmodPluginAsync(http, plugin.Name!, cancellationToken);
+        if (lookup.Error is not null)
         {
-            body = await http.GetStringAsync(url, cancellationToken);
-        }
-        catch (Exception ex)
-        {
-            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod lookup failed: {ex.Message}" });
+            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = lookup.Error });
             continue;
         }
 
-        try
-        {
-            using var doc = JsonDocument.Parse(body);
-            if (!doc.RootElement.TryGetProperty("data", out var data) ||
-                data.ValueKind != JsonValueKind.Array ||
-                data.GetArrayLength() == 0)
-            {
-                updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found" });
-                continue;
-            }
+        var current = plugin.Version;
+        var needsUpdate = !string.IsNullOrWhiteSpace(lookup.Latest) &&
+                          !string.Equals(lookup.Latest, current, StringComparison.OrdinalIgnoreCase);
+        var downloadUrl = needsUpdate ? lookup.DownloadUrl : null;
 
-            var first = data[0];
-            var latest = first.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
-            var current = plugin.Version;
-            var needsUpdate = !string.IsNullOrWhiteSpace(latest) &&
-                              !string.Equals(latest, current, StringComparison.OrdinalIgnoreCase);
-            var downloadUrl = needsUpdate && first.TryGetProperty("download_url", out var dlNode)
-                ? dlNode.GetString()
-                : null;
-
-            updates.Add(new
-            {
-                plugin = plugin.Name,
-                current,
-                latest,
-                downloadUrl,
-                state = needsUpdate ? "update_available" : "current"
-            });
-        }
-        catch (JsonException ex)
+        updates.Add(new
         {
-            updates.Add(new { plugin = plugin.Name, current = plugin.Version, state = "not_found", reason = $"umod response parse failed: {ex.Message}" });
-        }
+            plugin = plugin.Name,
+            current,
+            latest = lookup.Latest,
+            downloadUrl,
+            state = needsUpdate ? "update_available" : "current"
+        });
     }
 
     return new { server, pluginPath = pluginsDir, updates };
+}
+
+static async Task<(string? Latest, string? DownloadUrl, string? Error)> LookupUmodPluginAsync(HttpClient http, string pluginName, CancellationToken cancellationToken)
+{
+    var searchName = Uri.EscapeDataString(pluginName);
+    var url = $"https://umod.org/plugins/search.json?query={searchName}&page=1&sort=title&sortdir=asc&filter=rust";
+    string body;
+    try
+    {
+        using var resp = await http.GetAsync(url, cancellationToken);
+        if (!resp.IsSuccessStatusCode)
+            return (null, null, $"umod HTTP {(int)resp.StatusCode}");
+        body = await resp.Content.ReadAsStringAsync(cancellationToken);
+    }
+    catch (Exception ex)
+    {
+        return (null, null, $"umod lookup failed: {ex.Message}");
+    }
+
+    JsonDocument doc;
+    try { doc = JsonDocument.Parse(body); }
+    catch (JsonException ex) { return (null, null, $"umod response not JSON: {ex.Message}"); }
+
+    using (doc)
+    {
+        if (!doc.RootElement.TryGetProperty("data", out var data) ||
+            data.ValueKind != JsonValueKind.Array ||
+            data.GetArrayLength() == 0)
+        {
+            return (null, null, "no uMod search results");
+        }
+
+        var normalizedQuery = NormalizePluginKey(pluginName);
+        JsonElement? match = null;
+        foreach (var entry in data.EnumerateArray())
+        {
+            var entryName = entry.TryGetProperty("name", out var nNode) ? nNode.GetString() : null;
+            var entryTitle = entry.TryGetProperty("title", out var tNode) ? tNode.GetString() : null;
+            if (NormalizePluginKey(entryName) == normalizedQuery ||
+                NormalizePluginKey(entryTitle) == normalizedQuery)
+            {
+                match = entry;
+                break;
+            }
+        }
+
+        if (match is null)
+            return (null, null, "no uMod entry matched plugin name");
+
+        var first = match.Value;
+        var latest = first.TryGetProperty("latest_release_version", out var latestNode) ? latestNode.GetString() : null;
+        var downloadUrl = first.TryGetProperty("download_url", out var dlNode) ? dlNode.GetString() : null;
+        return (latest, downloadUrl, null);
+    }
+}
+
+static string NormalizePluginKey(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+    var sb = new System.Text.StringBuilder(value.Length);
+    foreach (var c in value)
+        if (char.IsLetterOrDigit(c)) sb.Append(char.ToLowerInvariant(c));
+    return sb.ToString();
 }
 
 static async Task<object?> InstallPluginAsync(string server, string pluginName, Uri downloadUri, CancellationToken cancellationToken)
@@ -4796,7 +4835,8 @@ static async Task<object?> InstallPluginAsync(string server, string pluginName, 
     var destPath = Path.Combine(pluginsDir, $"{safeName}.cs");
     try
     {
-        using var http = new HttpClient();
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        http.DefaultRequestHeaders.UserAgent.ParseAdd("RustOpsAgent/1.0 (+https://umod.org)");
         var bytes = await http.GetByteArrayAsync(downloadUri, cancellationToken);
         await File.WriteAllBytesAsync(destPath, bytes, cancellationToken);
 
