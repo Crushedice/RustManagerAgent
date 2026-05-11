@@ -98,6 +98,17 @@
     "searchFilter": "rust",
     "referenceIndexDatabasePath": "data/plugin-reference-index.db"
   },
+  "consoleMonitor": {
+    "enabled": true,
+    "adminCallNotify": {
+      "enabled": false,
+      "threshold": 3,
+      "windowMinutes": 10,
+      "cooldownMinutes": 30,
+      "callTypes": ["cheater-report", "admin-request"],
+      "rconCommand": ""
+    }
+  },
   "webSearch": {
     "enabled": true
   },

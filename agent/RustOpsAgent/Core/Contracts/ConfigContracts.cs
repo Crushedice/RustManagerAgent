@@ -170,6 +170,20 @@ internal sealed class ConsoleMonitorSettings
     [JsonPropertyName("maxAdminCalls")] public int MaxAdminCalls { get; set; } = 500;
     [JsonPropertyName("sentimentAlertThreshold")] public double SentimentAlertThreshold { get; set; } = 4.0;
     [JsonPropertyName("compileErrorSeedThreshold")] public int CompileErrorSeedThreshold { get; set; } = 5;
+    [JsonPropertyName("adminCallNotify")] public AdminCallNotifySettings AdminCallNotify { get; set; } = new();
+}
+
+internal sealed class AdminCallNotifySettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = false;
+    [JsonPropertyName("threshold")] public int Threshold { get; set; } = 3;
+    [JsonPropertyName("windowMinutes")] public int WindowMinutes { get; set; } = 10;
+    [JsonPropertyName("cooldownMinutes")] public int CooldownMinutes { get; set; } = 30;
+    [JsonPropertyName("callTypes")] public List<string> CallTypes { get; set; } = new() { "cheater-report", "admin-request" };
+
+    // Optional RCON command to execute when threshold triggers. Placeholders:
+    // {server}, {count}, {accusedName}, {accusedSteamId}. Empty/null disables the action.
+    [JsonPropertyName("rconCommand")] public string? RconCommand { get; set; }
 }
 
 internal sealed class StandInAdminSettings

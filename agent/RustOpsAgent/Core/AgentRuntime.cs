@@ -100,6 +100,14 @@ internal sealed class AgentRuntime
 
     private DateTime _lastRemoteRconWarmupAtUtc = DateTime.MinValue;
     private readonly Dictionary<string, string> _notifiedPluginUpdatesHash = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _lastAdminCallNotifyAtUtc = new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly System.Text.RegularExpressions.Regex SteamIdRegex = new(
+        @"\b7656\d{13}\b",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+    private static readonly System.Text.RegularExpressions.Regex QuotedNameRegex = new(
+        @"[""'`]([^""'`]{2,30})[""'`]",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
 
     // Periodically re-warm RCON sessions to remote servers. If a server was offline at agent
     // startup, was restarted, or its WebSocket got dropped, this re-establishes the chat
@@ -1319,8 +1327,103 @@ internal sealed class AgentRuntime
                 .OrderBy(e => e.CapturedAtUtc)
                 .TakeLast(_config.ConsoleMonitor.MaxAdminCalls)
                 .ToList();
+
+            EvaluateAdminCallThreshold(chat, server);
         }
     }
+
+    private void EvaluateAdminCallThreshold(PlayerChatKnowledge chat, string server)
+    {
+        var settings = _config.ConsoleMonitor.AdminCallNotify;
+        if (!settings.Enabled || settings.Threshold < 1)
+            return;
+
+        var window = TimeSpan.FromMinutes(Math.Max(1, settings.WindowMinutes));
+        var cooldown = TimeSpan.FromMinutes(Math.Max(0, settings.CooldownMinutes));
+        var nowUtc = DateTime.UtcNow;
+        var cutoff = nowUtc - window;
+
+        var matchingTypes = settings.CallTypes is { Count: > 0 } ? settings.CallTypes : new() { "cheater-report", "admin-request" };
+        var recent = chat.AdminCalls
+            .Where(c => c.ServerName.Equals(server, StringComparison.OrdinalIgnoreCase))
+            .Where(c => c.CapturedAtUtc >= cutoff)
+            .Where(c => matchingTypes.Any(t => string.Equals(t, c.CallType, StringComparison.OrdinalIgnoreCase)))
+            .ToList();
+
+        if (recent.Count < settings.Threshold)
+            return;
+
+        if (_lastAdminCallNotifyAtUtc.TryGetValue(server, out var lastNotify) && nowUtc - lastNotify < cooldown)
+            return;
+
+        _lastAdminCallNotifyAtUtc[server] = nowUtc;
+
+        var reporters = recent
+            .Select(c => c.PlayerName)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var accusedSteamIds = new HashSet<string>(StringComparer.Ordinal);
+        var accusedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in recent)
+        {
+            foreach (System.Text.RegularExpressions.Match m in SteamIdRegex.Matches(c.Message ?? string.Empty))
+                accusedSteamIds.Add(m.Value);
+            foreach (System.Text.RegularExpressions.Match m in QuotedNameRegex.Matches(c.Message ?? string.Empty))
+            {
+                var name = m.Groups[1].Value.Trim();
+                if (!string.IsNullOrWhiteSpace(name) && !reporters.Contains(name, StringComparer.OrdinalIgnoreCase))
+                    accusedNames.Add(name);
+            }
+        }
+
+        var sample = recent.OrderByDescending(c => c.CapturedAtUtc).Take(3)
+            .Select(c => $"  - {c.PlayerName}: {Truncate(c.Message ?? string.Empty, 160)}");
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"[{server}] Admin-call threshold reached: {recent.Count} report(s) in last {(int)window.TotalMinutes}m.");
+        if (reporters.Count > 0)
+            sb.AppendLine($"Reporters: {string.Join(", ", reporters)}");
+        if (accusedSteamIds.Count > 0)
+            sb.AppendLine($"Accused SteamIDs: {string.Join(", ", accusedSteamIds)}");
+        if (accusedNames.Count > 0)
+            sb.AppendLine($"Accused names (quoted): {string.Join(", ", accusedNames)}");
+        sb.AppendLine("Recent messages:");
+        foreach (var line in sample) sb.AppendLine(line);
+
+        var message = sb.ToString().TrimEnd();
+        Console.WriteLine($"[admin-call] {message}");
+        BroadcastOutbox(message, server);
+
+        var template = settings.RconCommand;
+        if (!string.IsNullOrWhiteSpace(template))
+        {
+            var accusedSteamId = accusedSteamIds.FirstOrDefault() ?? string.Empty;
+            var accusedName = accusedNames.FirstOrDefault() ?? string.Empty;
+            var rconCommand = template
+                .Replace("{server}", server)
+                .Replace("{count}", recent.Count.ToString())
+                .Replace("{accusedSteamId}", accusedSteamId)
+                .Replace("{accusedName}", accusedName);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var reply = await RustDirectRconHelper.TryExecuteAsync(server, rconCommand, CancellationToken.None);
+                    Console.WriteLine($"[admin-call] {server}: rcon '{rconCommand}' → {(string.IsNullOrWhiteSpace(reply) ? "(no reply)" : Truncate(reply, 200))}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[admin-call] {server}: rcon '{rconCommand}' failed: {ex.Message}");
+                }
+            });
+        }
+    }
+
+    private static string Truncate(string value, int max)
+        => value.Length <= max ? value : value.Substring(0, max) + "…";
 
     // Patterns are anchored on word boundaries so that substrings like "esp" inside
     // "respawn" or "admin" inside a plugin name don't false-trigger. Keep these in sync
