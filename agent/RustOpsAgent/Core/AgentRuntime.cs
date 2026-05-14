@@ -1420,6 +1420,38 @@ internal sealed class AgentRuntime
                 }
             });
         }
+
+        if (settings.AddAccusedToForcedList && accusedSteamIds.Count > 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                foreach (var steamId in accusedSteamIds)
+                {
+                    try
+                    {
+                        using var content = new StringContent(steamId);
+                        using var resp = await _forcedHttpClient.PostAsync("http://apps.rusticaland.net:8853/Sadduser", content);
+                        var name = _playerStore?.Get(steamId)?.DisplayName;
+                        var who = string.IsNullOrWhiteSpace(name) ? steamId : $"{name} ({steamId})";
+                        if (resp.IsSuccessStatusCode)
+                        {
+                            _playerStore?.MarkForcedStatus(steamId, true);
+                            var notice = $"[{server}] Auto-forced {who} onto the launcher forced list due to cheater reports.";
+                            Console.WriteLine($"[admin-call] {notice}");
+                            BroadcastOutbox(notice, server);
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[admin-call] {server}: forced-list add {steamId} failed — HTTP {(int)resp.StatusCode}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[admin-call] {server}: forced-list add {steamId} failed: {ex.Message}");
+                    }
+                }
+            });
+        }
     }
 
     private static string Truncate(string value, int max)
@@ -1776,6 +1808,8 @@ internal sealed class AgentRuntime
     {
         // Actively poll RCON rolling log for remote servers. This complements the event-driven
         // unsolicited message handler by ensuring no chat/console output is missed.
+        // Kept at full parity with ObserveServerLogsAsync: error escalation, compile seeding,
+        // admin review prompts, repeating-message tracking, and importance-scored log memory.
         try
         {
             var rollingLog = RustDirectRconHelper.GetRollingLog(server);
@@ -1789,10 +1823,15 @@ internal sealed class AgentRuntime
                 serverConsole = new ServerConsoleState();
                 consoleMonitor.Servers[server] = serverConsole;
             }
+            var knowledge = _neoCortex.LoadLogs();
 
             var chatChanged = false;
             var consoleChanged = false;
+            var logChanged = false;
             var startOffset = _remoteServerLogOffsets.TryGetValue(server, out var lastOffset) ? lastOffset : 0;
+            var newHighImportanceLines = new List<string>();
+            var newConsoleMemoryCandidates = new List<string>();
+            var uncertainReviewPrompts = new List<(string Key, string Line)>();
 
             for (var i = Math.Max(0, startOffset); i < rollingLog.Count; i++)
             {
@@ -1850,9 +1889,7 @@ internal sealed class AgentRuntime
                         existing.Count++;
                         existing.LastSeenAtUtc = DateTime.UtcNow;
                         if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
-                        {
                             existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
-                        }
                     }
                     else
                     {
@@ -1869,26 +1906,149 @@ internal sealed class AgentRuntime
                     serverConsole.TotalErrorsIngested++;
                     serverConsole.ErrorCountSinceLastAlert++;
                     consoleChanged = true;
+
+                    newConsoleMemoryCandidates.Add(consoleSignalLine!);
+                    if (ShouldAskAdminToReviewConsoleLine(consoleSignalLine!, category) && existing.ReviewPromptedAtUtc is null)
+                    {
+                        existing.ReviewPromptedAtUtc = DateTime.UtcNow;
+                        uncertainReviewPrompts.Add((key, consoleSignalLine!));
+                    }
+
+                    // Compile/oxide error learning seeding
+                    var signalLowered = consoleSignalLine!.ToLowerInvariant();
+                    if (signalLowered.Contains("oxide") || signalLowered.Contains("compil") || signalLowered.Contains("error while"))
+                    {
+                        _compileErrorCounts.TryGetValue(server, out var ceCount);
+                        _compileErrorCounts[server] = ceCount + 1;
+                        if (_compileErrorCounts[server] >= _config.ConsoleMonitor.CompileErrorSeedThreshold)
+                        {
+                            _compileErrorCounts[server] = 0;
+                            var ck = _neoCortex.LoadClassifierKnowledge();
+                            ck.PendingMisclassifications.Add(new MisclassificationRecord
+                            {
+                                FeedbackNote = $"Repeated plugin/oxide compilation errors observed on server '{server}'. Queries about errors on this server likely relate to plugin compilation.",
+                                DetectedIntent = "observation",
+                                CapturedAtUtc = DateTime.UtcNow
+                            });
+                            ck.PendingMisclassifications = ck.PendingMisclassifications.TakeLast(50).ToList();
+                            _neoCortex.SaveClassifierKnowledge(ck);
+                            Console.WriteLine($"[evolution] Compile/oxide observation seeded for '{server}'.");
+                        }
+                    }
+                }
+
+                // --- Repeating info/debug tracking ---
+                if (category is "info" or "debug")
+                {
+                    var key = NormalizeErrorKey(line);
+                    serverConsole.RepeatingMessages.TryGetValue(key, out var cnt);
+                    serverConsole.RepeatingMessages[key] = cnt + 1;
+                    if (cnt + 1 == _config.ConsoleMonitor.RepeatThreshold)
+                    {
+                        Console.WriteLine($"[console] {server}: repeating message ({cnt + 1}x): {(key.Length > 80 ? key[..80] + "..." : key)}");
+                        consoleChanged = true;
+                    }
+                }
+
+                // --- Log importance scoring (feeds incident review + semantic memory) ---
+                if (knowledge.IgnorePatterns.Any(pattern => lowered.Contains(pattern.ToLowerInvariant(), StringComparison.Ordinal)))
+                    continue;
+
+                var importance = ScoreImportance(lowered, knowledge.ImportanceRules);
+                if (importance < 3 && _incidentPatterns.Any(p => lowered.Contains(p.ToLowerInvariant(), StringComparison.Ordinal)))
+                    importance = 3;
+
+                if (importance >= 2)
+                {
+                    knowledge.RecentEntries.Add(new LogObservation
+                    {
+                        ServerName = server,
+                        Line = line,
+                        Importance = importance,
+                        CapturedAtUtc = DateTime.UtcNow
+                    });
+                    if (importance >= 3)
+                        newHighImportanceLines.Add(line);
+                    logChanged = true;
                 }
             }
 
             // Update offset to resume from next new line
             _remoteServerLogOffsets[server] = rollingLog.Count;
 
-            // Persist changes
+            // Persist chat
             if (chatChanged)
-            {
                 _neoCortex.SavePlayerChat(playerChat);
-            }
 
+            // Persist console monitor + escalation alert
             if (consoleChanged)
             {
                 serverConsole.RecentErrors = serverConsole.RecentErrors
                     .OrderByDescending(e => e.LastSeenAtUtc)
                     .Take(_config.ConsoleMonitor.MaxConsoleErrors)
                     .ToList();
+
+                if (serverConsole.RepeatingMessages.Count > 200)
+                {
+                    serverConsole.RepeatingMessages = serverConsole.RepeatingMessages
+                        .OrderByDescending(kv => kv.Value)
+                        .Take(100)
+                        .ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+                }
+
+                if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
+                {
+                    var alertCount = serverConsole.ErrorCountSinceLastAlert;
+                    serverConsole.LastAlertAtUtc = DateTime.UtcNow;
+                    serverConsole.ErrorCountSinceLastAlert = 0;
+                    if (DateTime.UtcNow > _alertMutedUntilUtc)
+                    {
+                        Console.WriteLine($"[console] ESCALATE {server}: {alertCount} errors since last alert.");
+                        var topErrors = serverConsole.RecentErrors
+                            .OrderByDescending(e => e.Count)
+                            .Select(e => new { Entry = e, Line = TryFormatConsoleAlertLine(e) })
+                            .Where(item => !string.IsNullOrWhiteSpace(item.Line))
+                            .Take(3)
+                            .Select(item => $"  • {item.Line} ({item.Entry.Count}x)")
+                            .ToList();
+                        var alertMsg = $"[{server}] {alertCount} console errors since last alert." +
+                            (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
+                        BroadcastOutbox(alertMsg, server);
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[console] {server}: escalation suppressed (alerts muted until {_alertMutedUntilUtc:HH:mm} UTC).");
+                    }
+                }
+
+                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
                 _neoCortex.SaveConsoleMonitor(consoleMonitor);
                 Console.WriteLine($"[observe] {server}: remote RCON log processed (chat={playerChat.RecentMessages.Count} messages, console={serverConsole.RecentErrors.Count} errors)");
+            }
+
+            // Console memory candidates + admin review prompts
+            if (_config.Memory.WriteEnabled)
+                await RecordConsoleMonitorCandidatesAsync(server, newConsoleMemoryCandidates, uncertainReviewPrompts);
+
+            // Persist log observations + write high-importance lines to semantic memory
+            if (logChanged)
+            {
+                if (newHighImportanceLines.Count > 0)
+                    Console.WriteLine($"[observe] {server}: {newHighImportanceLines.Count} high-importance line(s) via remote RCON.");
+
+                if (_config.Memory.WriteEnabled)
+                {
+                    foreach (var logLine in newHighImportanceLines)
+                    {
+                        var summary = $"[{server}] {TrimSingleLine(logLine, 80)}";
+                        var detail = $"Server: {server}\nLog: {logLine}";
+                        _ = _semanticMemory.RecordServerFactAsync(server, summary, detail,
+                            new[] { "log", "high-importance", server.ToLowerInvariant() }, CancellationToken.None);
+                    }
+                }
+
+                knowledge.RecentEntries = knowledge.RecentEntries.TakeLast(400).ToList();
+                _neoCortex.SaveLogs(knowledge);
             }
         }
         catch (Exception ex)
