@@ -96,6 +96,14 @@ app.Urls.Add(bindUrl);
 // -- Remote agent status tracking (declare early for use in endpoints) ----------
 var remoteAgentStatus = new Dictionary<string, RemoteAgentStatus>(StringComparer.OrdinalIgnoreCase);
 
+// -- Dashboard summary cache: building the summary touches every server (status,
+// log tail, RCON queries, remote agents), so repeated loads within a few seconds
+// serve the cached result instead of re-doing all of it. -------------------------
+object? dashboardSummaryCache = null;
+var dashboardSummaryCacheAtUtc = DateTime.MinValue;
+var dashboardSummaryGate = new SemaphoreSlim(1, 1);
+var dashboardSummaryTtl = TimeSpan.FromSeconds(10);
+
 // -- Health --------------------------------------------------------------------
 app.MapGet("/health", () => Results.Ok(new
 {
@@ -113,6 +121,16 @@ app.MapGet("/ui", () => Results.Content(BuildDashboardHtml(), "text/html; charse
 
 app.MapGet("/dashboard/summary", async () =>
 {
+    // Serve the cached summary while it's fresh; only one request rebuilds at a time.
+    if (dashboardSummaryCache is not null && DateTime.UtcNow - dashboardSummaryCacheAtUtc < dashboardSummaryTtl)
+        return Results.Ok(dashboardSummaryCache);
+
+    await dashboardSummaryGate.WaitAsync();
+    try
+    {
+    if (dashboardSummaryCache is not null && DateTime.UtcNow - dashboardSummaryCacheAtUtc < dashboardSummaryTtl)
+        return Results.Ok(dashboardSummaryCache);
+
     var agentPaths = ResolveAgentRuntimePaths(agentSettingsPath, botSettingsPath, agentRootDir);
     var listResult = await ExecRustMgrAsync("list");
     var serverNames = (listResult.StdOut ?? string.Empty)
@@ -124,9 +142,9 @@ app.MapGet("/dashboard/summary", async () =>
     {
         var statusResult = await ExecRustMgrAsync("status", name);
         var status = ParseStatus(name, statusResult.StdOut);
-        var logsResult = await ExecRustMgrAsync("logs", name);
-        var recentWarningCount = TailLines(logsResult.StdOut ?? string.Empty, 80)
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+
+        // Warning count from the log file tail directly — never "rustmgr logs" (cats the whole file).
+        var recentWarningCount = ReadLogTailLines(name, 80)
             .Count(line =>
                 line.Contains("warn", StringComparison.OrdinalIgnoreCase) ||
                 line.Contains("error", StringComparison.OrdinalIgnoreCase) ||
@@ -134,9 +152,15 @@ app.MapGet("/dashboard/summary", async () =>
 
         var config = LoadServerConfig(name);
         var normalized = config is null ? null : NormalizeConfig(name, config);
-        var processStats = status.Pid.HasValue ? await ReadProcessSnapshotAsync(status.Pid.Value) : null;
-        var playerSnapshot = status.Online ? await TryReadPlayerSnapshotAsync(name) : null;
-        var infoSnapshot = status.Online ? await TryReadServerInfoSnapshotAsync(name) : null;
+
+        // Process stats and the two RCON snapshots are independent — run them concurrently.
+        var processStatsTask = status.Pid.HasValue ? ReadProcessSnapshotAsync(status.Pid.Value) : Task.FromResult<ProcessSnapshot?>(null);
+        var playerTask = status.Online ? TryReadPlayerSnapshotFastAsync(name) : Task.FromResult<PlayerSnapshot?>(null);
+        var infoTask = status.Online ? TryReadServerInfoSnapshotFastAsync(name) : Task.FromResult<ServerInfoSnapshot?>(null);
+        await Task.WhenAll(processStatsTask, playerTask, infoTask);
+        var processStats = processStatsTask.Result;
+        var playerSnapshot = playerTask.Result;
+        var infoSnapshot = infoTask.Result;
 
         return new
         {
@@ -224,7 +248,7 @@ app.MapGet("/dashboard/summary", async () =>
         (remoteAgentStatus.TryGetValue(r.Name, out var agSt) && agSt.IsReachable && agSt.IsAuthValid)
         || remoteStatusData.ContainsKey(r.Name));
 
-    return Results.Ok(new
+    object summaryPayload = new
     {
         generatedAtUtc = DateTime.UtcNow,
         host = new
@@ -399,7 +423,16 @@ app.MapGet("/dashboard/summary", async () =>
         capabilityGaps = memory.CapabilityGaps,
         selfRepairHistory = memory.SelfRepairHistory,
         services
-    });
+    };
+
+    dashboardSummaryCache = summaryPayload;
+    dashboardSummaryCacheAtUtc = DateTime.UtcNow;
+    return Results.Ok(summaryPayload);
+    }
+    finally
+    {
+        dashboardSummaryGate.Release();
+    }
 });
 
 app.MapGet("/agent/log-rules", () =>
@@ -1657,10 +1690,10 @@ app.MapGet("/servers/{server}/health", async (string server) =>
     var statusResult = await ExecRustMgrAsync("status", server);
     var status       = ParseStatus(server, statusResult.StdOut);
 
-    // Scan last 200 log lines for ERROR / Exception / NullRef patterns
-    var logsResult  = await ExecRustMgrAsync("logs", server);
-    var recentLines = TailLines(logsResult.StdOut ?? string.Empty, 200)
-        .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    // Scan last 200 log lines for ERROR / Exception / NullRef patterns.
+    // Read the log file tail directly — the agent polls this endpoint continuously,
+    // and shelling "rustmgr logs" cats the entire log every time.
+    var recentLines = ReadLogTailLines(server, 200);
 
     var errorKeywords = new[] { "ERROR", "Exception", "NullReferenceException", "fatal", "crash" };
     var recentErrors  = recentLines
@@ -2368,11 +2401,8 @@ app.MapGet("/servers/{server}/console", async (string server, int? lines) =>
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result = await ExecRustMgrAsync("logs", server);
-    if (!result.Ok) return Results.BadRequest(result);
-
     var n = Math.Max(1, lines.GetValueOrDefault(defaultConsoleLines));
-    var content = TailLines(result.StdOut ?? string.Empty, n);
+    var content = string.Join('\n', ReadLogTailLines(server, n, maxBytes: 512 * 1024));
     return Results.Ok(new { server, lines = n, content });
 });
 
@@ -2399,12 +2429,8 @@ app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, stri
     if (!await IsValidServerAsync(server))
         return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-    var result = await ExecRustMgrAsync("logs", server);
-    if (!result.Ok) return Results.BadRequest(result);
-
     var n          = Math.Max(1, lines.GetValueOrDefault(200));
-    var rawLines   = TailLines(result.StdOut ?? string.Empty, n)
-                         .Split('\n', StringSplitOptions.RemoveEmptyEntries);
+    var rawLines   = ReadLogTailLines(server, n, maxBytes: 512 * 1024);
     var entries    = ParseLogLines(rawLines);
 
     if (!string.IsNullOrWhiteSpace(since) && DateTime.TryParse(since, out var sinceUtc))
@@ -2794,6 +2820,88 @@ RconConnectionInfo? TryResolveRconConnectionInfo(string server, ServerConfig? cf
 
 Task<string> SendPersistentRconAsync(RconConnectionInfo endpoint, string command, CancellationToken cancellationToken = default) =>
     rconConnections.SendAndReceiveAsync(endpoint.Host, endpoint.Port, endpoint.Password, command, cancellationToken);
+
+// Fast log tail: reads the last maxBytes of the server's log file directly instead of
+// shelling out to "rustmgr logs" (which cats the ENTIRE log — hundreds of MB mid-wipe).
+// This is the difference between the dashboard loading in milliseconds vs many seconds.
+string[] ReadLogTailLines(string server, int maxLines, int maxBytes = 128 * 1024)
+{
+    try
+    {
+        var cfg = LoadServerConfig(server);
+        if (cfg is null)
+            return Array.Empty<string>();
+
+        var logPath = GetServerLogPath(NormalizeConfig(server, cfg));
+        if (!File.Exists(logPath))
+            return Array.Empty<string>();
+
+        using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        var length = stream.Length;
+        var readBytes = (int)Math.Min(maxBytes, length);
+        stream.Seek(length - readBytes, SeekOrigin.Begin);
+        var buffer = new byte[readBytes];
+        var total = 0;
+        while (total < readBytes)
+        {
+            var n = stream.Read(buffer, total, readBytes - total);
+            if (n <= 0) break;
+            total += n;
+        }
+
+        var text = Encoding.UTF8.GetString(buffer, 0, total);
+        var lines = text.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        // Drop the first line when we started mid-file — it is almost certainly partial.
+        var skipFirst = readBytes < length && lines.Length > 0 ? 1 : 0;
+        return lines.Skip(skipFirst).TakeLast(maxLines).ToArray();
+    }
+    catch (Exception ex)
+    {
+        CaptureHandledApiException(ex, "Fast log tail read failed.", server);
+        return Array.Empty<string>();
+    }
+}
+
+// Direct-RCON snapshots for the dashboard. The old path shelled out to "rustmgr query"
+// per snapshot (process spawn + fresh RCON connection each time); these reuse the API's
+// persistent WebRCON connections with a hard timeout so one slow server can't stall the
+// whole summary. On failure they return quickly — the dashboard shows "query failed"
+// instead of blocking.
+async Task<PlayerSnapshot?> TryReadPlayerSnapshotFastAsync(string server)
+{
+    var endpoint = TryResolveRconConnectionInfo(server, LoadServerConfig(server));
+    if (endpoint is null || !endpoint.WebRconEnabled)
+        return new PlayerSnapshot { QueryOk = false };
+
+    try
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+        var reply = await SendPersistentRconAsync(endpoint, "playerlist", cts.Token);
+        return ParsePlayerSnapshot(TryExtractJson(reply));
+    }
+    catch
+    {
+        return new PlayerSnapshot { QueryOk = false };
+    }
+}
+
+async Task<ServerInfoSnapshot?> TryReadServerInfoSnapshotFastAsync(string server)
+{
+    var endpoint = TryResolveRconConnectionInfo(server, LoadServerConfig(server));
+    if (endpoint is null || !endpoint.WebRconEnabled)
+        return null;
+
+    try
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+        var reply = await SendPersistentRconAsync(endpoint, "serverinfo", cts.Token);
+        return ParseServerInfoSnapshot(TryExtractJson(reply));
+    }
+    catch
+    {
+        return null;
+    }
+}
 
 app.Run();
 }
@@ -4342,13 +4450,8 @@ static async Task<ProcessSnapshot?> ReadProcessSnapshotAsync(int pid)
     };
 }
 
-static async Task<PlayerSnapshot?> TryReadPlayerSnapshotAsync(string server)
+static PlayerSnapshot ParsePlayerSnapshot(string? payload)
 {
-    var result = await ExecRustMgrAsync("query", server, "playerlist");
-    if (!result.Ok)
-        return new PlayerSnapshot { QueryOk = false };
-
-    var payload = TryExtractJson(result.StdOut);
     if (payload is null)
         return new PlayerSnapshot { QueryOk = false };
 
@@ -4378,13 +4481,8 @@ static async Task<PlayerSnapshot?> TryReadPlayerSnapshotAsync(string server)
     };
 }
 	
-static async Task<ServerInfoSnapshot?> TryReadServerInfoSnapshotAsync(string server)
+static ServerInfoSnapshot? ParseServerInfoSnapshot(string? payload)
 {
-    var result = await ExecRustMgrAsync("query", server, "serverinfo");
-    if (!result.Ok)
-        return null;
-
-    var payload = TryExtractJson(result.StdOut);
     if (payload is null)
         return null;
 

@@ -139,10 +139,9 @@ try
             return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
         var status = await executor.GetStatusAsync(server);
-        var logs = await executor.ExecuteAsync("logs", server);
-        var recentErrors = (logs.StdOut ?? string.Empty)
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .TakeLast(200)
+        // Tail the log file directly — "rustmgr logs" cats the entire log, which makes this
+        // endpoint (polled continuously by the main API/agent) scale with log size.
+        var recentErrors = ReadLogTail(server, 200)
             .Where(line =>
                 line.Contains("error", StringComparison.OrdinalIgnoreCase) ||
                 line.Contains("exception", StringComparison.OrdinalIgnoreCase) ||
@@ -218,12 +217,8 @@ try
         if (!await IsKnownServerAsync(server))
             return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-        var result = await executor.ExecuteAsync("logs", server);
-        if (!result.Ok)
-            return Results.BadRequest(result);
-
         var count = Math.Clamp(lines ?? 120, 1, 1000);
-        return Results.Ok(new { server, lines = count, content = TailLines(result.StdOut ?? string.Empty, count) });
+        return Results.Ok(new { server, lines = count, content = string.Join('\n', ReadLogTail(server, count)) });
     });
 
     app.MapGet("/servers/{server}/logs/tail", async (string server, int? lines, string? since, int? offset) =>
@@ -231,13 +226,8 @@ try
         if (!await IsKnownServerAsync(server))
             return Results.NotFound(new ApiError("not_found", $"Unknown server '{server}'."));
 
-        var result = await executor.ExecuteAsync("logs", server);
-        if (!result.Ok)
-            return Results.BadRequest(result);
-
         var count = Math.Clamp(lines ?? 200, 1, 1000);
-        var entries = TailLines(result.StdOut ?? string.Empty, count)
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        var entries = ReadLogTail(server, count)
             .Select((line, index) => new LogEntry(null, "log", line, index))
             .ToList();
 
@@ -543,6 +533,45 @@ try
         if (string.IsNullOrWhiteSpace(config.ServerDir))
             return "serverDir is required.";
         return null;
+    }
+
+    // Reads the last maxBytes of the server's log file and returns up to maxLines lines.
+    // Replaces "rustmgr logs" (cat of the whole file) for tail-style endpoints.
+    string[] ReadLogTail(string server, int maxLines, int maxBytes = 512 * 1024)
+    {
+        try
+        {
+            var cfg = LoadServerConfig(server);
+            if (cfg is null)
+                return Array.Empty<string>();
+
+            var path = GetServerLogPath(cfg);
+            if (!File.Exists(path))
+                return Array.Empty<string>();
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            var length = stream.Length;
+            var readBytes = (int)Math.Min(maxBytes, length);
+            stream.Seek(length - readBytes, SeekOrigin.Begin);
+            var buffer = new byte[readBytes];
+            var total = 0;
+            while (total < readBytes)
+            {
+                var n = stream.Read(buffer, total, readBytes - total);
+                if (n <= 0) break;
+                total += n;
+            }
+
+            var lines = Encoding.UTF8.GetString(buffer, 0, total)
+                .Replace("\r\n", "\n")
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var skipFirst = readBytes < length && lines.Length > 0 ? 1 : 0;
+            return lines.Skip(skipFirst).TakeLast(maxLines).ToArray();
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
     }
 
     string GetServerLogPath(ServerConfig config)
