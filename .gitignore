@@ -37,8 +37,31 @@ agentsettings.json
 botsettings.json
 OldProjectfiles/
 RusticalandOPS.zip
-.claude/worktrees/dreamy-brown-709393/
-.claude/worktrees/cranky-williamson-009cb6/
+.claude/
 Cotton.json
 ServerCommands.txt
 ServerVariables.txt
+
+# Instance-specific secrets — contains agent API keys / RCON credentials
+remote-servers.json
+*.bak-*
+
+# Server-runtime state pulled down from the live host — never source
+serverfiles/
+config/
+currconfigs/
+generated/
+logs/
+tasks/
+memory/*
+!memory/FEATURE_AUDIT.md
+.config/
+.local/
+.steam/
+
+# Native/published runtime artifacts sitting next to source
+**/Sentry/
+*.so
+api/web.config
+remote-agent/RustOpsRemoteAgent/RustOpsRemoteAgent
+remote-agent/RustOpsRemoteAgent/publish/

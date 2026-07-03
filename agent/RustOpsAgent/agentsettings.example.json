@@ -36,6 +36,24 @@
       "chunkMaxTokens": 1400,
       "nearDuplicateThreshold": 0.94
     },
+    "learning": {
+      "enabled": true,
+      "reinforceOnOutcome": true,
+      "successImportanceDelta": 0.03,
+      "successConfidenceDelta": 0.02,
+      "failureImportanceDelta": 0.04,
+      "maturationIntervalMinutes": 60,
+      "autoPromoteEnabled": true,
+      "autoPromoteMinConfidence": 0.75,
+      "autoPromoteMaxPerRun": 200,
+      "autoPromoteTypes": ["Fact", "ServerState", "PluginSummary", "Procedure"],
+      "decayUnusedEnabled": true,
+      "decayAfterDays": 21,
+      "decayImportanceStep": 0.04,
+      "decayMaxPerRun": 500,
+      "synthesizeProceduresEnabled": true,
+      "procedureMinFailureOccurrences": 3
+    },
     "embedding": {
       "provider": "openai-compatible",
       "baseUrl": "${RUSTOPS_EMBEDDING_BASE_URL}",

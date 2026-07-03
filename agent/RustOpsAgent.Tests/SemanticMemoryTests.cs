@@ -1308,6 +1308,8 @@ public class SemanticMemoryTests
         }
 
         public Task<int> PruneAsync(CancellationToken cancellationToken) => Task.FromResult(2);
+        public Task ReinforceRecalledMemoriesAsync(WorkflowMemoryContext? recall, bool success, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<MemoryMaturationReport> RunMaturationAsync(CancellationToken cancellationToken) => Task.FromResult(new MemoryMaturationReport());
     }
 
     private static HttpResponseMessage JsonResponse(string json) =>

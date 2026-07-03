@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Microsoft.AspNetCore.Http.Json;
+using Sentry;
 
 RustOpsEnv.LoadFromDefaultLocations();
 using var sentry = RustOpsSentry.Initialize("rustops-remote-agent");
@@ -27,6 +28,17 @@ try
         "RUSTOPS_REMOTE_AGENT_API_KEY",
         "RUSTMGR_API_KEY",
         "RUSTOPS_API_KEY") ?? "changeme";
+    if (apiKey == "changeme")
+    {
+        Console.Error.WriteLine(
+            "[remote-agent] SECURITY WARNING: no API key configured — running with the default key 'changeme'. " +
+            "Anyone who can reach this port has full RCON and lifecycle control of the servers. " +
+            "Set RUSTOPS_REMOTE_AGENT_API_KEY immediately.");
+        RustOpsSentry.CaptureMessage(
+            "Remote agent running with default API key.",
+            "startup",
+            SentryLevel.Warning);
+    }
     var rustMgrPath = Environment.GetEnvironmentVariable("RUSTMGR_PATH") ?? "/opt/rust-manager/rustmgr.sh";
     var configDir = Environment.GetEnvironmentVariable("RUSTMGR_CONFIG") ?? "/opt/rust-manager/config";
     var runtimeDir = Environment.GetEnvironmentVariable("RUSTMGR_RUNTIME") ?? "/opt/rust-manager/runtime";
@@ -51,8 +63,10 @@ try
             return;
         }
 
-        var supplied = ctx.Request.Headers["X-Api-Key"].FirstOrDefault();
-        if (!string.Equals(supplied, apiKey, StringComparison.Ordinal))
+        var supplied = ctx.Request.Headers["X-Api-Key"].FirstOrDefault() ?? string.Empty;
+        if (supplied.Length == 0 ||
+            !System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(supplied), Encoding.UTF8.GetBytes(apiKey)))
         {
             ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
             await ctx.Response.WriteAsJsonAsync(new ApiError("unauthorized", "Invalid remote agent API key."));
@@ -330,11 +344,14 @@ try
     app.MapGet("/servers/{server}/bans", async (string server) => await QueryJsonRconAsync(server, "bans"));
 
     app.MapPost("/servers/{server}/kick", async (string server, ModerationRequest request) =>
-        await ExecuteModerationAsync(server, $"kick {request.SteamId} \"{EscapeReason(request.Reason)}\""));
+        ValidateSteamId(request.SteamId) is { } err ? err
+            : await ExecuteModerationAsync(server, $"kick {request.SteamId} \"{EscapeReason(request.Reason)}\""));
     app.MapPost("/servers/{server}/ban", async (string server, ModerationRequest request) =>
-        await ExecuteModerationAsync(server, $"ban {request.SteamId} \"{EscapeReason(request.Reason)}\""));
+        ValidateSteamId(request.SteamId) is { } err ? err
+            : await ExecuteModerationAsync(server, $"ban {request.SteamId} \"{EscapeReason(request.Reason)}\""));
     app.MapPost("/servers/{server}/unban", async (string server, ModerationRequest request) =>
-        await ExecuteModerationAsync(server, $"unban {request.SteamId}"));
+        ValidateSteamId(request.SteamId) is { } err ? err
+            : await ExecuteModerationAsync(server, $"unban {request.SteamId}"));
 
     // -- Runtime meta -----------------------------------------------------------
     app.MapGet("/servers/{server}/meta", async (string server) =>
@@ -646,6 +663,13 @@ static IResult ToCommandResult(string server, string operation, CommandExecution
 
     return result.Ok ? Results.Ok(body) : Results.BadRequest(body);
 }
+
+// SteamIds are interpolated directly into RCON command strings — reject anything that
+// isn't a plain SteamID64 so a crafted request can't smuggle extra command text.
+static IResult? ValidateSteamId(string? steamId) =>
+    !string.IsNullOrWhiteSpace(steamId) && steamId.Length == 17 && steamId.All(char.IsDigit)
+        ? null
+        : Results.BadRequest(new ApiError("invalid_request", "steamId must be a 17-digit SteamID64."));
 
 static string? ValidateCommand(string? command)
 {
@@ -1288,25 +1312,26 @@ internal sealed class RustRcon : IAsyncDisposable
         _pending[id] = tcs;
 
         var payload = JsonSerializer.Serialize(new { Identifier = id, Message = command, Name = "WebRcon" });
-        await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            await _ws!.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
-        }
-        finally
-        {
-            _sendLock.Release();
-        }
+            await _sendLock.WaitAsync(cancellationToken);
+            try
+            {
+                await _ws!.SendAsync(Encoding.UTF8.GetBytes(payload), WebSocketMessageType.Text, true, cancellationToken);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-        using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
-        try
-        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+            using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
             return await tcs.Task;
         }
         finally
         {
+            // Remove even when the send throws, so failed sends can't leak pending entries.
             _pending.TryRemove(id, out _);
         }
     }

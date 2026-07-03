@@ -557,6 +557,31 @@ public class ModularArchitectureTests
         Assert.Equal("idle", svc.LastStatus.Phase);
     }
 
+    // ── Scheduler scope safety ──────────────────────────────────────────────────
+
+    [Fact]
+    public void ServerScopeResolver_Single_Scope_Not_Fanned_Out_By_Scheduling_Words()
+    {
+        // Regression: a daily-restart schedule stored "restart cotton each day at 3AM".
+        // The word "each" tripped the collective-all regex and fanned the restart out to
+        // every known server. An explicit Single scope with a known target must win.
+        var known = new[] { "cotton", "modded", "vanilla", "sandbox" };
+        var state = new ConversationSelectionState { AdminId = "admin" };
+
+        var scope = ServerScopeResolver.Resolve(
+            message: "[scheduled] restart cotton each day at 3AM",
+            knownServers: known,
+            state: state,
+            requestedScopeKind: ServerScopeKind.Single,
+            requestedServers: null,
+            requestedServer: "cotton",
+            allowPluralDefaultAll: false,
+            allowLastScopeFallback: true);
+
+        Assert.Equal(ServerScopeKind.Single, scope.ScopeKind);
+        Assert.Equal(new[] { "cotton" }, scope.Servers);
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private static string TempRoot()

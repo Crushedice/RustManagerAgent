@@ -49,6 +49,56 @@ internal sealed class MemorySettings
     [JsonPropertyName("minimumRecallConfidence")] public double MinimumRecallConfidence { get; set; } = 0.55;
     [JsonPropertyName("memoryImport")] public MemoryImportSettings MemoryImport { get; set; } = new();
     [JsonPropertyName("embedding")] public EmbeddingSettings Embedding { get; set; } = new();
+    [JsonPropertyName("learning")] public MemoryLearningSettings Learning { get; set; } = new();
+}
+
+// Controls the memory "maturation" loop that turns a write-only store into one that
+// actually learns: reinforcing memories that prove useful, verifying them, promoting
+// high-confidence Pending knowledge so it becomes recallable, and decaying never-used
+// noise so the store self-curates. Conservative defaults; every step is individually
+// gateable so the loop can be rolled out incrementally on a live agent.
+internal sealed class MemoryLearningSettings
+{
+    [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
+
+    // --- Reinforcement (runs inline on action outcomes, not on a timer) ---
+    // When an action succeeds, the memories that were recalled to plan/execute it are
+    // credited: importance/confidence nudged up and last_verified stamped. This is what
+    // makes importance reflect real usefulness instead of a static seed value.
+    [JsonPropertyName("reinforceOnOutcome")] public bool ReinforceOnOutcome { get; set; } = true;
+    [JsonPropertyName("successImportanceDelta")] public double SuccessImportanceDelta { get; set; } = 0.03;
+    [JsonPropertyName("successConfidenceDelta")] public double SuccessConfidenceDelta { get; set; } = 0.02;
+    // On failure, a memory that *warned* of the failure (Failure/Exception/Procedure) is
+    // worth surfacing more, so its importance is nudged up; confidence is left untouched.
+    [JsonPropertyName("failureImportanceDelta")] public double FailureImportanceDelta { get; set; } = 0.04;
+
+    // --- Maturation pass (runs on a timer in the background loop) ---
+    [JsonPropertyName("maturationIntervalMinutes")] public int MaturationIntervalMinutes { get; set; } = 60;
+
+    // Promote Pending -> Active for trusted record types once confidence clears the bar,
+    // unlocking seeded/observed knowledge that recall otherwise never sees.
+    [JsonPropertyName("autoPromoteEnabled")] public bool AutoPromoteEnabled { get; set; } = true;
+    // 0.75 deliberately includes the trusted seeded reference corpus (ServerVariables /
+    // ServerCommands catalog), which imports at confidence 0.75 and is otherwise stuck Pending
+    // and invisible to recall. The per-run cap promotes it gradually rather than all at once.
+    [JsonPropertyName("autoPromoteMinConfidence")] public double AutoPromoteMinConfidence { get; set; } = 0.75;
+    [JsonPropertyName("autoPromoteMaxPerRun")] public int AutoPromoteMaxPerRun { get; set; } = 200;
+    [JsonPropertyName("autoPromoteTypes")] public List<string> AutoPromoteTypes { get; set; } = new()
+    {
+        "Fact", "ServerState", "PluginSummary", "Procedure"
+    };
+
+    // Decay importance of records that have never been recalled and have aged past the
+    // window, so persistent noise eventually falls below the prune floor on its own.
+    [JsonPropertyName("decayUnusedEnabled")] public bool DecayUnusedEnabled { get; set; } = true;
+    [JsonPropertyName("decayAfterDays")] public int DecayAfterDays { get; set; } = 21;
+    [JsonPropertyName("decayImportanceStep")] public double DecayImportanceStep { get; set; } = 0.04;
+    [JsonPropertyName("decayMaxPerRun")] public int DecayMaxPerRun { get; set; } = 500;
+
+    // Failure -> Procedure synthesis: when a recurring failure has later been resolved by a
+    // successful action on the same target, distil a durable "when X fails, do Y" procedure.
+    [JsonPropertyName("synthesizeProceduresEnabled")] public bool SynthesizeProceduresEnabled { get; set; } = true;
+    [JsonPropertyName("procedureMinFailureOccurrences")] public int ProcedureMinFailureOccurrences { get; set; } = 3;
 }
 
 internal sealed class MemoryImportSettings
@@ -164,6 +214,12 @@ internal sealed class ConsoleMonitorSettings
     [JsonPropertyName("enabled")] public bool Enabled { get; set; } = true;
     [JsonPropertyName("errorEscalationThreshold")] public int ErrorEscalationThreshold { get; set; } = 10;
     [JsonPropertyName("repeatThreshold")] public int RepeatThreshold { get; set; } = 5;
+    // After alerting a given error signature, stay quiet about that same signature for this many
+    // hours unless it materially changes — stops the agent re-broadcasting identical known errors.
+    [JsonPropertyName("alertReissueHours")] public double AlertReissueHours { get; set; } = 6.0;
+    // Re-alert a still-suppressed signature early if the error count spikes by at least this factor
+    // versus the last time it was alerted (a real escalation, not just steady background noise).
+    [JsonPropertyName("alertSpikeFactor")] public double AlertSpikeFactor { get; set; } = 3.0;
     [JsonPropertyName("sentimentAnalysisIntervalMinutes")] public int SentimentAnalysisIntervalMinutes { get; set; } = 30;
     [JsonPropertyName("maxChatMessages")] public int MaxChatMessages { get; set; } = 2000;
     [JsonPropertyName("maxConsoleErrors")] public int MaxConsoleErrors { get; set; } = 500;
@@ -200,6 +256,11 @@ internal sealed class StandInAdminSettings
     [JsonPropertyName("maxResponsesPerMinute")] public int MaxResponsesPerMinute { get; set; } = 3;
     [JsonPropertyName("allowedServers")] public List<string> AllowedServers { get; set; } = new();
     [JsonPropertyName("systemPrompt")] public string? SystemPrompt { get; set; }
+
+    // When enabled, the stand-in admin runs a keyless web lookup (DuckDuckGo) for player questions
+    // and injects the findings into the prompt before answering. Off by default — it gives a
+    // player-facing service outbound internet, so opt in deliberately.
+    [JsonPropertyName("webLookupEnabled")] public bool WebLookupEnabled { get; set; }
 }
 
 internal sealed class LlmSettings

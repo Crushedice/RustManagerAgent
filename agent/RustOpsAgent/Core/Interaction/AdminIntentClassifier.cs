@@ -230,7 +230,8 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "══ INTENT VALUES ══\n" +
         "chat              General conversation, questions about the agent, git/build/code operations\n" +
         "server_control    Rust game server lifecycle ONLY: start, stop, restart, kill, update, wipe\n" +
-        "player_lookup     Player lists, ban lists, kick queries\n" +
+        "player_lookup     Player lists, ban lists, kick queries (READ-ONLY, per server)\n" +
+        "player_moderation Unban a player (state-mutating). Works on one server OR all servers (\"unban X everywhere\")\n" +
         "rcon_command      Live RCON commands sent to a running server; server convars get/set/explain\n" +
         "file_edit         Read or edit rustmgr JSON config files; query or change a config file key\n" +
         "status_check      Server health, online/offline, network interfaces, logs overview\n" +
@@ -243,7 +244,7 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "══ TARGETREF VALUES ══\n" +
         "rust.server.control   rust.player.lookup    rust.rcon.command    rust.file.edit\n" +
         "rust.status.check     rust.logs.inspect     rust.plugins.verify  rust.network.inspect\n" +
-        "rust.chat.reply       rust.server.management  rust.player.forced  web.search\n" +
+        "rust.chat.reply       rust.server.management  rust.player.forced  rust.player.moderation  web.search\n" +
         "rust.schedule.task    rust.schedule.management\n\n" +
         "══ SLOTS ══\n" +
         "serverName   string  – single server (match from Known servers list when possible)\n" +
@@ -384,6 +385,10 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
         "  -> intent=player_forced_management, targetRef=rust.player.forced, slots.playerName=\"hophop\"\n\n" +
         "\"is hophop forced?\" / \"check force status of 76561199645683644\"\n" +
         "  -> intent=player_forced_management, targetRef=rust.player.forced, slots.playerName=\"hophop\"\n\n" +
+        "\"unban hophop on cotton\" / \"lift the ban on 76561199645683644 on cotton\"\n" +
+        "  -> intent=player_moderation, targetRef=rust.player.moderation, slots.playerName=\"hophop\", slots.serverName=\"cotton\"\n\n" +
+        "\"unban hophop on all servers\" / \"unban 76561199645683644 everywhere\"\n" +
+        "  -> intent=player_moderation, targetRef=rust.player.moderation, slots.playerName=\"hophop\", slots.scopeKind=\"all\"\n\n" +
         "\"set mapsize to 4500 on monthly\"\n" +
         "  -> intent=file_edit, targetRef=rust.file.edit, slots.configKey=\"server.worldsize\", slots.configValue=\"4500\", slots.serverName=\"monthly\"\n\n" +
         "\"wipe monthly\"\n" +
@@ -570,6 +575,10 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             return AdminIntentType.Troubleshooting;
         if (lowered.Contains("restart") || lowered.Contains("wipe") || IsLifecycleVerb(lowered))
             return AdminIntentType.ServerControl;
+        // "unban" must be checked before the generic "ban" → player_lookup rule below, since
+        // "unban" contains "ban". Unban mutates state and can target all servers; lookup can't.
+        if (LooksLikeModerationIntent(lowered))
+            return AdminIntentType.PlayerModeration;
         if (lowered.Contains("player") || lowered.Contains("ban"))
             return AdminIntentType.PlayerLookup;
         if (lowered.Contains("rcon") || lowered.Contains("command") || lowered.Contains("say ") || lowered.Contains("global."))
@@ -614,6 +623,14 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
             lowered.StartsWith("resume schedule") || lowered.StartsWith("delete schedule"))
             return true;
         return false;
+    }
+
+    // Detects unban requests (state-mutating moderation) so they route to player_moderation
+    // instead of player_lookup. Deliberately narrow: only "unban"/"remove|lift|revoke ban"/"pardon".
+    private static bool LooksLikeModerationIntent(string lowered)
+    {
+        return Regex.IsMatch(lowered,
+            @"\b(?:unban|un-ban|remove\s+(?:the\s+)?ban|lift\s+(?:the\s+)?ban|revoke\s+(?:the\s+)?ban|pardon)\b");
     }
 
     private static bool LooksLikeForcedListIntent(string lowered)
@@ -1032,7 +1049,11 @@ internal sealed class AdminIntentClassifier : IIntentClassifier
                 stepTargetRef));
         }
 
-        return list.Count > 1 ? list : null; // a single step is just the top-level route
+        // Keep single steps too: schedule_task carries its (often single) action in steps[],
+        // and the scheduler handler needs that step to know what to run at fire time. Multi-step
+        // *execution* is gated separately in ActionExecutor (Count > 1), so a lone step here never
+        // double-runs a normal one-off route — it just stays available to the scheduler.
+        return list.Count > 0 ? list : null;
     }
 
     private static AdminIntentType ParseIntent(string value) => value.ToLowerInvariant() switch

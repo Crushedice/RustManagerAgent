@@ -80,7 +80,7 @@ internal sealed class OpsSteamBot
     private readonly HashSet<ulong> _admins;
     private readonly Dictionary<string, int> _outboxFailureCounts = new(StringComparer.OrdinalIgnoreCase);
     private string? _authCode;
-    private bool _isRunning;
+    private volatile bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
     private int _pendingChats;
     private EPersonaState _currentPersonaState = EPersonaState.Offline;
@@ -355,11 +355,15 @@ internal sealed class OpsSteamBot
 
     private IEnumerable<ulong> ResolveTargets(AdapterMessage message)
     {
-        if (!string.IsNullOrWhiteSpace(message.TargetAdminId) &&
-            ulong.TryParse(message.TargetAdminId, out var targetAdminId) &&
-            _admins.Contains(targetAdminId))
+        if (!string.IsNullOrWhiteSpace(message.TargetAdminId))
         {
-            return new[] { targetAdminId };
+            if (ulong.TryParse(message.TargetAdminId, out var targetAdminId) && _admins.Contains(targetAdminId))
+                return new[] { targetAdminId };
+
+            // A targeted message whose recipient is unknown/not an admin must NOT fall back
+            // to broadcasting a potentially private reply to every admin.
+            Console.Error.WriteLine($"Dropping outbox message targeted at unknown admin '{message.TargetAdminId}'.");
+            return Array.Empty<ulong>();
         }
 
         return _admins;

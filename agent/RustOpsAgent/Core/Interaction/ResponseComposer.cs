@@ -52,21 +52,6 @@ internal sealed class ResponseComposer : IResponseComposer
         if (!string.IsNullOrWhiteSpace(payloadPreview) && payloadPreview.Length > 1200)
             payloadPreview = payloadPreview[..1200];
 
-        // If the LLM is disabled or unavailable, fall back to the tool's own message verbatim.
-        // Otherwise we let the LLM rephrase ALL outcomes (success, failure, mutated) — gated by a
-        // strict "ground-truth" prompt below that forbids inventing facts. This is what makes the
-        // agent feel like a conversation partner instead of a hardcoded status board.
-        if (_kernel is null || !_settings.Enabled)
-        {
-            var fallback = ComposeFallback(result);
-            return new ComposedReply(
-                fallback,
-                "response-compose-fallback",
-                false, false,
-                !_settings.Enabled ? "template_llm_disabled" : "template_no_kernel",
-                fallback);
-        }
-
         // Special-case: pure mutated action with empty payload and a trivial tool message — keep
         // the template so admins get deterministic confirmations on critical ops (start/stop/wipe).
         // Heuristic: tool message is short and looks like a status confirmation.
@@ -85,6 +70,8 @@ internal sealed class ResponseComposer : IResponseComposer
         }
 
         // For success+no-payload, we have nothing for the LLM to enrich. Echo the tool message.
+        // Checked before the LLM-availability fallback so the deterministic template applies
+        // regardless of whether an LLM is configured.
         if (result.Success && result.Payload is null && string.IsNullOrWhiteSpace(payloadPreview))
         {
             var message = string.IsNullOrWhiteSpace(result.Message)
@@ -98,7 +85,22 @@ internal sealed class ResponseComposer : IResponseComposer
                 message.Length > 180 ? message[..180] : message);
         }
 
-        var conversationHistory = BuildConversationHistory(context.SelectionState);
+        // If the LLM is disabled or unavailable, fall back to the tool's own message verbatim.
+        // Otherwise we let the LLM rephrase ALL outcomes (success, failure, mutated) — gated by a
+        // strict "ground-truth" prompt below that forbids inventing facts. This is what makes the
+        // agent feel like a conversation partner instead of a hardcoded status board.
+        if (_kernel is null || !_settings.Enabled)
+        {
+            var fallback = ComposeFallback(result);
+            return new ComposedReply(
+                fallback,
+                "response-compose-fallback",
+                false, false,
+                !_settings.Enabled ? "template_llm_disabled" : "template_no_kernel",
+                fallback);
+        }
+
+        var conversationHistory = BuildConversationHistory(context.SelectionState, context.UtcNow);
         var memoryContext = BuildMemoryContext(context);
         var systemPrompt = BuildSystemPrompt();
 
@@ -116,7 +118,7 @@ Agent capabilities — use these when framing your reply or suggesting relevant 
 - Player lookup, config file editing, status & logs, plugin troubleshooting, server management
 - Memory recall, web search, scheduled/recurring tasks
 
-Operational context (THIS is your ground truth — do NOT contradict, embellish, or fabricate):
+Operational context: (THIS is your ground truth — do NOT contradict, embellish, or fabricate)
 - Admin said: "{{context.Message}}"
 - Detected intent: {{context.Route.Intent}}
 - Server targeted: {{result.SelectedServer ?? context.Route.Slots.ServerName ?? "none"}}
@@ -128,7 +130,8 @@ Operational context (THIS is your ground truth — do NOT contradict, embellish,
 
 Reply to the admin in 1–3 short sentences (longer ONLY when listing data the admin clearly asked for).
 Rules — VIOLATING ANY OF THESE BREAKS THE SYSTEM:
-- NEVER use future tense ("I will", "I'll", "let me check"). Past/present only.
+- Respond ONLY to the CURRENT request in "Operational context" above. The "Recent conversation" is prior background — NEVER answer, continue, or repeat a question or request from it.
+- DO NOT use future tense ("I will", "I'll", "let me check"). Past/present only.
 - NEVER invent server names, file paths, plugin names, players, counts, or config values not in the context above.
 - NEVER claim something succeeded if outcome says FAILED, and vice versa.
 - If the action failed, say what failed in plain language and suggest one concrete next step.
@@ -191,13 +194,25 @@ When something works, confirm it clearly and note anything worth watching.
 """ + "\n\n" + criticalRules;
     }
 
-    private static string BuildConversationHistory(ConversationSelectionState state)
+    // Conversation history is BACKGROUND ONLY. Anything older than this window is dropped so a
+    // stale turn (e.g. a clarification asked yesterday) cannot bleed into — and be answered by —
+    // the reply to the current request. This is the root of the "answers the previous question" bug.
+    private static readonly TimeSpan ConversationHistoryWindow = TimeSpan.FromMinutes(15);
+
+    private static string BuildConversationHistory(ConversationSelectionState state, DateTime nowUtc)
     {
-        if (state.RecentMessages.Count == 0)
+        // Messages without a timestamp (legacy persisted state, or callers that don't stamp
+        // AtUtc) must be treated as recent — otherwise the window filter silently drops the
+        // ENTIRE history and the composer loses all conversational continuity.
+        var recent = state.RecentMessages
+            .Where(m => m.AtUtc == default || nowUtc - m.AtUtc <= ConversationHistoryWindow)
+            .TakeLast(10)
+            .ToList();
+        if (recent.Count == 0)
             return string.Empty;
 
-        var sb = new StringBuilder("Recent conversation:\n");
-        foreach (var msg in state.RecentMessages.TakeLast(10))
+        var sb = new StringBuilder("Recent conversation (BACKGROUND for tone/continuity only — do NOT answer any question or request from it):\n");
+        foreach (var msg in recent)
         {
             var label = msg.Role == "assistant" ? "RustOps" : "Admin";
             sb.AppendLine($"[{label}]: {msg.Text}");

@@ -30,4 +30,16 @@ internal sealed class NullMemoryStore : IInspectableMemoryStore
 
     public Task<bool> ExistsByContentHashAsync(string contentHash, CancellationToken cancellationToken) =>
         Task.FromResult(false);
+
+    public Task<bool> ReinforceAsync(
+        string id, double importanceDelta, double confidenceDelta, bool markVerified, CancellationToken cancellationToken) =>
+        Task.FromResult(false);
+
+    public Task<int> PromotePendingAsync(
+        IReadOnlyCollection<MemoryRecordType> types, double minConfidence, int maxToPromote, CancellationToken cancellationToken) =>
+        Task.FromResult(0);
+
+    public Task<int> DecayUnusedAsync(
+        double importanceStep, int olderThanDays, int maxToDecay, CancellationToken cancellationToken) =>
+        Task.FromResult(0);
 }

@@ -188,6 +188,15 @@ internal sealed class RustServerControlToolHandler : IToolHandler
     private const int DefaultRestartCountdownSeconds = 120;
     private const int DefaultStopCountdownSeconds = 60;
 
+    // Server updates run steamcmd on the API side for up to ~25 minutes. Give the HTTP call a
+    // budget comfortably above that so the agent waits for completion instead of timing out at
+    // the 20s default that fits short control calls.
+    private static readonly TimeSpan UpdateRequestTimeout = TimeSpan.FromMinutes(30);
+
+    // Per-operation HTTP budget: updates need the long budget, everything else uses the default.
+    private static TimeSpan? TimeoutForEndpoint(string endpoint) =>
+        endpoint.EndsWith("/update", StringComparison.Ordinal) ? UpdateRequestTimeout : null;
+
     private readonly RustOpsApiClient _api;
     private readonly Action<string, string, string?>? _notifyAdmin; // (adminId, message, serverName)
     private readonly ISemanticMemoryService? _semanticMemory;
@@ -204,7 +213,15 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 
     public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
     {
-        var message = context.Message.ToLowerInvariant();
+        // Determine the lifecycle action from the classified commandText slot first; fall back to
+        // scanning the raw admin message. This matters for sequenced/scheduled steps: every step in
+        // a sequence inherits the SAME parent context.Message, so the only reliable per-step verb is
+        // the step's own commandText slot (e.g. a "start" step in a wipe sequence, or the start phase
+        // of a scheduled restart). Without this, those steps mis-resolve to the parent sentence's verb.
+        var slotAction = context.Route.Slots.CommandText;
+        var message = !string.IsNullOrWhiteSpace(slotAction)
+            ? slotAction.ToLowerInvariant()
+            : context.Message.ToLowerInvariant();
 
         // If admin is answering our pending restart-countdown clarification ("60", "300 seconds", "5 min"),
         // reconstruct the full restart intent from conversation state instead of falling through to /start.
@@ -258,7 +275,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
 
         try
         {
-            using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken);
+            using var response = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(server)), new { }, cancellationToken, TimeoutForEndpoint(endpoint));
             var action = endpoint.Split('/').Last();
             if (_semanticMemory is not null)
             {
@@ -274,7 +291,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         catch (Exception ex)
         {
             var action = endpoint.Split('/').Last();
-            return new ToolExecutionResult(false, $"Failed to {action} {server}: {ex.Message}", server, false, "api_error",
+            return new ToolExecutionResult(false, $"Couldn't {action} {HumanizeApiError(server, ex)}.", server, false, "api_error",
                 SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
         }
     }
@@ -317,12 +334,12 @@ internal sealed class RustServerControlToolHandler : IToolHandler
         {
             try
             {
-                using var _ = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(s)), new { }, cancellationToken);
+                using var _ = await _api.PostAsync(endpoint.Replace("{server}", Uri.EscapeDataString(s)), new { }, cancellationToken, TimeoutForEndpoint(endpoint));
                 successes.Add(s);
             }
             catch (Exception ex)
             {
-                failures.Add($"{s} ({ex.Message})");
+                failures.Add(HumanizeApiError(s, ex));
             }
         }
 
@@ -459,7 +476,7 @@ internal sealed class RustServerControlToolHandler : IToolHandler
             }
             catch (Exception ex)
             {
-                return new ToolExecutionResult(false, $"Failed to stop {server}: {ex.Message}", server, false, "api_error",
+                return new ToolExecutionResult(false, $"Couldn't stop {HumanizeApiError(server, ex)}.", server, false, "api_error",
                     SelectedServers: new[] { server }, ScopeKind: ServerScopeKind.Single);
             }
         }
@@ -582,6 +599,38 @@ internal sealed class RustServerControlToolHandler : IToolHandler
             return secs;
 
         return null;
+    }
+
+    // Turns RustOpsApiClient's raw "API POST /servers/x/kill failed: 400 Bad Request {json}"
+    // exceptions into something an admin can act on, instead of leaking endpoints, HTTP status
+    // codes, and JSON bodies into chat. Always prefixed with the server name.
+    internal static string HumanizeApiError(string server, Exception ex)
+    {
+        var raw = ex.Message ?? string.Empty;
+
+        if (ex is TimeoutException || raw.Contains("timed out", StringComparison.OrdinalIgnoreCase))
+            return $"{server}: timed out before the server responded";
+
+        if (raw.Contains("remote_server", StringComparison.OrdinalIgnoreCase) ||
+            raw.Contains("remote agent", StringComparison.OrdinalIgnoreCase))
+            return $"{server}: remote server — its remote agent isn't reachable";
+
+        // Prefer a JSON "message" field from the API error body.
+        var jsonMessage = Regex.Match(raw, "\"message\"\\s*:\\s*\"(?<m>[^\"]+)\"", RegexOptions.IgnoreCase);
+        if (jsonMessage.Success)
+            return $"{server}: {jsonMessage.Groups["m"].Value.Trim()}";
+
+        // Otherwise strip the "API <VERB> /path failed: <status>" prefix and any JSON tail.
+        var idx = raw.IndexOf("failed:", StringComparison.OrdinalIgnoreCase);
+        var tail = idx >= 0 ? raw[(idx + "failed:".Length)..].Trim() : raw;
+        var brace = tail.IndexOf('{');
+        if (brace >= 0)
+            tail = tail[..brace].Trim();
+        tail = Regex.Replace(tail, @"^\d{3}\s+", string.Empty).Trim(); // drop leading "400 "
+        if (string.IsNullOrWhiteSpace(tail))
+            return $"{server}: the server rejected the operation";
+
+        return $"{server}: {(tail.Length > 140 ? tail[..140] : tail)}";
     }
 
     // Returns null when the message doesn't match a known operation — caller must handle.
@@ -1275,6 +1324,129 @@ internal sealed class RustPlayerLookupToolHandler : IToolHandler
         return start >= 0 && end > start
             ? reply[start..(end + 1)]
             : null;
+    }
+}
+
+// Executes player moderation that ISN'T tied to inspecting one server's roster. Today that's
+// unban: a ban removal which the admin legitimately wants to apply either on one server or
+// across all of them ("unban X everywhere"). Unlike player_lookup this asks "which server,
+// or all?" rather than silently demanding a single server, and it actually mutates state.
+internal sealed class RustPlayerModerationToolHandler : IToolHandler
+{
+    private readonly RustOpsApiClient _api;
+    private readonly PlayerStore _playerStore;
+
+    private static readonly Regex SteamIdRegex = new(@"\b7656\d{13}\b", RegexOptions.Compiled);
+    private static readonly Regex UnbanRegex = new(
+        @"\b(?:unban|un-ban|remove\s+(?:the\s+)?ban|lift\s+(?:the\s+)?ban|pardon|revoke\s+(?:the\s+)?ban)\b",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    public RustPlayerModerationToolHandler(RustOpsApiClient api, PlayerStore playerStore)
+    {
+        _api = api;
+        _playerStore = playerStore;
+    }
+
+    public string Name => "rust.player.moderation";
+    public IReadOnlyCollection<AdminIntentType> EligibleIntents => new[] { AdminIntentType.PlayerModeration };
+
+    public async Task<ToolExecutionResult> ExecuteAsync(ToolExecutionContext context, CancellationToken cancellationToken)
+    {
+        var message = context.Message ?? string.Empty;
+
+        // Only unban is wired up so far; ban/kick can be added the same way once desired.
+        if (!UnbanRegex.IsMatch(message))
+        {
+            return new ToolExecutionResult(
+                false,
+                "I can unban a player on one server or across all of them. Try \"unban <player> on cotton\" or \"unban <player> on all servers\".",
+                null, false, "clarification_required");
+        }
+
+        var steamId = ResolveSteamId(message, context.Route.Slots.PlayerName);
+        if (steamId is null)
+        {
+            return new ToolExecutionResult(
+                false,
+                "Which player should I unban? Give me a steamid (17 digits, starts with 7656) or a name I've seen before.",
+                null, false, "clarification_required");
+        }
+
+        var knownServers = await RustToolHelper.GetKnownServersAsync(_api, cancellationToken);
+        // allowPluralDefaultAll:false → a bare "unban X" still asks which server, but "all servers"
+        // / "everywhere" resolves to every server, which is exactly the behaviour the admin wants.
+        var scope = RustToolHelper.ResolveServerScope(context, knownServers, allowPluralDefaultAll: false);
+        if (scope.Servers.Count == 0)
+        {
+            return new ToolExecutionResult(
+                false,
+                $"Which server should I unban {DisplayName(steamId)} on? Name one, or say \"all servers\".",
+                null, false, "clarification_required",
+                SelectedServers: context.SelectionState.LastResolvedServers,
+                ScopeKind: ServerScopeKind.Unspecified);
+        }
+
+        var successes = new List<string>();
+        var failures = new List<string>();
+        foreach (var server in scope.Servers)
+        {
+            try
+            {
+                using var _ = await _api.PostAsync(
+                    $"/servers/{Uri.EscapeDataString(server)}/unban", new { steamId }, cancellationToken);
+                successes.Add(server);
+            }
+            catch (Exception ex)
+            {
+                failures.Add(RustServerControlToolHandler.HumanizeApiError(server, ex));
+            }
+        }
+
+        var who = DisplayName(steamId);
+        var single = scope.Servers.Count == 1;
+        if (failures.Count == 0)
+        {
+            var where = single ? successes[0] : $"all {successes.Count} servers ({string.Join(", ", successes)})";
+            return new ToolExecutionResult(true, $"Unbanned {who} on {where}.", single ? successes[0] : null, true,
+                SelectedServers: successes, ScopeKind: single ? ServerScopeKind.Single : ServerScopeKind.All);
+        }
+
+        var summary = successes.Count == 0
+            ? $"Couldn't unban {who}: {string.Join("; ", failures)}."
+            : $"Unbanned {who} on {successes.Count}/{scope.Servers.Count}: {string.Join(", ", successes)}. Failed: {string.Join("; ", failures)}.";
+        return new ToolExecutionResult(successes.Count > 0, summary, null, successes.Count > 0,
+            SelectedServers: successes, ScopeKind: ServerScopeKind.Subset);
+    }
+
+    private string? ResolveSteamId(string message, string? slotPlayerName)
+    {
+        var sidMatch = SteamIdRegex.Match(message);
+        if (sidMatch.Success) return sidMatch.Value;
+
+        if (!string.IsNullOrWhiteSpace(slotPlayerName))
+        {
+            var trimmed = slotPlayerName.Trim();
+            if (trimmed.Length == 17 && trimmed.StartsWith("7656", StringComparison.Ordinal) && trimmed.All(char.IsDigit))
+                return trimmed;
+            var bySlot = ResolveNameToSteamId(trimmed);
+            if (bySlot is not null) return bySlot;
+        }
+
+        return null;
+    }
+
+    private string? ResolveNameToSteamId(string name)
+    {
+        var roster = _playerStore.GetDisplayNamesBySteamId(5000);
+        var exact = roster.FirstOrDefault(kv => string.Equals(kv.Value, name, StringComparison.OrdinalIgnoreCase));
+        return string.IsNullOrEmpty(exact.Key) ? null : exact.Key;
+    }
+
+    private string DisplayName(string? steamId)
+    {
+        if (string.IsNullOrWhiteSpace(steamId)) return "that player";
+        var name = _playerStore.Get(steamId)?.DisplayName;
+        return string.IsNullOrWhiteSpace(name) ? steamId : $"{name} ({steamId})";
     }
 }
 

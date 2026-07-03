@@ -66,6 +66,16 @@ internal static class ServerScopeResolver
 
         requested = Canonicalize(requested, canonicalKnownServers).ToList();
         var correctionFollowUp = IsCorrectionFollowUp(loweredMessage);
+
+        // A structured single-server scope with a concrete, known target wins over any
+        // collective-all word found in the free-text message. This guards scheduled tasks
+        // (whose stored phrasing may contain "each day"/"every Friday") and any other caller
+        // that supplies an explicit Single scope from a slot rather than the sentence itself.
+        if (requestedScopeKind == ServerScopeKind.Single && requested.Count == 1)
+        {
+            return new ScopeResolution(ServerScopeKind.Single, requested, false);
+        }
+
         var explicitAll = requestedScopeKind == ServerScopeKind.All || ContainsCollectiveAll(loweredMessage);
 
         if (explicitAll)

@@ -60,6 +60,11 @@ internal sealed class PersistentRconSession : IAsyncDisposable
             {
                 return await _client!.SendCommandAsync(command, cancellationToken);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Caller cancelled — do not tear down a healthy connection or retry.
+                throw;
+            }
             catch (Exception ex)
             {
                 RustOpsSentry.AddBreadcrumb(

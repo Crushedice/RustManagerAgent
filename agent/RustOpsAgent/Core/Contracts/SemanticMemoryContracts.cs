@@ -308,6 +308,38 @@ internal interface IInspectableMemoryStore : IMemoryStore
     Task<IReadOnlyList<MemoryRecord>> ListByApprovalStateAsync(MemoryApprovalState approvalState, int maxResults, CancellationToken cancellationToken);
     Task<IReadOnlyList<MemoryRecord>> GetAllAsync(CancellationToken cancellationToken);
     Task<bool> ExistsByContentHashAsync(string contentHash, CancellationToken cancellationToken);
+
+    // --- Learning primitives ---
+
+    // Adjust a single record's importance/confidence (clamped to [0,1]) and optionally stamp
+    // last_verified_utc. Returns true if the record existed. Used for outcome reinforcement.
+    Task<bool> ReinforceAsync(
+        string id, double importanceDelta, double confidenceDelta, bool markVerified, CancellationToken cancellationToken);
+
+    // Batch-promote Pending records to Active for the given types when confidence >= minConfidence.
+    // Returns the number promoted.
+    Task<int> PromotePendingAsync(
+        IReadOnlyCollection<MemoryRecordType> types, double minConfidence, int maxToPromote, CancellationToken cancellationToken);
+
+    // Batch-decay importance of records that have never been accessed and have aged past
+    // olderThanDays. Returns the number decayed.
+    Task<int> DecayUnusedAsync(
+        double importanceStep, int olderThanDays, int maxToDecay, CancellationToken cancellationToken);
+}
+
+// Outcome of one run of the memory maturation loop — surfaced in logs so the learning
+// behaviour is observable over time.
+internal sealed class MemoryMaturationReport
+{
+    public bool Ran { get; set; }
+    public int Promoted { get; set; }
+    public int Decayed { get; set; }
+    public int ProceduresSynthesized { get; set; }
+
+    public bool HasActivity => Promoted > 0 || Decayed > 0 || ProceduresSynthesized > 0;
+
+    public override string ToString() =>
+        $"promoted={Promoted} decayed={Decayed} proceduresSynthesized={ProceduresSynthesized}";
 }
 
 internal interface IEmbeddingProvider
@@ -367,6 +399,14 @@ internal interface ISemanticMemoryService
     Task<int> RebuildEmbeddingsAsync(CancellationToken cancellationToken);
     Task<MemoryMigrationReport> MigrateLegacyMemoryAsync(bool dryRun, CancellationToken cancellationToken);
     Task<int> PruneAsync(CancellationToken cancellationToken);
+
+    // Credit the memories that were recalled for an action once its outcome is known, so
+    // importance/confidence track real usefulness and useful memories get verified.
+    Task ReinforceRecalledMemoriesAsync(WorkflowMemoryContext? recall, bool success, CancellationToken cancellationToken);
+
+    // Periodic learning pass: promote high-confidence Pending knowledge, decay unused noise,
+    // and distil recurring-failure-then-fix patterns into durable procedures.
+    Task<MemoryMaturationReport> RunMaturationAsync(CancellationToken cancellationToken);
 }
 
 internal interface IMemoryImportService

@@ -231,6 +231,104 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    public async Task<bool> ReinforceAsync(
+        string id, double importanceDelta, double confidenceDelta, bool markVerified, CancellationToken cancellationToken)
+    {
+        await using var connection = OpenConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        // Clamp in SQL so reinforcement can never push importance/confidence outside [0,1].
+        command.CommandText =
+            """
+            UPDATE memory_records
+            SET importance = MAX(0.0, MIN(1.0, importance + $importance_delta)),
+                confidence = MAX(0.0, MIN(1.0, confidence + $confidence_delta)),
+                last_verified_utc = CASE WHEN $mark_verified = 1 THEN $now ELSE last_verified_utc END,
+                updated_at_utc = $now
+            WHERE id = $id;
+            """;
+        command.Parameters.AddWithValue("$id", id);
+        command.Parameters.AddWithValue("$importance_delta", importanceDelta);
+        command.Parameters.AddWithValue("$confidence_delta", confidenceDelta);
+        command.Parameters.AddWithValue("$mark_verified", markVerified ? 1 : 0);
+        command.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
+        return await command.ExecuteNonQueryAsync(cancellationToken) > 0;
+    }
+
+    public async Task<int> PromotePendingAsync(
+        IReadOnlyCollection<MemoryRecordType> types, double minConfidence, int maxToPromote, CancellationToken cancellationToken)
+    {
+        if (types.Count == 0 || maxToPromote <= 0)
+            return 0;
+
+        await using var connection = OpenConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+
+        var typeParams = new List<string>();
+        var i = 0;
+        foreach (var type in types)
+        {
+            var name = $"$type{i++}";
+            typeParams.Add(name);
+            command.Parameters.AddWithValue(name, type.ToString());
+        }
+
+        // Stamp a verification time and an audit reason in metadata so a promoted record is
+        // distinguishable from a manually-approved one. Confidence/importance are unchanged.
+        command.CommandText =
+            $"""
+            UPDATE memory_records
+            SET approval_state = 'Active',
+                last_verified_utc = $now,
+                updated_at_utc = $now
+            WHERE id IN (
+                SELECT id FROM memory_records
+                WHERE approval_state = 'Pending'
+                  AND confidence >= $min_confidence
+                  AND type IN ({string.Join(", ", typeParams)})
+                  AND (expiry_utc IS NULL OR expiry_utc > $now)
+                ORDER BY confidence DESC, importance DESC
+                LIMIT $limit
+            );
+            """;
+        command.Parameters.AddWithValue("$now", DateTime.UtcNow.ToString("O"));
+        command.Parameters.AddWithValue("$min_confidence", minConfidence);
+        command.Parameters.AddWithValue("$limit", maxToPromote);
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    public async Task<int> DecayUnusedAsync(
+        double importanceStep, int olderThanDays, int maxToDecay, CancellationToken cancellationToken)
+    {
+        if (importanceStep <= 0 || maxToDecay <= 0)
+            return 0;
+
+        await using var connection = OpenConnection();
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        // Only touch records that have never been recalled and have aged past the window.
+        // Importance floors at 0 (CompactOrPrune later removes the truly dead ones).
+        command.CommandText =
+            """
+            UPDATE memory_records
+            SET importance = MAX(0.0, importance - $step),
+                updated_at_utc = updated_at_utc
+            WHERE id IN (
+                SELECT id FROM memory_records
+                WHERE access_count = 0
+                  AND importance > 0.0
+                  AND created_at_utc < $cutoff
+                ORDER BY created_at_utc ASC
+                LIMIT $limit
+            );
+            """;
+        command.Parameters.AddWithValue("$step", importanceStep);
+        command.Parameters.AddWithValue("$cutoff", DateTime.UtcNow.AddDays(-Math.Max(0, olderThanDays)).ToString("O"));
+        command.Parameters.AddWithValue("$limit", maxToDecay);
+        return await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     public async Task<int> CompactOrPruneAsync(CancellationToken cancellationToken)
     {
         await using var connection = OpenConnection();
@@ -615,11 +713,23 @@ internal sealed class SqliteMemoryStore : IInspectableMemoryStore
         return JsonSerializer.Deserialize<T>(json, JsonDefaults.Default);
     }
 
+    // Timestamps are stored in round-trip ("O") format with a Z suffix. Parsing must use
+    // AdjustToUniversal: the default DateTime.TryParse converts a "Z" timestamp to LOCAL
+    // time, and stamping that with Kind=Utc would shift every stored instant by the host's
+    // timezone offset (skewing recency scoring, expiry, and decay on non-UTC machines).
     private static DateTime ParseDateTime(string? value) =>
-        DateTime.TryParse(value, out var parsed) ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc) : DateTime.UtcNow;
+        DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+            out var parsed)
+            ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+            : DateTime.UtcNow;
 
     private static DateTime? ParseNullableDateTime(string? value) =>
-        DateTime.TryParse(value, out var parsed) ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc) : null;
+        DateTime.TryParse(value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal,
+            out var parsed)
+            ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+            : null;
 
     private static double Similarity(float[] left, float[] right)
     {

@@ -37,11 +37,13 @@ internal sealed class AgentRuntime
     private readonly HashSet<string> _staticIgnorePatterns;
     private readonly HashSet<string> _incidentPatterns;
     private readonly HashSet<string> _startupIgnorePatterns;
+    private readonly TimeSpan _pendingClarificationTtl = TimeSpan.FromMinutes(10);
     private DateTime _logRulesLastWriteUtc = DateTime.MinValue;
     private string _lastDigestDate = DateTime.UtcNow.ToString("yyyy-MM-dd");
     private DateTime _alertMutedUntilUtc = DateTime.MinValue;
     private DateTime _lastObservationAtUtc = DateTime.MinValue;
     private DateTime _lastIncidentReviewAtUtc = DateTime.MinValue;
+    private DateTime _lastMemoryMaturationAtUtc = DateTime.MinValue;
     private DateTime _lastSentimentAnalysisAtUtc = DateTime.MinValue;
     private DateTime _lastClassifierEvolutionAtUtc = DateTime.MinValue;
     private DateTime _lastScheduleTickAtUtc = DateTime.MinValue;
@@ -134,106 +136,152 @@ internal sealed class AgentRuntime
         }
     }
 
+    // Unsolicited RCON messages arrive on WebSocket receive-loop threads. Processing them
+    // there raced the main loop's load-modify-save cycles on the NeoCortex chat/console
+    // stores (lost updates, colliding temp-file writes). Instead, receive threads only
+    // enqueue; the main loop drains the queue each tick, so all NeoCortex mutation happens
+    // on one logical thread.
+    private const int MaxQueuedUnsolicitedMessages = 5000;
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(string Server, string Message)> _unsolicitedRconQueue = new();
+    private int _unsolicitedRconQueueCount;
+
     private void OnRemoteRconUnsolicited(string server, string rawMessage)
     {
-        try
+        // Bound the queue so a stalled main loop can't grow it without limit.
+        if (Volatile.Read(ref _unsolicitedRconQueueCount) >= MaxQueuedUnsolicitedMessages)
+            return;
+
+        _unsolicitedRconQueue.Enqueue((server, rawMessage));
+        Interlocked.Increment(ref _unsolicitedRconQueueCount);
+    }
+
+    private Task DrainUnsolicitedRconQueueAsync(CancellationToken cancellationToken)
+    {
+        if (_unsolicitedRconQueue.IsEmpty)
+            return Task.CompletedTask;
+
+        PlayerChatKnowledge? playerChat = null;
+        ConsoleMonitorState? consoleMonitor = null;
+        var chatChanged = false;
+        var consoleChanged = false;
+
+        while (_unsolicitedRconQueue.TryDequeue(out var item))
         {
-            // Try to parse as a chat line first
-            var parsed = TryParseChatLine(rawMessage);
-            if (parsed is not null)
+            Interlocked.Decrement(ref _unsolicitedRconQueueCount);
+            cancellationToken.ThrowIfCancellationRequested();
+            var (server, rawMessage) = item;
+
+            try
             {
-                Console.WriteLine($"[chat] {server}: {parsed.Value.Player}: {parsed.Value.Message}");
-                var playerChat = _neoCortex.LoadPlayerChat();
-                RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
-                _neoCortex.SavePlayerChat(playerChat);
-                _playerStore?.RecordChat(parsed.Value.SteamId, parsed.Value.Player, server, parsed.Value.Message);
-                return; // Chat lines don't also go to console error tracking
-            }
-
-            // Try to parse as a player join/auth/disconnect line
-            TryRecordPlayerEventFromLogLine(rawMessage, server);
-
-            // Record non-chat lines to console monitor (errors, warnings, etc.)
-            if (!_config.ConsoleMonitor.Enabled)
-                return;
-
-            var consoleMonitor = _neoCortex.LoadConsoleMonitor();
-            if (!consoleMonitor.Servers.TryGetValue(server, out var serverConsole))
-            {
-                serverConsole = new ServerConsoleState();
-                consoleMonitor.Servers[server] = serverConsole;
-            }
-
-            var consoleSignalLine = ExtractConsoleSignalLine(rawMessage);
-            var category = consoleSignalLine is null ? "info" : ClassifyConsoleLine(consoleSignalLine.ToLowerInvariant());
-
-            if (category is "error" or "warning")
-            {
-                if (IsPurePlayerConnectionNoise(consoleSignalLine!))
-                    return;
-
-                var key = NormalizeErrorKey(consoleSignalLine!);
-                var existing = serverConsole.RecentErrors
-                    .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
-
-                if (existing is not null)
+                // Try to parse as a chat line first
+                var parsed = TryParseChatLine(rawMessage);
+                if (parsed is not null)
                 {
-                    existing.Count++;
-                    existing.LastSeenAtUtc = DateTime.UtcNow;
-                    if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
+                    Console.WriteLine($"[chat] {server}: {parsed.Value.Player}: {parsed.Value.Message}");
+                    playerChat ??= _neoCortex.LoadPlayerChat();
+                    RecordPlayerChat(playerChat, server, parsed.Value.Player, parsed.Value.Message, DateTime.UtcNow);
+                    _playerStore?.RecordChat(parsed.Value.SteamId, parsed.Value.Player, server, parsed.Value.Message);
+                    chatChanged = true;
+                    continue; // Chat lines don't also go to console error tracking
+                }
+
+                // Try to parse as a player join/auth/disconnect line
+                TryRecordPlayerEventFromLogLine(rawMessage, server);
+
+                // Record non-chat lines to console monitor (errors, warnings, etc.)
+                if (!_config.ConsoleMonitor.Enabled)
+                    continue;
+
+                consoleMonitor ??= _neoCortex.LoadConsoleMonitor();
+                if (!consoleMonitor.Servers.TryGetValue(server, out var serverConsole))
+                {
+                    serverConsole = new ServerConsoleState();
+                    consoleMonitor.Servers[server] = serverConsole;
+                }
+
+                var consoleSignalLine = ExtractConsoleSignalLine(rawMessage);
+                var category = consoleSignalLine is null ? "info" : ClassifyConsoleLine(consoleSignalLine.ToLowerInvariant());
+
+                if (category is "error" or "warning")
+                {
+                    if (IsPurePlayerConnectionNoise(consoleSignalLine!))
+                        continue;
+
+                    var key = NormalizeErrorKey(consoleSignalLine!);
+                    var existing = serverConsole.RecentErrors
+                        .FirstOrDefault(e => string.Equals(e.Message, key, StringComparison.OrdinalIgnoreCase));
+
+                    if (existing is not null)
                     {
-                        existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
+                        existing.Count++;
+                        existing.LastSeenAtUtc = DateTime.UtcNow;
+                        if (string.IsNullOrWhiteSpace(existing.SampleLine) || IsBetterConsoleSample(consoleSignalLine!, existing.SampleLine))
+                        {
+                            existing.SampleLine = TrimSingleLine(consoleSignalLine!, 600);
+                        }
                     }
-                }
-                else
-                {
-                    existing = new ConsoleErrorEntry
+                    else
                     {
-                        Message = key,
-                        SampleLine = TrimSingleLine(consoleSignalLine!, 600),
-                        Category = category,
-                        FirstSeenAtUtc = DateTime.UtcNow,
-                        LastSeenAtUtc = DateTime.UtcNow
-                    };
-                    serverConsole.RecentErrors.Add(existing);
+                        existing = new ConsoleErrorEntry
+                        {
+                            Message = key,
+                            SampleLine = TrimSingleLine(consoleSignalLine!, 600),
+                            Category = category,
+                            FirstSeenAtUtc = DateTime.UtcNow,
+                            LastSeenAtUtc = DateTime.UtcNow
+                        };
+                        serverConsole.RecentErrors.Add(existing);
+                    }
+
+                    serverConsole.TotalErrorsIngested++;
+                    serverConsole.ErrorCountSinceLastAlert++;
+
+                    // Trim recent errors to a reasonable size
+                    serverConsole.RecentErrors = serverConsole.RecentErrors
+                        .OrderByDescending(e => e.LastSeenAtUtc)
+                        .Take(100)
+                        .ToList();
+
+                    consoleChanged = true;
                 }
-
-                serverConsole.TotalErrorsIngested++;
-                serverConsole.ErrorCountSinceLastAlert++;
-
-                // Trim recent errors to a reasonable size
-                serverConsole.RecentErrors = serverConsole.RecentErrors
-                    .OrderByDescending(e => e.LastSeenAtUtc)
-                    .Take(100)
-                    .ToList();
-
-                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
-                _neoCortex.SaveConsoleMonitor(consoleMonitor);
-            }
-            else if (category is "info" or "debug")
-            {
-                // Track repeating info/debug messages
-                var key = NormalizeErrorKey(rawMessage);
-                serverConsole.RepeatingMessages.TryGetValue(key, out var cnt);
-                serverConsole.RepeatingMessages[key] = cnt + 1;
-
-                // Keep repeating map bounded
-                if (serverConsole.RepeatingMessages.Count > 200)
+                else if (category is "info" or "debug")
                 {
-                    var oldestKey = serverConsole.RepeatingMessages.OrderBy(kv => kv.Value).First().Key;
-                    serverConsole.RepeatingMessages.Remove(oldestKey);
-                }
+                    // Track repeating info/debug messages
+                    var key = NormalizeErrorKey(rawMessage);
+                    serverConsole.RepeatingMessages.TryGetValue(key, out var cnt);
+                    serverConsole.RepeatingMessages[key] = cnt + 1;
 
-                consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
-                _neoCortex.SaveConsoleMonitor(consoleMonitor);
+                    // Keep repeating map bounded
+                    if (serverConsole.RepeatingMessages.Count > 200)
+                    {
+                        var oldestKey = serverConsole.RepeatingMessages.OrderBy(kv => kv.Value).First().Key;
+                        serverConsole.RepeatingMessages.Remove(oldestKey);
+                    }
+
+                    consoleChanged = true;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                RustOpsSentry.CaptureException(ex, "Remote RCON message processing failed.", "agent.chat-monitor",
+                    extras: new Dictionary<string, object?> { ["server"] = server });
             }
         }
-        catch (Exception ex)
+
+        if (chatChanged && playerChat is not null)
+            _neoCortex.SavePlayerChat(playerChat);
+
+        if (consoleChanged && consoleMonitor is not null)
         {
-            // Never let a chat-capture or console-monitor failure affect the RCON receive loop.
-            RustOpsSentry.CaptureException(ex, "Remote RCON message processing failed.", "agent.chat-monitor",
-                extras: new Dictionary<string, object?> { ["server"] = server });
+            consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
+            _neoCortex.SaveConsoleMonitor(consoleMonitor);
         }
+
+        return Task.CompletedTask;
     }
 
     public void RequestStop() => _stop = true;
@@ -261,11 +309,13 @@ internal sealed class AgentRuntime
                 if (chatFiles > 0 || tick % 5 == 0)
                     Console.WriteLine($"[agent] Tick {tick}: chat-inbox={chatFiles} file(s)");
 
+                await SafeExecuteAsync(() => DrainUnsolicitedRconQueueAsync(cancellationToken), "rcon-unsolicited-drain", cancellationToken);
                 await SafeExecuteAsync(() => ProcessChatInboxAsync(cancellationToken), "chat-processing", cancellationToken);
                 await SafeExecuteAsync(() => ProcessPluginChatInboxAsync(cancellationToken), "plugin-chat-processing", cancellationToken);
                 await SafeExecuteAsync(() => ObserveServersAsync(cancellationToken), "server-observation", cancellationToken);
                 await SafeExecuteAsync(() => ReconnectRemoteRconSessionsAsync(cancellationToken), "remote-rcon-reconnect", cancellationToken);
                 await SafeExecuteAsync(() => ReviewIncidentsAsync(cancellationToken), "incident-review", cancellationToken);
+                await SafeExecuteAsync(() => MatureMemoryAsync(cancellationToken), "memory-maturation", cancellationToken);
                 await SafeExecuteAsync(() => AnalyzePlayerSentimentAsync(cancellationToken), "sentiment-analysis", cancellationToken);
                 await SafeExecuteAsync(() => ProcessPlayerChatForStandInAsync(cancellationToken), "stand-in-admin", cancellationToken);
                 await SafeExecuteAsync(() => CheckPluginUpdatesAsync(cancellationToken), "plugin-check", cancellationToken);
@@ -539,7 +589,7 @@ internal sealed class AgentRuntime
             if (correctionAck is not null)
             {
                 RecordConversationTurn(state, item.Message, correctionAck);
-                _neoCortex.SaveSelection(selection);
+                SaveConversationState(state);
                 WriteOutbox(item.AdminId, correctionAck, actionId, null);
                 return;
             }
@@ -566,6 +616,15 @@ internal sealed class AgentRuntime
             // BUT: skip this if the message contains explicit intent signals (pull, git, rebuild, etc.)
             // indicating a new request, not a clarification answer.
             var pending = state.PendingClarification;
+            // A clarification only makes sense as the admin's very next turn. If they come back much
+            // later with a fresh request, an unanswered clarification must NOT hijack it — otherwise
+            // the agent answers the previous question and ignores the current one. Expire stale ones.
+            if (pending is not null && DateTime.UtcNow - pending.AskedAtUtc > _pendingClarificationTtl)
+            {
+                Console.WriteLine($"[chat] Discarding stale pending clarification (asked {pending.AskedAtUtc:o}, intent={pending.Intent})");
+                state.PendingClarification = null;
+                pending = null;
+            }
             var messageLowered = item.Message.ToLowerInvariant();
             var hasExplicitNewIntent = messageLowered.Contains("pull", StringComparison.Ordinal) ||
                                        messageLowered.Contains("git", StringComparison.Ordinal) ||
@@ -648,29 +707,32 @@ internal sealed class AgentRuntime
 
             UpdateSelectionState(state, item.Message, route, result);
             RecordConversationTurn(state, item.Message, reply);
-            _neoCortex.SaveSelection(selection);
+            SaveConversationState(state);
             var primaryServer = ResolvePrimaryServer(result, route);
 
-            var operations = _neoCortex.LoadOperations();
-            operations.RuntimeStatus = new RuntimeStatus
+            lock (_operationsSync)
             {
-                LlmEnabled = _config.Llm.Enabled,
-                LlmProvider = _config.Llm.Provider,
-                LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
-                UpdatedAtUtc = DateTime.UtcNow
-            };
-            if (route.Intent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
-            {
-                operations.RecentActions.Add(new ActionRecord
+                var operations = _neoCortex.LoadOperations();
+                operations.RuntimeStatus = new RuntimeStatus
                 {
-                    Intent = route.Intent.ToString(),
-                    Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
-                    ServerName = primaryServer,
-                    TimestampUtc = DateTime.UtcNow
-                });
-                operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
+                    LlmEnabled = _config.Llm.Enabled,
+                    LlmProvider = _config.Llm.Provider,
+                    LastLlmInteractionAtUtc = operations.LlmInteractions.FirstOrDefault()?.AtUtc,
+                    UpdatedAtUtc = DateTime.UtcNow
+                };
+                if (route.Intent is not (AdminIntentType.Chat or AdminIntentType.Clarification))
+                {
+                    operations.RecentActions.Add(new ActionRecord
+                    {
+                        Intent = route.Intent.ToString(),
+                        Result = result.Success ? "success" : (result.ErrorCode ?? "failed"),
+                        ServerName = primaryServer,
+                        TimestampUtc = DateTime.UtcNow
+                    });
+                    operations.RecentActions = operations.RecentActions.TakeLast(100).ToList();
+                }
+                _neoCortex.SaveOperations(operations);
             }
-            _neoCortex.SaveOperations(operations);
 
             _legacyState.RecordAction(
                 actionId,
@@ -1315,6 +1377,15 @@ internal sealed class AgentRuntime
             return;
         _forcedCheckThrottle[steamId] = now;
 
+        // The throttle map grows by one entry per unique steamid; on a long-running agent
+        // that is a slow leak. Drop entries older than an hour once the map gets large.
+        if (_forcedCheckThrottle.Count > 2000)
+        {
+            var cutoff = now - TimeSpan.FromHours(1);
+            foreach (var stale in _forcedCheckThrottle.Where(kv => kv.Value < cutoff).Select(kv => kv.Key).ToList())
+                _forcedCheckThrottle.TryRemove(stale, out _);
+        }
+
         try
         {
             using var content = new StringContent(steamId);
@@ -1797,30 +1868,10 @@ internal sealed class AgentRuntime
                 serverConsole.RepeatingMessages = top;
             }
 
-            // Escalate if error count exceeds threshold, unless alerts are muted.
+            // Escalate if error count exceeds threshold (memory-aware dedup handled in the helper).
             if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
             {
-                var alertCount = serverConsole.ErrorCountSinceLastAlert;
-                serverConsole.LastAlertAtUtc = DateTime.UtcNow;
-                serverConsole.ErrorCountSinceLastAlert = 0;
-                if (DateTime.UtcNow > _alertMutedUntilUtc)
-                {
-                    Console.WriteLine($"[console] ESCALATE {server}: {alertCount} errors since last alert.");
-                    var topErrors = serverConsole.RecentErrors
-                        .OrderByDescending(e => e.Count)
-                        .Select(e => new { Entry = e, Line = TryFormatConsoleAlertLine(e) })
-                        .Where(item => !string.IsNullOrWhiteSpace(item.Line))
-                        .Take(3)
-                        .Select(item => $"  • {item.Line} ({item.Entry.Count}x)")
-                        .ToList();
-                    var alertMsg = $"[{server}] {alertCount} console errors since last alert." +
-                        (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
-                    BroadcastOutbox(alertMsg, server);
-                }
-                else
-                {
-                    Console.WriteLine($"[console] {server}: escalation suppressed (alerts muted until {_alertMutedUntilUtc:HH:mm} UTC).");
-                }
+                await MaybeBroadcastConsoleAlertAsync(server, serverConsole, CancellationToken.None);
             }
 
             consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
@@ -2079,27 +2130,7 @@ internal sealed class AgentRuntime
 
                 if (serverConsole.ErrorCountSinceLastAlert >= _config.ConsoleMonitor.ErrorEscalationThreshold)
                 {
-                    var alertCount = serverConsole.ErrorCountSinceLastAlert;
-                    serverConsole.LastAlertAtUtc = DateTime.UtcNow;
-                    serverConsole.ErrorCountSinceLastAlert = 0;
-                    if (DateTime.UtcNow > _alertMutedUntilUtc)
-                    {
-                        Console.WriteLine($"[console] ESCALATE {server}: {alertCount} errors since last alert.");
-                        var topErrors = serverConsole.RecentErrors
-                            .OrderByDescending(e => e.Count)
-                            .Select(e => new { Entry = e, Line = TryFormatConsoleAlertLine(e) })
-                            .Where(item => !string.IsNullOrWhiteSpace(item.Line))
-                            .Take(3)
-                            .Select(item => $"  • {item.Line} ({item.Entry.Count}x)")
-                            .ToList();
-                        var alertMsg = $"[{server}] {alertCount} console errors since last alert." +
-                            (topErrors.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topErrors) : string.Empty);
-                        BroadcastOutbox(alertMsg, server);
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[console] {server}: escalation suppressed (alerts muted until {_alertMutedUntilUtc:HH:mm} UTC).");
-                    }
+                    await MaybeBroadcastConsoleAlertAsync(server, serverConsole, CancellationToken.None);
                 }
 
                 consoleMonitor.UpdatedAtUtc = DateTime.UtcNow;
@@ -2552,10 +2583,29 @@ internal sealed class AgentRuntime
                             memoryContext = "\nRelevant server context:\n" + string.Join("\n", memResults.Select(r => $"- {r.MemoryRecord.Summary}"));
                     }
 
+                    // Web lookup fallback: when local memory is thin, pull keyless web findings so the
+                    // model can answer questions it has no stored context for. Scoped to Rust sources
+                    // unless the question is clearly general, to keep queries on-topic and reduce abuse.
+                    var webContext = string.Empty;
+                    if (_config.StandInAdmin.WebLookupEnabled && string.IsNullOrEmpty(memoryContext))
+                    {
+                        try
+                        {
+                            var scopeToRust = WebSearchToolHandler.ShouldScopeToRust(msg.Message, msg.Message);
+                            var findings = await WebSearchToolHandler.SearchAsync(msg.Message, scopeToRust, cancellationToken);
+                            if (!string.IsNullOrWhiteSpace(findings))
+                                webContext = "\nWeb lookup (may be imprecise — do not repeat verbatim, summarize for the player):\n" + findings;
+                        }
+                        catch (Exception webEx)
+                        {
+                            Console.WriteLine($"[stand-in] {server}: Web lookup failed for {msg.PlayerName}: {webEx.Message}");
+                        }
+                    }
+
                     var systemPrompt = _config.StandInAdmin.SystemPrompt
                         ?? $"You are {agentName}, the automated admin assistant for this Rust game server. Answer briefly and helpfully. Never impersonate other players. If you don't know, say so. Keep responses under 140 characters.";
 
-                    var prompt = $"{systemPrompt}{memoryContext}\n\nPlayer '{msg.PlayerName}' says: {msg.Message}\n\nReply as {agentName} (max 140 chars, no quotes):";
+                    var prompt = $"{systemPrompt}{memoryContext}{webContext}\n\nPlayer '{msg.PlayerName}' says: {msg.Message}\n\nReply as {agentName} (max 140 chars, no quotes):";
 
                     using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     cts.CancelAfter(TimeSpan.FromSeconds(30));
@@ -2815,8 +2865,7 @@ Recent player chat (newest last):
 
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-            using var resp = await http.GetAsync("http://apps.rusticaland.net:8853/all", cancellationToken);
+            using var resp = await _forcedHttpClient.GetAsync("http://apps.rusticaland.net:8853/all", cancellationToken);
             if (!resp.IsSuccessStatusCode)
             {
                 Console.WriteLine($"[forced] poll skipped: HTTP {(int)resp.StatusCode}");
@@ -2972,7 +3021,36 @@ Recent player chat (newest last):
             : $"{singleLine[..Math.Max(0, maxLength - 3)]}...";
     }
 
+    // Guards read-modify-write cycles on the shared selection/operations stores. Chat
+    // messages from different admins are processed concurrently (see ProcessChatInboxAsync),
+    // so without this, two admins finishing at the same time would overwrite each other's
+    // conversation state or LLM-interaction records.
+    private readonly object _selectionSync = new();
+    private readonly object _operationsSync = new();
+
+    // Persist a single admin's conversation state by merging it into a freshly loaded
+    // selection snapshot, so concurrent admins don't clobber each other's entries.
+    private void SaveConversationState(ConversationSelectionState state)
+    {
+        lock (_selectionSync)
+        {
+            var selection = _neoCortex.LoadSelection();
+            selection.Conversations.RemoveAll(c =>
+                string.Equals(c.AdminId, state.AdminId, StringComparison.OrdinalIgnoreCase));
+            selection.Conversations.Add(state);
+            _neoCortex.SaveSelection(selection);
+        }
+    }
+
     private void RecordLlmInteraction(string type, bool llmAttempted, bool llmSucceeded, string? context, string? responsePreview, string? source)
+    {
+        lock (_operationsSync)
+        {
+            RecordLlmInteractionCore(type, llmAttempted, llmSucceeded, context, responsePreview, source);
+        }
+    }
+
+    private void RecordLlmInteractionCore(string type, bool llmAttempted, bool llmSucceeded, string? context, string? responsePreview, string? source)
     {
         var operations = _neoCortex.LoadOperations();
         operations.LlmInteractions.Add(new LlmInteractionRecord
@@ -3376,9 +3454,15 @@ Admin corrections:
                         Steps: steps.Count > 1 ? steps : null);
 
                     var fakeState = new ConversationSelectionState { AdminId = task.AdminId };
+                    // Build the execution message from the structured steps, NOT the original
+                    // natural-language request. The original sentence contains scheduling words
+                    // ("each day", "every Friday", "all weekend") that ServerScopeResolver's
+                    // collective-all regex (\b(all|every|each)\b) would otherwise match — fanning
+                    // a single-server schedule out to every server. The steps already carry an
+                    // explicit ServerName/ScopeKind, so scope must be derived from those.
                     var ctx = new ToolExecutionContext(
                         AdminId: task.AdminId,
-                        Message: $"[scheduled] {task.OriginalMessage}",
+                        Message: BuildScheduledMessage(steps),
                         Route: route,
                         SelectionState: fakeState,
                         UtcNow: nowUtc,
@@ -3427,6 +3511,32 @@ Admin corrections:
         }
 
         _neoCortex.SaveScheduledTasks(state);
+    }
+
+    // Synthesizes a clean, structured command string for scheduled execution so that
+    // scope/verb parsing never sees the original NL scheduling phrase. For a step
+    // { commandText="restart", serverName="cotton" } this yields "restart cotton".
+    // Steps are joined with "; " so a multi-step sequence still reads naturally in logs.
+    private static string BuildScheduledMessage(IReadOnlyList<AdminIntentStep> steps)
+    {
+        var parts = new List<string>();
+        foreach (var step in steps)
+        {
+            var slots = step.Slots;
+            var verb = !string.IsNullOrWhiteSpace(slots.CommandText)
+                ? slots.CommandText!.Trim()
+                : !string.IsNullOrWhiteSpace(slots.ConfigKey)
+                    ? $"set {slots.ConfigKey}{(string.IsNullOrWhiteSpace(slots.ConfigValue) ? "" : $" {slots.ConfigValue}")}".Trim()
+                    : step.Intent.ToString();
+
+            var piece = string.IsNullOrWhiteSpace(slots.ServerName)
+                ? verb
+                : $"{verb} {slots.ServerName!.Trim()}";
+            if (!string.IsNullOrWhiteSpace(piece))
+                parts.Add(piece);
+        }
+
+        return parts.Count == 0 ? "[scheduled]" : $"[scheduled] {string.Join("; ", parts)}";
     }
 
     private static AdminIntentStep MaterializeStep(ScheduledStep s, ScheduledTask owner)
@@ -3531,6 +3641,28 @@ Admin corrections:
         bool LlmAttempted,
         bool LlmSucceeded,
         string Source);
+
+    // Periodic memory maturation: promotes high-confidence Pending knowledge so recall can see
+    // it, decays never-used noise toward the prune floor, and distils recurring-failure-then-fix
+    // history into durable procedures. Interval-gated like the other deep tasks; no LLM required.
+    private async Task MatureMemoryAsync(CancellationToken cancellationToken)
+    {
+        var learning = _config.Memory.Learning;
+        if (!learning.Enabled)
+            return;
+
+        var interval = TimeSpan.FromMinutes(Math.Max(5, learning.MaturationIntervalMinutes));
+        if (DateTime.UtcNow - _lastMemoryMaturationAtUtc < interval)
+            return;
+
+        _lastMemoryMaturationAtUtc = DateTime.UtcNow;
+
+        var report = await _semanticMemory.RunMaturationAsync(cancellationToken);
+        if (report.HasActivity)
+        {
+            Console.WriteLine($"[memory-maturation] {report}");
+        }
+    }
 
     private async Task ReviewIncidentsAsync(CancellationToken cancellationToken)
     {
@@ -3882,12 +4014,25 @@ Repeated failure memory clusters:
             if (candidate.Length <= limitChars)
             {
                 buffer = new StringBuilder(candidate);
+                continue;
+            }
+
+            if (buffer.Length > 0)
+            {
+                yield return buffer.ToString();
+                buffer = new StringBuilder();
+            }
+
+            // A single line longer than the limit must be hard-split, otherwise the
+            // oversized chunk would be rejected downstream (Steam message cap).
+            if (line.Length > limitChars)
+            {
+                for (var i = 0; i < line.Length; i += limitChars)
+                    yield return line.Substring(i, Math.Min(limitChars, line.Length - i));
             }
             else
             {
-                if (buffer.Length > 0)
-                    yield return buffer.ToString();
-                buffer = new StringBuilder(line);
+                buffer.Append(line);
             }
         }
 
@@ -3911,6 +4056,127 @@ Repeated failure memory clusters:
         Directory.CreateDirectory(_config.Outbox.MessageOutboxPath);
         var path = Path.Combine(_config.Outbox.MessageOutboxPath, $"{payload.CreatedAtUtc:yyyyMMddHHmmssfff}-chat-reply-{payload.Id}.json");
         File.WriteAllText(path, JsonSerializer.Serialize(payload, JsonDefaults.Default));
+    }
+
+    // Decides whether a console-error escalation is worth telling the admin about and, if so,
+    // broadcasts a message that reflects what we already know. The previous behaviour re-sent the
+    // same "[server] N console errors" block every time the threshold was crossed, which produced
+    // ~30% of all outbound messages as duplicates of the same known issue. Now we fingerprint the
+    // top errors, stay quiet about an already-reported signature until it spikes or a re-issue
+    // window elapses, frame recurring issues as recurring, and attach a known mitigation from
+    // memory when we have one. Callers must already hold ErrorCountSinceLastAlert >= threshold.
+    private async Task MaybeBroadcastConsoleAlertAsync(string server, ServerConsoleState serverConsole, CancellationToken cancellationToken)
+    {
+        var alertCount = serverConsole.ErrorCountSinceLastAlert;
+        serverConsole.LastAlertAtUtc = DateTime.UtcNow;
+        serverConsole.ErrorCountSinceLastAlert = 0;
+
+        if (DateTime.UtcNow <= _alertMutedUntilUtc)
+        {
+            Console.WriteLine($"[console] {server}: escalation suppressed (alerts muted until {_alertMutedUntilUtc:HH:mm} UTC).");
+            return;
+        }
+
+        var topEntries = serverConsole.RecentErrors
+            .OrderByDescending(e => e.Count)
+            .Select(e => new { Entry = e, Line = TryFormatConsoleAlertLine(e) })
+            .Where(item => !string.IsNullOrWhiteSpace(item.Line))
+            .Take(3)
+            .ToList();
+
+        var signature = ConsoleAlertPolicy.Signature(topEntries.Select(t => t.Entry.Message));
+        var now = DateTime.UtcNow;
+        serverConsole.AlertedSignatures.TryGetValue(signature, out var prior);
+
+        var decision = ConsoleAlertPolicy.Decide(
+            prior, alertCount, now, _config.ConsoleMonitor.AlertReissueHours, _config.ConsoleMonitor.AlertSpikeFactor);
+
+        if (decision == ConsoleAlertPolicy.AlertDecision.Suppress)
+        {
+            // Same known pattern, recently reported, not escalating — don't spam the admin.
+            Console.WriteLine(
+                $"[console] {server}: known recurring signature suppressed ({alertCount} errors; " +
+                $"alerted {prior!.TimesAlerted}x, last {ConsoleAlertPolicy.FormatAgo(now - prior.LastAlertedAtUtc)} ago).");
+            return;
+        }
+
+        var isNew = decision == ConsoleAlertPolicy.AlertDecision.New;
+        var topLines = topEntries.Select(t => $"  • {t.Line} ({t.Entry.Count}x)").ToList();
+        var topBlock = topLines.Count > 0 ? "\nTop errors:\n" + string.Join("\n", topLines) : string.Empty;
+
+        string alertMsg;
+        if (isNew)
+        {
+            alertMsg = $"[{server}] {alertCount} console errors since last alert.{topBlock}";
+        }
+        else
+        {
+            var reason = decision == ConsoleAlertPolicy.AlertDecision.Spike ? "spiking" : "still ongoing";
+            alertMsg =
+                $"[{server}] Recurring console errors {reason} — known issue first flagged " +
+                $"{ConsoleAlertPolicy.FormatAgo(now - prior!.FirstAlertedAtUtc)} ago (reported {prior.TimesAlerted}x). " +
+                $"{alertCount} since last alert.{topBlock}";
+        }
+
+        var mitigation = await TryFindConsoleMitigationAsync(topEntries.Select(t => t.Entry.Message).FirstOrDefault(), cancellationToken);
+        if (!string.IsNullOrWhiteSpace(mitigation))
+            alertMsg += $"\nKnown mitigation: {mitigation}";
+
+        BroadcastOutbox(alertMsg, server);
+        Console.WriteLine($"[console] ESCALATE {server}: {alertCount} errors ({decision} signature).");
+
+        serverConsole.AlertedSignatures[signature] = new AlertedSignatureState
+        {
+            FirstAlertedAtUtc = prior?.FirstAlertedAtUtc ?? now,
+            LastAlertedAtUtc = now,
+            LastAlertedCount = alertCount,
+            TimesAlerted = (prior?.TimesAlerted ?? 0) + 1
+        };
+
+        if (serverConsole.AlertedSignatures.Count > 50)
+        {
+            foreach (var stale in serverConsole.AlertedSignatures
+                         .OrderBy(kv => kv.Value.LastAlertedAtUtc)
+                         .Take(serverConsole.AlertedSignatures.Count - 50)
+                         .ToList())
+            {
+                serverConsole.AlertedSignatures.Remove(stale.Key);
+            }
+        }
+
+        // First time we see a pattern, record it so recall and the maturation loop can learn from
+        // it (and so a future occurrence can be correlated with any mitigation derived since).
+        if (_config.Memory.WriteEnabled && isNew && topEntries.Count > 0)
+        {
+            var summary = $"[{server}] Recurring console errors: {TrimSingleLine(topEntries[0].Line ?? string.Empty, 80)}";
+            var detail = $"Server: {server}\nRecurring console error pattern ({alertCount}+ occurrences). Top errors:\n{string.Join("\n", topLines)}";
+            _ = _semanticMemory.RecordServerFactAsync(
+                server, summary, detail, new[] { "console", "recurring", server.ToLowerInvariant() }, CancellationToken.None);
+        }
+    }
+
+    // Best-effort lookup of a learned mitigation (synthesized Procedure or incident-review
+    // Reflection) for the dominant console error, so a recurring alert carries the fix with it.
+    private async Task<string?> TryFindConsoleMitigationAsync(string? topErrorMessage, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(topErrorMessage))
+            return null;
+
+        try
+        {
+            var matches = await _semanticMemory.SearchAsync(topErrorMessage, 5, cancellationToken);
+            var best = matches
+                .Where(r => r.MemoryRecord.Type is MemoryRecordType.Procedure or MemoryRecordType.Reflection or MemoryRecordType.Fix)
+                .Where(r => r.FinalScore >= 0.55)
+                .OrderByDescending(r => r.FinalScore)
+                .FirstOrDefault();
+            return best is null ? null : TrimSingleLine(best.MemoryRecord.Summary, 160);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[console] mitigation lookup skipped: {ex.Message}");
+            return null;
+        }
     }
 
     private static async Task TryApplyAffinityAsync(string server, int pid, string cpuList, CancellationToken ct)

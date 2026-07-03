@@ -66,26 +66,28 @@ internal sealed class RustRconClient : IRconClient
         });
 
         var bytes = Encoding.UTF8.GetBytes(payload);
-        await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            await _socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, cancellationToken);
-        }
-        finally
-        {
-            _sendLock.Release();
-        }
+            await _sendLock.WaitAsync(cancellationToken);
+            try
+            {
+                await _socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, cancellationToken);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
 
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-        using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+            using var reg = linked.Token.Register(() => tcs.TrySetCanceled(linked.Token));
 
-        try
-        {
             return await tcs.Task;
         }
         finally
         {
+            // Always drop the pending entry — including when the send itself fails —
+            // so a failed send can't leak an orphaned TaskCompletionSource.
             _pending.TryRemove(identifier, out _);
         }
     }

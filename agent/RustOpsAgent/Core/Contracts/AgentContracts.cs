@@ -14,6 +14,7 @@ internal enum AdminIntentType
     Clarification,
     ServerManagement,
     PlayerForcedManagement,
+    PlayerModeration,
     ScheduleTask,
     ScheduleManagement
 }

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using Sentry;
 using RustOpsAgent.Core.Contracts;
 
 namespace RustOpsAgent.Infrastructure;
@@ -27,6 +28,17 @@ internal sealed class AutoPullService
             return;
 
         await TriggerAsync(cancellationToken);
+    }
+
+    // git error messages can echo the remote URL including the injected PAT
+    // (e.g. "unable to access 'https://oauth2:<token>@github.com/...'"). Scrub it
+    // before anything reaches the console log or Sentry.
+    private string ScrubSecrets(string text)
+    {
+        if (string.IsNullOrEmpty(text) || string.IsNullOrWhiteSpace(_settings.GithubToken))
+            return text;
+
+        return text.Replace(_settings.GithubToken!, "***");
     }
 
     public async Task<AutoPullStatus> TriggerAsync(CancellationToken cancellationToken)
@@ -71,9 +83,10 @@ internal sealed class AutoPullService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[autopull] Failed: {ex.Message}");
-            RustOpsSentry.CaptureException(ex, "AutoPull cycle failed.", "agent.autopull");
-            _lastStatus = new AutoPullStatus("error", output.ToString().Trim(), ex.Message, DateTime.UtcNow);
+            var scrubbed = ScrubSecrets(ex.Message);
+            Console.WriteLine($"[autopull] Failed: {scrubbed}");
+            RustOpsSentry.CaptureMessage($"AutoPull cycle failed: {scrubbed}", "agent.autopull", SentryLevel.Error);
+            _lastStatus = new AutoPullStatus("error", ScrubSecrets(output.ToString().Trim()), scrubbed, DateTime.UtcNow);
         }
 
         return _lastStatus;

@@ -50,6 +50,13 @@ app.UseRustOpsMiddleware();
 
 // -- Configuration
 var apiKey      = RustOpsEnv.FirstNonEmptyEnvironment("RUSTMGR_API_KEY", "RUSTOPS_API_KEY") ?? "changeme";
+if (apiKey == "changeme")
+{
+    Console.Error.WriteLine(
+        "[api] SECURITY WARNING: no API key configured — running with the default key 'changeme'. " +
+        "Set RUSTMGR_API_KEY before exposing this service.");
+    RustOpsSentry.CaptureMessage("API running with default API key.", "startup", SentryLevel.Warning);
+}
 var bindUrl     = Environment.GetEnvironmentVariable("RUSTMGR_BIND")    ?? "http://0.0.0.0:2077";
 var rustMgrPath = Environment.GetEnvironmentVariable("RUSTMGR_PATH")    ?? "/opt/rust-manager/rustmgr.sh";
 var runtimeDir  = Environment.GetEnvironmentVariable("RUSTMGR_RUNTIME") ?? "/opt/rust-manager/runtime";

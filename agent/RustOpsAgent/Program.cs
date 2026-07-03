@@ -241,6 +241,7 @@ var handlers = new List<IToolHandler>
     new RustServerControlToolHandler(apiClient, serverStatusNotifier, semanticMemory),
     new RustStatusToolHandler(apiClient, semanticMemory),
     new RustPlayerLookupToolHandler(apiClient),
+    new RustPlayerModerationToolHandler(apiClient, playerStore),
     new RustRconToolHandler(apiClient, neoCortex, config.CommandExecution, serverKnowledge, semanticMemory),
     new RustLogsToolHandler(apiClient, neoCortex, semanticMemory),
     new RustPluginToolHandler(apiClient, config.PluginUpdates, semanticMemory, pluginReferenceIndexer),

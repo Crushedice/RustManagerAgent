@@ -141,6 +141,18 @@ restart_flag_path() {
     echo "$RUNTIME_DIR/$server.autorestart"
 }
 
+# Set the autorestart flag for a server. A plain `touch` fails if the flag file
+# was left behind owned by another user (e.g. a stray root invocation), which
+# would silently break start/restart. RUNTIME_DIR is group/other-writable with
+# no sticky bit, so we can always rm+recreate the file as the current user.
+set_restart_flag() {
+    local flag="$1"
+    if ! touch "$flag" 2>/dev/null; then
+        rm -f "$flag" 2>/dev/null || true
+        : > "$flag"
+    fi
+}
+
 command_trace_path() {
     local server="$1"
     echo "$RUNTIME_DIR/$server.commands.log"
@@ -978,7 +990,7 @@ start_one() {
         pid="$(server_pid "$server" || true)"
         if [[ -n "$pid" ]]; then
             server_log_info "$server" "Server already running (pid=$pid)"
-            touch "$control_path"
+            set_restart_flag "$control_path"
             echo "$server already running"
             return 0
         fi
@@ -988,11 +1000,11 @@ start_one() {
         sleep 1
     fi
 
-    touch "$control_path"
+    set_restart_flag "$control_path"
     trace_path="$(command_trace_path "$server")"
     server_log_debug "$server" "Creating new tmux session: $(session_name "$server")"
     server_log_debug "$server" "Runner script: $runner_path"
-    tmux new-session -d -s "$(session_name "$server")" "bash -lc $(shell_escape "$runner_path")" 2>&1 | server_log_debug "$server" "tmux output: %s"
+    SHELL=/bin/bash tmux new-session -d -s "$(session_name "$server")" "bash -lc $(shell_escape "$runner_path")" 2>&1 | server_log_debug "$server" "tmux output: %s"
 
     waited=0
     detected_pid=""
@@ -1196,7 +1208,7 @@ restart_one() {
     fi
 
     control_path="$(restart_flag_path "$server")"
-    touch "$control_path"
+    set_restart_flag "$control_path"
 
     old_pid="$(server_pid "$server" || true)"
     if [[ -z "$old_pid" ]]; then
@@ -1245,7 +1257,36 @@ update_one() {
     load_config "$server"
     require_update_deps
 
+    # steamcmd must not run against a live install: open file handles corrupt the
+    # update and can leave the server unstartable. Stop the server first, and
+    # remember whether it was running so we can bring it back afterwards.
+    local was_running=0
+    if tmux_has_session "$server" || [[ -n "$(server_pid "$server" 2>/dev/null || true)" ]]; then
+        was_running=1
+        server_log_info "$server" "Server is running; stopping before update"
+        stop_one "$server" >/dev/null
+    fi
+
     server_log_info "$server" "Updating Rust server in $CFG_SERVER_DIR"
+
+    # Remove the server's steamapps folder before updating. A stale steamapps
+    # manifest is the usual cause of steamcmd refusing to re-validate / getting
+    # stuck, so we clear it for a clean update. Guard hard against an empty or
+    # unexpected CFG_SERVER_DIR so we never rm -rf the wrong tree.
+    local steamapps_dir="$CFG_SERVER_DIR/steamapps"
+    if [[ -n "$CFG_SERVER_DIR" && -d "$CFG_SERVER_DIR" && -d "$steamapps_dir" ]]; then
+        server_log_info "$server" "Removing steamapps folder before update: $steamapps_dir"
+        rm -rf -- "$steamapps_dir"
+        if [[ -d "$steamapps_dir" ]]; then
+            server_log_error "$server" "Failed to remove steamapps folder: $steamapps_dir"
+            restart_after_update "$server" "$was_running" "failed steamapps removal"
+            die "Failed to remove steamapps folder for $server: $steamapps_dir"
+        fi
+        trace_server_command "$server" "update: removed steamapps folder"
+    else
+        server_log_info "$server" "No steamapps folder to remove (skipping): $steamapps_dir"
+    fi
+
     local steam_out rc
     set +e
     steam_out="$(
@@ -1265,18 +1306,36 @@ update_one() {
         if [[ "$steam_out" == *"state is 0x6 after update job"* ]]; then
             server_log_warn "$server" "SteamCMD returned exit $rc with state 0x6 (treating as non-fatal)"
             trace_server_command "$server" "update: steamcmd exit $rc state 0x6 (treated non-fatal)"
+            restart_after_update "$server" "$was_running" "post-update"
             server_log_info "$server" "========== UPDATE COMPLETED =========="
             echo "updated $server"
             return 0
         fi
 
         server_log_error "$server" "========== UPDATE FAILED ========== SteamCMD exit code $rc"
+        restart_after_update "$server" "$was_running" "after failed update"
         die "steamcmd update failed for $server (exit $rc)"
     fi
 
     trace_server_command "$server" "update completed"
+    restart_after_update "$server" "$was_running" "post-update"
     server_log_info "$server" "========== UPDATE COMPLETED SUCCESSFULLY =========="
     echo "updated $server"
+}
+
+# Restart a server after an update if it was running beforehand. Never fatal:
+# a restart failure is logged but must not mask the update result.
+restart_after_update() {
+    local server="$1"
+    local was_running="$2"
+    local phase="$3"
+
+    (( was_running == 1 )) || return 0
+
+    server_log_info "$server" "Restarting server ${phase}"
+    if ! start_one "$server" >/dev/null; then
+        server_log_warn "$server" "Failed to restart server ${phase}; leaving stopped"
+    fi
 }
 
 umod_one() {

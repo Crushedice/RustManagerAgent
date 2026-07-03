@@ -288,6 +288,16 @@ internal sealed class NeoCortexStore : IEvolutionStore
         Directory.CreateDirectory(Path.GetDirectoryName(_playerChatPath)!);
     }
 
+    // Per-path locks: several components (main loop, concurrent admin chat groups) do
+    // load-modify-save cycles on the same store files. Serialising Load/Save per path
+    // prevents two writers from colliding on the shared ".tmp" file and readers from
+    // observing a file mid-replace. (It does not make read-modify-write atomic — callers
+    // that need that must coordinate at a higher level.)
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, object> PathLocks =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static object LockFor(string path) => PathLocks.GetOrAdd(path, _ => new object());
+
     private static T LoadJson<T>(string path, T fallback)
     {
         if (!File.Exists(path))
@@ -296,7 +306,10 @@ internal sealed class NeoCortexStore : IEvolutionStore
         string text;
         try
         {
-            text = File.ReadAllText(path);
+            lock (LockFor(path))
+            {
+                text = File.ReadAllText(path);
+            }
         }
         catch
         {
@@ -335,8 +348,11 @@ internal sealed class NeoCortexStore : IEvolutionStore
         var json = JsonSerializer.Serialize(state, JsonDefaults.Default);
         // Atomic write: write to temp file, then rename to replace target.
         // Prevents readers from seeing a partially-written file.
-        var tempPath = path + ".tmp";
-        File.WriteAllText(tempPath, json);
-        File.Move(tempPath, path, overwrite: true);
+        lock (LockFor(path))
+        {
+            var tempPath = path + ".tmp";
+            File.WriteAllText(tempPath, json);
+            File.Move(tempPath, path, overwrite: true);
+        }
     }
 }

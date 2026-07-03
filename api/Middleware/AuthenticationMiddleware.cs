@@ -23,7 +23,7 @@ public class AuthenticationMiddleware
         var apiKey = RustOpsEnv.FirstNonEmptyEnvironment("RUSTMGR_API_KEY", "RUSTOPS_API_KEY") ?? "changeme";
         var providedKey = context.Request.Headers["X-API-Key"].ToString();
 
-        if (string.IsNullOrWhiteSpace(providedKey) || providedKey != apiKey)
+        if (string.IsNullOrWhiteSpace(providedKey) || !FixedTimeEquals(providedKey, apiKey))
         {
             context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             await context.Response.WriteAsJsonAsync(new { error = "Unauthorized" });
@@ -31,5 +31,13 @@ public class AuthenticationMiddleware
         }
 
         await _next(context);
+    }
+
+    // Constant-time comparison so the key can't be recovered byte-by-byte via timing.
+    private static bool FixedTimeEquals(string provided, string expected)
+    {
+        var providedBytes = System.Text.Encoding.UTF8.GetBytes(provided);
+        var expectedBytes = System.Text.Encoding.UTF8.GetBytes(expected);
+        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(providedBytes, expectedBytes);
     }
 }

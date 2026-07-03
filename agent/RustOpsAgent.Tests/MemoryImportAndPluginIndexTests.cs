@@ -310,5 +310,7 @@ public class MemoryImportAndPluginIndexTests
         public Task<int> RebuildEmbeddingsAsync(CancellationToken cancellationToken) => Task.FromResult(0);
         public Task<MemoryMigrationReport> MigrateLegacyMemoryAsync(bool dryRun, CancellationToken cancellationToken) => Task.FromResult(new MemoryMigrationReport());
         public Task<int> PruneAsync(CancellationToken cancellationToken) => Task.FromResult(0);
+        public Task ReinforceRecalledMemoriesAsync(WorkflowMemoryContext? recall, bool success, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<MemoryMaturationReport> RunMaturationAsync(CancellationToken cancellationToken) => Task.FromResult(new MemoryMaturationReport());
     }
 }

@@ -169,6 +169,10 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
 
         var writeResult = await TryStoreRecordAsync(record, cancellationToken, allowMissingEmbeddings: false);
         LogDebug($"post-action writeback {(writeResult == MemoryImportDisposition.Imported ? "stored" : $"skipped:{writeResult}")}");
+
+        // Close the learning loop: credit the memories that were recalled to plan/execute this
+        // action based on whether it actually worked.
+        await ReinforceRecalledMemoriesAsync(context.ExecutionMemoryContext, result.Success, cancellationToken);
     }
 
     public async Task RecordUserInstructionAsync(string? adminId, string? serverName, string instruction, CancellationToken cancellationToken)
@@ -400,6 +404,227 @@ internal sealed class SemanticMemoryService : ISemanticMemoryService
     }
 
     public Task<int> PruneAsync(CancellationToken cancellationToken) => _store.CompactOrPruneAsync(cancellationToken);
+
+    public async Task ReinforceRecalledMemoriesAsync(WorkflowMemoryContext? recall, bool success, CancellationToken cancellationToken)
+    {
+        var learning = _settings.Learning;
+        if (!learning.Enabled || !learning.ReinforceOnOutcome || recall is null || !recall.HasResults)
+        {
+            return;
+        }
+
+        foreach (var result in recall.Results)
+        {
+            var record = result.MemoryRecord;
+            try
+            {
+                if (success)
+                {
+                    // The recalled memory helped reach a good outcome: nudge it up and verify it.
+                    await _store.ReinforceAsync(
+                        record.Id, learning.SuccessImportanceDelta, learning.SuccessConfidenceDelta,
+                        markVerified: true, cancellationToken);
+                }
+                else if (IsWarningMemory(record.Type))
+                {
+                    // The action failed, but a memory that warns of this kind of failure deserves
+                    // to surface more readily next time. Don't touch confidence on a failed run.
+                    await _store.ReinforceAsync(
+                        record.Id, learning.FailureImportanceDelta, 0.0, markVerified: false, cancellationToken);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogDebug($"reinforce skipped for {record.Id}: {ex.Message}");
+            }
+        }
+    }
+
+    public async Task<MemoryMaturationReport> RunMaturationAsync(CancellationToken cancellationToken)
+    {
+        var learning = _settings.Learning;
+        var report = new MemoryMaturationReport();
+        if (!learning.Enabled)
+        {
+            return report;
+        }
+
+        report.Ran = true;
+
+        if (learning.AutoPromoteEnabled)
+        {
+            var types = ParseAutoPromoteTypes(learning.AutoPromoteTypes);
+            if (types.Count > 0)
+            {
+                report.Promoted = await _store.PromotePendingAsync(
+                    types, learning.AutoPromoteMinConfidence, Math.Max(0, learning.AutoPromoteMaxPerRun), cancellationToken);
+            }
+        }
+
+        if (learning.DecayUnusedEnabled)
+        {
+            report.Decayed = await _store.DecayUnusedAsync(
+                learning.DecayImportanceStep, learning.DecayAfterDays, Math.Max(0, learning.DecayMaxPerRun), cancellationToken);
+        }
+
+        if (learning.SynthesizeProceduresEnabled)
+        {
+            report.ProceduresSynthesized = await SynthesizeProceduresAsync(learning, cancellationToken);
+        }
+
+        LogDebug($"maturation pass: {report}");
+        return report;
+    }
+
+    // Turn "this kept failing, then this fixed it" history into a durable, recallable
+    // procedure. We only act on a recurring failure that has a later successful action on the
+    // same intent+tool+server, and dedup by content hash so the procedure is written once.
+    private async Task<int> SynthesizeProceduresAsync(MemoryLearningSettings learning, CancellationToken cancellationToken)
+    {
+        var clusters = await ListRepeatedFailuresAsync(
+            Math.Max(2, learning.ProcedureMinFailureOccurrences), cancellationToken);
+        if (clusters.Count == 0)
+        {
+            return 0;
+        }
+
+        var all = await _store.GetAllAsync(cancellationToken);
+        var resolutions = all
+            .Where(record => record.Type is MemoryRecordType.Fix or MemoryRecordType.Procedure)
+            .Where(record => record.Metadata.TryGetValue("success", out var ok) && ok.Equals("True", StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        // Fingerprints we've already distilled into a procedure on a previous run — skip them so
+        // the pass is idempotent (writes dedup by id, not by content, so we must guard here).
+        var alreadySynthesized = all
+            .Where(record => record.Type == MemoryRecordType.Procedure &&
+                             record.Metadata.TryGetValue("synthesizedFrom", out var src) &&
+                             src.Equals("repeated_failure_then_fix", StringComparison.OrdinalIgnoreCase))
+            .Select(record => record.Metadata.TryGetValue("actionFingerprint", out var fp) ? fp : string.Empty)
+            .Where(fp => !string.IsNullOrWhiteSpace(fp))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var synthesized = 0;
+        foreach (var cluster in clusters)
+        {
+            var failures = cluster.ToList();
+            var representative = failures[0];
+            var failurePrefix = FingerprintPrefix(representative);
+            if (string.IsNullOrWhiteSpace(failurePrefix) || alreadySynthesized.Contains(failurePrefix))
+            {
+                continue;
+            }
+
+            var lastFailureAt = failures.Max(f => f.CreatedAtUtc);
+
+            // A resolution is a later success sharing the intent|tool|server prefix.
+            var resolution = resolutions
+                .Where(fix => string.Equals(FingerprintPrefix(fix), failurePrefix, StringComparison.OrdinalIgnoreCase))
+                .Where(fix => fix.CreatedAtUtc >= lastFailureAt)
+                .OrderByDescending(fix => fix.CreatedAtUtc)
+                .FirstOrDefault();
+
+            if (resolution is null)
+            {
+                continue;
+            }
+
+            var server = representative.Metadata.TryGetValue("selectedServer", out var s) ? s : string.Empty;
+            var intent = representative.Metadata.TryGetValue("intent", out var it) ? it : "operation";
+            var errorCode = representative.Metadata.TryGetValue("errorCode", out var ec) ? ec : string.Empty;
+
+            var scopeLabel = string.IsNullOrWhiteSpace(server) ? intent : $"{intent} on {server}";
+            var trigger = string.IsNullOrWhiteSpace(errorCode)
+                ? $"{cluster.Count()}x failure of {scopeLabel} (\"{TrimSingleLine(representative.Summary, 90)}\")"
+                : $"{cluster.Count()}x failure of {scopeLabel} with '{errorCode}'";
+
+            var summary = $"When {scopeLabel} fails, the action that resolved it: {TrimSingleLine(resolution.Summary, 110)}";
+            var detail =
+                $"Recurring failure: {trigger}.\n" +
+                $"Resolution observed: {resolution.Summary}.\n" +
+                $"Derived automatically from {cluster.Count()} failure record(s) followed by a successful outcome on the same target.";
+
+            var tags = new List<string> { "procedure", "auto-synthesized", intent.ToLowerInvariant() };
+            if (!string.IsNullOrWhiteSpace(server))
+            {
+                tags.Add($"server:{server}");
+            }
+
+            var relatedIds = new List<string> { intent };
+            if (!string.IsNullOrWhiteSpace(server))
+            {
+                relatedIds.Add(server);
+            }
+
+            var record = new MemoryRecord
+            {
+                Type = MemoryRecordType.Procedure,
+                Scope = string.IsNullOrWhiteSpace(server) ? MemoryScope.Project : MemoryScope.Server,
+                Source = MemorySource.ReflectionLoop,
+                Summary = summary,
+                Text = detail,
+                Tags = tags,
+                RelatedEntityIds = relatedIds,
+                // High importance, solid confidence: this is observed-to-work knowledge. Active so
+                // recall sees it immediately — it is the whole point of synthesizing it.
+                Importance = 0.85,
+                Confidence = 0.82,
+                ApprovalState = MemoryApprovalState.Active,
+                LastVerifiedUtc = DateTime.UtcNow,
+                Metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["actionFingerprint"] = failurePrefix,
+                    ["intent"] = intent,
+                    ["selectedServer"] = server,
+                    ["failureCount"] = cluster.Count().ToString(),
+                    ["synthesizedFrom"] = "repeated_failure_then_fix"
+                }
+            };
+
+            // ImportRecordAsync dedups on content hash, so a procedure already written in a prior
+            // run is skipped instead of duplicated.
+            var disposition = await ImportRecordAsync(record, cancellationToken);
+            if (disposition == MemoryImportDisposition.Imported)
+            {
+                synthesized++;
+            }
+        }
+
+        return synthesized;
+    }
+
+    private static bool IsWarningMemory(MemoryRecordType type) =>
+        type is MemoryRecordType.Failure or MemoryRecordType.Exception
+            or MemoryRecordType.Procedure or MemoryRecordType.Fix;
+
+    // The intent|tool|server prefix of an action fingerprint, dropping any trailing errorCode
+    // segment so a failure and its fix compare equal on the same target.
+    private static string FingerprintPrefix(MemoryRecord record)
+    {
+        if (!record.Metadata.TryGetValue("actionFingerprint", out var fingerprint) || string.IsNullOrWhiteSpace(fingerprint))
+        {
+            return string.Empty;
+        }
+
+        var parts = fingerprint.Split('|');
+        return parts.Length >= 3
+            ? string.Join('|', parts.Take(3))
+            : fingerprint;
+    }
+
+    private static IReadOnlyCollection<MemoryRecordType> ParseAutoPromoteTypes(IEnumerable<string> names)
+    {
+        var types = new List<MemoryRecordType>();
+        foreach (var name in names)
+        {
+            if (Enum.TryParse<MemoryRecordType>(name?.Trim(), ignoreCase: true, out var type) && !types.Contains(type))
+            {
+                types.Add(type);
+            }
+        }
+
+        return types;
+    }
 
     private async Task<WorkflowMemoryContext> RecallAsync(
         string query,

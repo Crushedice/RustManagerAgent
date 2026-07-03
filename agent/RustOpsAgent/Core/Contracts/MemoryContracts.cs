@@ -120,6 +120,17 @@ internal sealed class ServerConsoleState
     [JsonPropertyName("lastAlertAtUtc")] public DateTime? LastAlertAtUtc { get; set; }
     [JsonPropertyName("errorCountSinceLastAlert")] public int ErrorCountSinceLastAlert { get; set; }
     [JsonPropertyName("totalErrorsIngested")] public int TotalErrorsIngested { get; set; }
+    // Per-error-signature alert history, so the agent can recognise an already-reported recurring
+    // pattern and stay quiet about it instead of re-broadcasting the same errors every cycle.
+    [JsonPropertyName("alertedSignatures")] public Dictionary<string, AlertedSignatureState> AlertedSignatures { get; set; } = new(StringComparer.Ordinal);
+}
+
+internal sealed class AlertedSignatureState
+{
+    [JsonPropertyName("firstAlertedAtUtc")] public DateTime FirstAlertedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("lastAlertedAtUtc")] public DateTime LastAlertedAtUtc { get; set; } = DateTime.UtcNow;
+    [JsonPropertyName("lastAlertedCount")] public int LastAlertedCount { get; set; }
+    [JsonPropertyName("timesAlerted")] public int TimesAlerted { get; set; }
 }
 
 internal sealed class ConsoleErrorEntry

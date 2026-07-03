@@ -561,6 +561,12 @@ internal sealed class RustChatToolHandler : IToolHandler
         // sense for plugins (chat/console command, oxide permission). Bare "command"/"permission"/
         // "hook" used to fire this path too — but those words match Rust server convar questions
         // too, leading to plugin-internal dumps for unrelated queries.
+        var playerFacing =
+            lowered.Contains("player-facing", StringComparison.Ordinal) ||
+            lowered.Contains("player safe", StringComparison.Ordinal) ||
+            lowered.Contains("players use", StringComparison.Ordinal) ||
+            lowered.Contains("what commands can players", StringComparison.Ordinal);
+
         var hasPluginContext =
             lowered.Contains("plugin", StringComparison.Ordinal) ||
             lowered.Contains("oxide", StringComparison.Ordinal) ||
@@ -569,7 +575,10 @@ internal sealed class RustChatToolHandler : IToolHandler
             lowered.Contains("console command", StringComparison.Ordinal) ||
             lowered.Contains("config key", StringComparison.Ordinal) ||
             lowered.Contains("oxide permission", StringComparison.Ordinal) ||
-            lowered.Contains("plugin hook", StringComparison.Ordinal);
+            lowered.Contains("plugin hook", StringComparison.Ordinal) ||
+            // "what commands can players use from <plugin>" — player-command questions are
+            // plugin questions even when the word "plugin" isn't used.
+            (playerFacing && lowered.Contains("command", StringComparison.Ordinal));
 
         if (!isQuestion || !hasPluginContext)
             return new PluginQueryIntent(PluginQueryKind.None, false);
@@ -581,12 +590,6 @@ internal sealed class RustChatToolHandler : IToolHandler
             lowered.Contains("enabled", StringComparison.Ordinal) ||
             lowered.Contains("active on", StringComparison.Ordinal))
             return new PluginQueryIntent(PluginQueryKind.None, false);
-
-        var playerFacing =
-            lowered.Contains("player-facing", StringComparison.Ordinal) ||
-            lowered.Contains("player safe", StringComparison.Ordinal) ||
-            lowered.Contains("players use", StringComparison.Ordinal) ||
-            lowered.Contains("what commands can players", StringComparison.Ordinal);
 
         // Pick the most specific category
         if (lowered.Contains("chat command", StringComparison.Ordinal))
