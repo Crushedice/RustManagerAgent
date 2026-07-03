@@ -3223,13 +3223,6 @@ static TraceEvent? ParseTraceEvent(string line)
     return new TraceEvent { Timestamp = ts, Kind = kind, Detail = detail };
 }
 
-static string TailLines(string text, int lines)
-{
-    if (string.IsNullOrWhiteSpace(text)) return string.Empty;
-    var all = text.Replace("\r\n", "\n").Split('\n');
-    return string.Join(Environment.NewLine, all.TakeLast(lines));
-}
-
 static string BuildQueryString(IReadOnlyDictionary<string, string?> values)
 {
     var parts = values
