@@ -65,3 +65,6 @@ memory/*
 api/web.config
 remote-agent/RustOpsRemoteAgent/RustOpsRemoteAgent
 remote-agent/RustOpsRemoteAgent/publish/
+
+# Publish output inside source dirs
+**/publish/
