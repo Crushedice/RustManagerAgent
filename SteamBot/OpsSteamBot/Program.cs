@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using Sentry;
 using SteamKit2;
+using SteamKit2.Authentication;
 
 var configPath = args.FirstOrDefault() ?? Path.Combine(AppContext.BaseDirectory, "botsettings.json");
 RustOpsEnv.LoadFromDefaultLocations(configPath);
@@ -79,7 +80,8 @@ internal sealed class OpsSteamBot
     private readonly SteamFriends _friends;
     private readonly HashSet<ulong> _admins;
     private readonly Dictionary<string, int> _outboxFailureCounts = new(StringComparer.OrdinalIgnoreCase);
-    private string? _authCode;
+    private readonly string _authTokenPath;
+    private StoredSteamAuth? _storedAuth;
     private volatile bool _isRunning;
     private DateTime _lastOutboxPollUtc = DateTime.MinValue;
     private int _pendingChats;
@@ -91,6 +93,8 @@ internal sealed class OpsSteamBot
         _config = config;
         _api = api;
         _admins = new HashSet<ulong>(config.Steam.AdminSteamIds);
+        _authTokenPath = Path.Combine(AppContext.BaseDirectory, "data", "steam-auth.json");
+        _storedAuth = StoredSteamAuth.TryLoad(_authTokenPath);
         _client = new SteamClient();
         _manager = new CallbackManager(_client);
         _user = _client.GetHandler<SteamUser>() ?? throw new InvalidOperationException("SteamUser handler not available.");
@@ -168,13 +172,69 @@ internal sealed class OpsSteamBot
     {
         Console.WriteLine("Connected to Steam. Logging in...");
         RustOpsSentry.AddBreadcrumb("Connected to Steam. Starting login.", "steam.connection");
+        _ = Task.Run(AuthenticateAndLogOnAsync);
+    }
 
-        _user.LogOn(new SteamUser.LogOnDetails
+    // SteamKit2 3.x no longer honours password-only logon (Steam returns InvalidPassword).
+    // We obtain a long-lived refresh token via the credentials auth session, persist it, and
+    // log on with AccessToken = refreshToken. Subsequent restarts reuse the stored token and
+    // skip credentials entirely.
+    private async Task AuthenticateAndLogOnAsync()
+    {
+        try
         {
-            Username = _config.Steam.Username,
-            Password = _config.Steam.Password,
-            AuthCode = _authCode
-        });
+            if (_storedAuth is { } stored && !string.IsNullOrWhiteSpace(stored.RefreshToken))
+            {
+                Console.WriteLine("Logging on with stored Steam refresh token...");
+                _user.LogOn(new SteamUser.LogOnDetails
+                {
+                    Username = stored.AccountName,
+                    AccessToken = stored.RefreshToken,
+                    ShouldRememberPassword = true,
+                });
+                return;
+            }
+
+            Console.WriteLine("No stored Steam token; authenticating with credentials...");
+            RustOpsSentry.AddBreadcrumb("Starting Steam credentials auth session.", "steam.connection");
+
+            var authSession = await _client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
+            {
+                Username = _config.Steam.Username,
+                Password = _config.Steam.Password,
+                IsPersistentSession = true,
+                GuardData = _storedAuth?.GuardData,
+                Authenticator = new HeadlessAuthenticator(),
+            });
+
+            var pollResponse = await authSession.PollingWaitForResultAsync();
+
+            _storedAuth = new StoredSteamAuth
+            {
+                AccountName = pollResponse.AccountName,
+                RefreshToken = pollResponse.RefreshToken,
+                GuardData = string.IsNullOrWhiteSpace(pollResponse.NewGuardData)
+                    ? _storedAuth?.GuardData
+                    : pollResponse.NewGuardData,
+            };
+            _storedAuth.Save(_authTokenPath);
+            Console.WriteLine("Steam credentials accepted; refresh token stored.");
+            RustOpsSentry.AddBreadcrumb("Steam refresh token acquired and persisted.", "steam.connection");
+
+            _user.LogOn(new SteamUser.LogOnDetails
+            {
+                Username = pollResponse.AccountName,
+                AccessToken = pollResponse.RefreshToken,
+                ShouldRememberPassword = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Steam authentication failed: {ex.Message}");
+            RustOpsSentry.CaptureException(ex, "Steam authentication failed.", "steam.connection");
+            // Drop back to the reconnect loop; OnDisconnected schedules a retry.
+            _client.Disconnect();
+        }
     }
 
     private void OnDisconnected(SteamClient.DisconnectedCallback callback)
@@ -197,23 +257,6 @@ internal sealed class OpsSteamBot
 
     private void OnLoggedOn(SteamUser.LoggedOnCallback callback)
     {
-        if (callback.Result == EResult.AccountLogonDenied ||
-            callback.Result == EResult.InvalidLoginAuthCode)
-        {
-            Console.Write("Steam Guard code: ");
-            _authCode = Console.ReadLine()?.Trim();
-            _client.Disconnect();
-            return;
-        }
-
-        if (callback.Result == EResult.AccountLoginDeniedNeedTwoFactor)
-        {
-            Console.Error.WriteLine("This bot currently expects a Steam Guard auth code flow.");
-            Console.Error.WriteLine("If you use mobile 2FA, extend the bot with a shared-secret TOTP step.");
-            _isRunning = false;
-            return;
-        }
-
         if (callback.Result != EResult.OK)
         {
             Console.Error.WriteLine($"Steam login failed: {callback.Result}");
@@ -221,6 +264,19 @@ internal sealed class OpsSteamBot
                 $"Steam login failed: {callback.Result}",
                 "steam.connection",
                 SentryLevel.Warning);
+
+            // A stored refresh token that Steam rejects is stale — discard it so the next
+            // connection re-authenticates with credentials instead of looping on a dead token.
+            if (_storedAuth is not null &&
+                callback.Result is EResult.Expired
+                    or EResult.AccessDenied
+                    or EResult.InvalidPassword
+                    or EResult.InvalidSignature)
+            {
+                Console.Error.WriteLine("Stored Steam token rejected; discarding and re-authenticating.");
+                StoredSteamAuth.Delete(_authTokenPath);
+                _storedAuth = null;
+            }
             return;
         }
 
@@ -653,6 +709,89 @@ internal sealed class OpsSteamBot
     }
 
     private static string Encode(string value) => Uri.EscapeDataString(value);
+}
+
+// Persisted Steam auth-session result. The refresh token is a credential — the file is
+// written 0600 and reused across restarts so the bot logs on without re-entering credentials.
+internal sealed class StoredSteamAuth
+{
+    public string AccountName { get; set; } = string.Empty;
+    public string RefreshToken { get; set; } = string.Empty;
+    public string? GuardData { get; set; }
+
+    private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
+
+    public static StoredSteamAuth? TryLoad(string path)
+    {
+        try
+        {
+            if (!File.Exists(path))
+                return null;
+            var stored = JsonSerializer.Deserialize<StoredSteamAuth>(File.ReadAllText(path));
+            return string.IsNullOrWhiteSpace(stored?.RefreshToken) ? null : stored;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to read stored Steam auth ({path}): {ex.Message}");
+            return null;
+        }
+    }
+
+    public void Save(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(this, Options));
+        try
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to restrict permissions on {path}: {ex.Message}");
+        }
+    }
+
+    public static void Delete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Failed to delete stale Steam auth ({path}): {ex.Message}");
+        }
+    }
+}
+
+// Headless authenticator. The bot account has no Steam Guard, so these are not expected to
+// fire; if Guard is ever enabled, a one-time code can be supplied via RUSTOPS_STEAM_GUARD_CODE
+// (env) or a steam-guard-code.txt file next to the binary, rather than blocking on the console.
+internal sealed class HeadlessAuthenticator : SteamKit2.Authentication.IAuthenticator
+{
+    public Task<string> GetDeviceCodeAsync(bool previousCodeWasIncorrect) => ReadCodeAsync(previousCodeWasIncorrect);
+
+    public Task<string> GetEmailCodeAsync(string email, bool previousCodeWasIncorrect) => ReadCodeAsync(previousCodeWasIncorrect);
+
+    public Task<bool> AcceptDeviceConfirmationAsync() => Task.FromResult(false);
+
+    private static Task<string> ReadCodeAsync(bool previousCodeWasIncorrect)
+    {
+        if (previousCodeWasIncorrect)
+            Console.Error.WriteLine("Previous Steam Guard code was rejected.");
+
+        var code = Environment.GetEnvironmentVariable("RUSTOPS_STEAM_GUARD_CODE");
+        var codeFile = Path.Combine(AppContext.BaseDirectory, "steam-guard-code.txt");
+        if (string.IsNullOrWhiteSpace(code) && File.Exists(codeFile))
+            code = File.ReadAllText(codeFile).Trim();
+
+        if (string.IsNullOrWhiteSpace(code))
+            throw new InvalidOperationException(
+                "Steam Guard code required but none available. Set RUSTOPS_STEAM_GUARD_CODE or write steam-guard-code.txt.");
+
+        return Task.FromResult(code.Trim());
+    }
 }
 
 internal sealed class RustMgrApiClient : IDisposable
